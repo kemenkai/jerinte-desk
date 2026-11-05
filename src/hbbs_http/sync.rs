@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 const TIME_HEARTBEAT: Duration = Duration::from_secs(15);
 const UPLOAD_SYSINFO_TIMEOUT: Duration = Duration::from_secs(120);
 const TIME_CONN: Duration = Duration::from_secs(3);
+/// The longest wait before asking the API again after it failed: a heartbeat waits 15, 30, then
+/// 60 s, sessions on or not; a sysinfo whose ID the server does not know yet 3, 6 ... 60 s.
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 #[cfg(not(any(target_os = "ios")))]
 lazy_static::lazy_static! {
@@ -54,6 +57,9 @@ struct InfoUploaded {
     uploaded: bool,
     url: String,
     last_uploaded: Option<Instant>,
+    // How long after `last_uploaded` to upload again: set while the server does not know the
+    // ID yet, `UPLOAD_SYSINFO_TIMEOUT` otherwise.
+    retry_in: Option<Duration>,
     id: String,
     username: Option<String>,
 }
@@ -64,6 +70,7 @@ impl Default for InfoUploaded {
             uploaded: false,
             url: "".to_owned(),
             last_uploaded: None,
+            retry_in: None,
             id: "".to_owned(),
             username: None,
         }
@@ -76,10 +83,16 @@ impl InfoUploaded {
             uploaded: true,
             url,
             last_uploaded: None,
+            retry_in: None,
             id,
             username: Some(username),
         }
     }
+}
+
+/// The wait before the next heartbeat after `failures` failed in a row.
+fn heartbeat_retry_after(failures: u32) -> Duration {
+    (TIME_HEARTBEAT * 2u32.pow(failures.saturating_sub(1).min(2))).min(RETRY_MAX)
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -90,6 +103,7 @@ async fn start_hbbs_sync_async() {
         TIME_CONN,
     ));
     let mut last_sent: Option<Instant> = None;
+    let mut heartbeat_failures = 0;
     let mut info_uploaded = InfoUploaded::default();
     let mut sysinfo_ver = "".to_owned();
     loop {
@@ -128,7 +142,7 @@ async fn start_hbbs_sync_async() {
                 // Though the username comparison is only necessary on Windows,
                 // we still keep the comparison on other platforms for consistency.
                 let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username)) &&
-                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
+                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= info_uploaded.retry_in.unwrap_or(UPLOAD_SYSINFO_TIMEOUT)).unwrap_or(true);
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
                     v["id"] = json!(id);
@@ -219,20 +233,30 @@ async fn start_hbbs_sync_async() {
                                 }
                                 *PRO.lock().unwrap() = true;
                             } else if x == "ID_NOT_FOUND" {
-                                info_uploaded.last_uploaded = None; // next heartbeat will upload sysinfo again
+                                // Soon again, the server may learn the ID any moment: 3, 6 ... 60 s.
+                                info_uploaded.retry_in = Some(info_uploaded.retry_in.map_or(TIME_CONN, |d| (d * 2).min(RETRY_MAX)));
+                                info_uploaded.last_uploaded = Some(Instant::now());
                             } else {
+                                info_uploaded.retry_in = None;
                                 info_uploaded.last_uploaded = Some(Instant::now());
                             }
                         }
                         _ => {
+                            info_uploaded.retry_in = None;
                             info_uploaded.last_uploaded = Some(Instant::now());
                         }
                     }
                 }
-                if conns.is_empty() && last_sent.map(|x| x.elapsed() < TIME_HEARTBEAT).unwrap_or(false) {
+                // Every tick while sessions are on, else every 15 s; after a failure, backing off
+                // whatever sessions are on.
+                let due = match heartbeat_failures {
+                    0 if conns.is_empty() => TIME_HEARTBEAT,
+                    0 => Duration::ZERO,
+                    failures => heartbeat_retry_after(failures),
+                };
+                if last_sent.map(|x| x.elapsed() < due).unwrap_or(false) {
                     continue;
                 }
-                last_sent = Some(Instant::now());
                 let mut v = Value::default();
                 v["id"] = json!(id);
                 v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
@@ -243,8 +267,24 @@ async fn start_hbbs_sync_async() {
                 let modified_at = LocalConfig::get_option("strategy_timestamp").parse::<i64>().unwrap_or(0);
                 v["modified_at"] = json!(modified_at);
                 let response = crate::post_request(url.clone(), v.to_string(), "").await;
-                if let Err(err) = &response {
-                    hbb_common::throttled_log!(API_LOG_INTERVAL, warn, "Heartbeat failed: {err:?}");
+                // Timed from its end: a failing request can take longer than the wait after it.
+                last_sent = Some(Instant::now());
+                match &response {
+                    // The API answers JSON; anything else, a proxy's error page say, is a failure.
+                    Ok(s) if serde_json::from_str::<Value>(s).is_ok() => {
+                        heartbeat_failures = 0;
+                        crate::service_status::heartbeat(&url, None);
+                    }
+                    Ok(_) => {
+                        heartbeat_failures += 1;
+                        hbb_common::throttled_log!(API_LOG_INTERVAL, warn, "Heartbeat failed: the answer is no JSON");
+                        crate::service_status::heartbeat(&url, Some("the answer is no JSON"));
+                    }
+                    Err(err) => {
+                        heartbeat_failures += 1;
+                        hbb_common::throttled_log!(API_LOG_INTERVAL, warn, "Heartbeat failed: {err:?}");
+                        crate::service_status::heartbeat(&url, Some(&err.to_string()));
+                    }
                 }
                 if let Ok(s) = response {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
@@ -281,7 +321,7 @@ async fn start_hbbs_sync_async() {
     }
 }
 
-fn heartbeat_url() -> String {
+pub(crate) fn heartbeat_url() -> String {
     let url = crate::common::get_api_server(
         Config::get_option("api-server"),
         Config::get_option("custom-rendezvous-server"),
@@ -470,5 +510,16 @@ mod tests {
         ]
         .concat();
         assert_eq!(switch_grant_signed_msg("id1", "c1", "1700000000"), expected);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_heartbeat_backs_off_to_a_minute() {
+        let secs: Vec<u64> = (1..=5).map(|n| heartbeat_retry_after(n).as_secs()).collect();
+        assert_eq!(secs, [15, 30, 60, 60, 60]);
     }
 }

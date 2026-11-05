@@ -12,6 +12,8 @@ case $1 in
 			systemctl stop rustdesk || true
 			systemctl disable rustdesk || true
 			rm /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service || true
+			systemctl disable rustdesk-vdisplay >/dev/null 2>&1 || true
+			rm /usr/lib/systemd/system/rustdesk-vdisplay.service >/dev/null 2>&1 || true
 			
 			# workaround temp dev build between 1.1.9 and 1.2.0
 			serverUser=$(ps -ef | grep -E 'rustdesk +--server' | grep -v 'sudo ' | awk '{print $1}' | head -1)

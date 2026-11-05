@@ -419,6 +419,54 @@ pub mod amyuni_idd {
     //
     // to-do: Maybe a better way is to add an option asking the user if plug out all virtual displays on disconnect.
     static VIRTUAL_DISPLAY_COUNT: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+    // The virtual display manager's backend (`crate::vdisplay`) holds a monitor, or is plugging one
+    // in. The paths here leave the driver alone meanwhile: unplugging takes the newest monitor,
+    // which would be the backend's.
+    static BACKEND_HOLDS: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    const BACKEND_HOLDS_MSG: &str = "The virtual display is in use by a remote session.";
+
+    /// Taking hold also waits out a plug of the paths here under way: from its return none
+    /// plugs or unplugs, so what the backend lists then stays as it is.
+    pub(crate) fn set_backend_holds(holds: bool) {
+        BACKEND_HOLDS.store(holds, atomic::Ordering::SeqCst);
+        if holds {
+            drop(LOCK.lock().unwrap());
+        }
+    }
+
+    pub(crate) fn backend_holds() -> bool {
+        BACKEND_HOLDS.load(atomic::Ordering::SeqCst)
+    }
+
+    /// Installs the driver for the backend if it is not there.
+    pub(crate) fn ensure_driver() -> ResultType<()> {
+        let mut is_async = false;
+        check_install_driver(&mut is_async)
+    }
+
+    /// Plugs a monitor in or out for the backend. Unlike `plug_monitor_` it leaves
+    /// `VIRTUAL_DISPLAY_COUNT` alone, which "plug out all" counts by. Right after an asynchronous
+    /// install the driver's interface takes a moment to appear.
+    pub(crate) fn plug_for_backend(add: bool) -> ResultType<()> {
+        let _l = LOCK.lock().unwrap();
+        let cmd = [if add { 0x10 } else { 0x00 }, 0x00, 0x00, 0x00];
+        let start = std::time::Instant::now();
+        loop {
+            let res = unsafe {
+                win_device::device_io_control(&INTERFACE_GUID, PLUG_MONITOR_IO_CONTROL_CDOE, &cmd, 0)
+            };
+            match res {
+                Ok(_) => return Ok(()),
+                Err(win_device::DeviceError::WinApiLastErr(_, e))
+                    if e.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as _)
+                        && start.elapsed() < Duration::from_secs(3) =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 
     fn get_deviceinstaller64_work_dir() -> ResultType<Option<Vec<u8>>> {
         let cur_exe = std::env::current_exe()?;
@@ -540,8 +588,20 @@ pub mod amyuni_idd {
         let cmd = [cmd, 0x00, 0x00, 0x00];
         let now = Instant::now();
         let c1 = get_monitor_count();
-        unsafe {
-            win_device::device_io_control(&INTERFACE_GUID, PLUG_MONITOR_IO_CONTROL_CDOE, &cmd, 0)?;
+        {
+            // Checked right at the call, under the lock the backend waits on as it takes hold.
+            let _l = LOCK.lock().unwrap();
+            if backend_holds() {
+                return Err(win_device::DeviceError::Raw(BACKEND_HOLDS_MSG.to_owned()));
+            }
+            unsafe {
+                win_device::device_io_control(
+                    &INTERFACE_GUID,
+                    PLUG_MONITOR_IO_CONTROL_CDOE,
+                    &cmd,
+                    0,
+                )?;
+            }
         }
         if let Some(wait_timeout) = wait_timeout {
             while now.elapsed() < wait_timeout {
@@ -627,6 +687,9 @@ pub mod amyuni_idd {
     }
 
     pub fn plug_in_headless() -> ResultType<()> {
+        if backend_holds() {
+            bail!(BACKEND_HOLDS_MSG);
+        }
         let mut tm = LAST_PLUG_IN_HEADLESS_TIME.lock().unwrap();
         if let Some(tm) = &mut *tm {
             if tm.elapsed() < Duration::from_secs(3) {
@@ -646,6 +709,9 @@ pub mod amyuni_idd {
     }
 
     pub fn plug_in_monitor() -> ResultType<()> {
+        if backend_holds() {
+            bail!(BACKEND_HOLDS_MSG);
+        }
         let mut is_async = false;
         if let Err(e) = check_install_driver(&mut is_async) {
             log::error!("Failed to install driver: {}", e);
@@ -664,6 +730,9 @@ pub mod amyuni_idd {
     // `force_one` is used to forcibly plug out one virtual display managed by other processes
     //             if there're no virtual displays managed by RustDesk.
     pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultType<()> {
+        if backend_holds() {
+            bail!(BACKEND_HOLDS_MSG);
+        }
         let plug_out_all = index == super::IDD_PLUG_OUT_ALL_INDEX;
         // If `plug_out_all and force_all` is true, forcibly plug out all virtual displays.
         // Though the driver may be controlled by other processes,

@@ -623,6 +623,45 @@ message CaptureDisplays {
 message ToggleVirtualDisplay {
   int32 display = 1;
   bool on = 2;
+  // Fork extension. When set, the request goes to the cross-platform virtual display manager:
+  // `display` is then a monitor of the controlling side (its slot), and -1 with `on = false`
+  // removes every slot of this session. Without it the message keeps its upstream meaning.
+  VirtualDisplaySpec spec = 100;
+}
+
+// The size a virtual display should have: pixels, and the scale factor to show them at.
+// A scale of 1 (or 0) asks for a plain display; above 1, a HiDPI one where the platform has it.
+message VirtualDisplaySpec {
+  int32 width = 1;
+  int32 height = 2;
+  double scale = 3;
+  // Fork extension: how the controlling side wants to use the display, so it fits the scene.
+  // 0 Shared (default): an extra screen on the shared desktop, as today. 1 Privacy: the physical
+  // screens go black while the controlling side has the desktop. 2 Nested: a session of its own on
+  // the virtual display, which the person at the device never sees. 3 Concurrent: a second cursor
+  // and focus, so both sides work the one desktop at once. An unknown value is taken as Shared.
+  // The controlled side only offers the modes in `vdm_caps.modes`; others fall back to Shared.
+  int32 mode = 4;
+}
+
+// The answer to a `ToggleVirtualDisplay` that carries a `spec`.
+message VirtualDisplayResult {
+  int32 slot = 1;
+  bool on = 2;
+  // The `DisplayInfo.name` of the virtual display, when `on`.
+  string name = 3;
+  // Empty on success.
+  string error = 4;
+  // Fork extension: word of the slot the controlling side did not ask for, answering no request.
+  // Its use changed on the peer: the person there took the desktop back, or privacy mode is no
+  // longer allowed. `error` says why. The controlling side asks for the slot as it is now (mode
+  // Shared), which tells the peer it heard: until then the peer does not take its desktop over
+  // for the slot again, a request sent before the word came being no deliberate one.
+  bool notice = 100;
+  // Fork extension: how the display is used now, when `on`: its `VirtualDisplaySpec.mode` plus
+  // one; 0 when not told, as by a peer from before it. A request that failed may leave the display
+  // used as before, as asked, or otherwise, which `error` alone does not say.
+  int32 used = 101;
 }
 
 message TogglePrivacyMode {
@@ -872,6 +911,8 @@ message Misc {
     // is rebuilt, and held again, the next time it is shown, before any connection names it
     // by id again, so the shape just selected is always there to give.
     uint64 request_cursor_data = 39;
+    // Fork extension, see `ToggleVirtualDisplay.spec`.
+    VirtualDisplayResult virtual_display_result = 100;
   }
 }
 

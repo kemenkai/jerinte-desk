@@ -289,6 +289,10 @@ void runConnectionManagerScreen() async {
     const DesktopServerPage(),
     MyTheme.currentThemeMode(),
   );
+  // The Windows runner gives this window the same title natively.
+  if (!isWindows) {
+    windowManager.setTitle('$appDisplayName - Connection Manager');
+  }
   final hide = await bind.cmGetConfig(name: "hide_cm") == 'true';
   gFFI.serverModel.hideCm = hide;
   if (hide) {
@@ -497,7 +501,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
           debugShowCheckedModeBanner: false,
           title: isWeb
               ? '${bind.mainGetAppNameSync()} Web Client V2 (Preview)'
-              : bind.mainGetAppNameSync(),
+              : appDisplayName,
           theme: MyTheme.lightTheme,
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),

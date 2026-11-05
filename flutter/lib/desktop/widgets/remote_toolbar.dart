@@ -2274,6 +2274,8 @@ class _ResolutionsMenuState extends State<_ResolutionsMenu> {
 
   @override
   Widget build(BuildContext context) {
+    // A virtual display of this session has the size of this window's view, and follows it.
+    if (ffi.virtualDisplayModel.shownSlot(pi) != null) return Offstage();
     final isVirtualDisplay = ffiModel.isVirtualDisplayResolution;
     final visible = ffiModel.keyboard &&
         (isVirtualDisplay || resolutions.length > 1) &&

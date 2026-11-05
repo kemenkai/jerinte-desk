@@ -17,7 +17,7 @@ use std::{
 #[cfg(windows)]
 pub mod win_exclude_from_capture;
 #[cfg(windows)]
-mod win_input;
+pub(crate) mod win_input;
 #[cfg(windows)]
 pub mod win_mag;
 #[cfg(windows)]
@@ -253,6 +253,13 @@ fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>
     // Check if privacy mode is already on or occupied by another one
     let mut privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
 
+    // Refused while a virtual display has the desktop to itself (src/vdisplay), before switching
+    // implementations below turns the old one off.
+    #[cfg(windows)]
+    if crate::vdisplay::taking_over() {
+        return Some(Err(anyhow!("A remote session has the desktop to itself")));
+    }
+
     // Check or switch privacy mode implementation
     let impl_key = get_supported_impl(impl_key);
 
@@ -319,13 +326,18 @@ pub(crate) fn close_other_remote_connections_for_privacy(owner_id: i32) {
 
 #[inline]
 pub fn turn_off_privacy(conn_id: i32, state: Option<PrivacyModeState>) -> Option<ResultType<()>> {
-    Some(
-        PRIVACY_MODE
-            .lock()
-            .unwrap()
-            .as_mut()?
-            .turn_off_privacy(conn_id, state),
-    )
+    let mut privacy_mode = PRIVACY_MODE.lock().unwrap();
+    let privacy_mode = privacy_mode.as_mut()?;
+    // Off already while a virtual display has the desktop to itself (src/vdisplay). Turned off
+    // anyway, as for "no connection" (`INVALID_PRIVACY_MODE_CONN_ID`) it would be, it would let go
+    // of the local input that display holds, or lay the desktop out anew.
+    #[cfg(windows)]
+    if crate::vdisplay::taking_over()
+        && privacy_mode.pre_conn_id() == INVALID_PRIVACY_MODE_CONN_ID
+    {
+        return Some(Ok(()));
+    }
+    Some(privacy_mode.turn_off_privacy(conn_id, state))
 }
 
 #[inline]

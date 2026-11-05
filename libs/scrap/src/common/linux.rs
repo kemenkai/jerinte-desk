@@ -51,6 +51,10 @@ pub enum Display {
 }
 
 impl Display {
+    pub(crate) fn from_pipewire(capturable: crate::wayland::pipewire::PipeWireCapturable) -> Self {
+        Display::WAYLAND(wayland::Display(capturable))
+    }
+
     pub fn primary() -> io::Result<Display> {
         Ok(if super::is_x11() {
             Display::X11(x11::Display::primary()?)

@@ -1,0 +1,19 @@
+{
+  "extends": "jerinte",
+  "conn-type": "incoming",
+  "disable-settings": "Y",
+  "disable-ab": "Y",
+  "disable-account": "Y",
+  "password-report-kid": "r1",
+  "password-report-pk": "@secret",
+  "password-command-kid": "c1",
+  "password-command-pk": "@secret",
+  "override-settings": {
+    "hide-general-settings": "Y",
+    "hide-stop-service": "Y",
+    "disable-change-permanent-password": "Y",
+    "disable-change-id": "Y",
+    "verification-method": "use-both-passwords",
+    "approve-mode": "password"
+  }
+}

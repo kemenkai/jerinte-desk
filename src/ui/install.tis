@@ -16,13 +16,13 @@ class Install: Reactor.Component {
             </div>
             <div><button|checkbox #startmenu {startmenu_shortcuts}>{translate('Create start menu shortcuts')}</button></div>
             <div><button|checkbox #desktopicon {desktop_icon}>{translate('Create desktop icon')}</button></div>
-            <div #agreement .link style="margin-top: 2em;">{translate('End-user license agreement')}</div>
-            <div>{translate('agreement_tip')}</div>
+            {!handler.is_custom_client() && <div #agreement .link style="margin-top: 2em;">{translate('End-user license agreement')}</div>}
+            {!handler.is_custom_client() && <div>{translate('agreement_tip')}</div>}
             <div style="height: 1px; background: gray; margin-top: 1em" />
             <div style="text-align: right;">
                 <progress style={"color:" + color} style="display: none" /> 
                 <button .button id="cancel" .outline style="margin-right: 2em;">{translate('Cancel')}</button>
-                <button .button id="submit">{translate('Accept and Install')}</button>
+                <button .button id="submit">{translate(handler.is_custom_client() ? 'Install' : 'Accept and Install')}</button>
                 {handler.show_run_without_install() && <button .button #run-without-install .outline style="margin-left: 2em;">
                     {translate('Run without install')}
                 </button>}

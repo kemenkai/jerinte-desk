@@ -263,7 +263,7 @@ pub fn core_main() -> Option<CoreMainAction> {
                     },
                 };
                 Toast::new(Toast::POWERSHELL_APP_ID)
-                    .title(&config::APP_NAME.read().unwrap())
+                    .title(&crate::get_app_display_name())
                     .text1(&translate(text))
                     .sound(Some(Sound::Default))
                     .duration(Duration::Short)
@@ -295,7 +295,7 @@ pub fn core_main() -> Option<CoreMainAction> {
                     }
                 };
                 Toast::new(Toast::POWERSHELL_APP_ID)
-                    .title(&config::APP_NAME.read().unwrap())
+                    .title(&crate::get_app_display_name())
                     .text1(&text)
                     .sound(Some(Sound::Default))
                     .duration(Duration::Short)
@@ -377,6 +377,16 @@ pub fn core_main() -> Option<CoreMainAction> {
             log::info!("start --uninstall-service");
             crate::platform::uninstall_service(false, true);
             return None;
+        } else if args[0] == "--release-virtual-displays" {
+            // Run by systemd as root once the service has stopped.
+            #[cfg(target_os = "linux")]
+            crate::vdisplay::release_leftovers();
+            return None;
+        } else if args[0] == "--vkms-boot" {
+            // Run by systemd as root at boot, before the display manager.
+            #[cfg(target_os = "linux")]
+            crate::vdisplay::vkms_boot();
+            return None;
         } else if args[0] == "--service" {
             log::info!("start --service");
             crate::start_os_service();
@@ -394,7 +404,10 @@ pub fn core_main() -> Option<CoreMainAction> {
                 hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
             }
             #[cfg(windows)]
-            crate::privacy_mode::restore_reg_connectivity(true, false);
+            {
+                crate::privacy_mode::restore_reg_connectivity(true, false);
+                crate::vdisplay::clean_leftover();
+            }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 crate::start_server(true, false);
@@ -816,7 +829,7 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
         use winapi::um::winuser::WM_USER;
         let res = crate::platform::send_message_to_hnwd(
             &crate::platform::FLUTTER_RUNNER_WIN32_WINDOW_CLASS,
-            &crate::get_app_name(),
+            &crate::get_app_display_name(),
             (WM_USER + 2) as _, // referred from unilinks desktop pub
             uni_links.as_str(),
             false,

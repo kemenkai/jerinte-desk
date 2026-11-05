@@ -1,0 +1,14 @@
+[Unit]
+Description=RustDesk virtual displays (vkms, loaded before the desktop)
+# Once at boot, before the display manager: the X server then starts with vkms, kept off until a
+# virtual display needs it. Never while a desktop runs; rustdesk checks.
+After=systemd-udev-trigger.service systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rustdesk --vkms-boot
+TimeoutStartSec=20
+
+[Install]
+WantedBy=graphical.target

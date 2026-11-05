@@ -237,6 +237,15 @@ pub fn set_password(value: &str) -> ResultType<bool> {
     })
 }
 
+/// Writes a permanent password given in its stored form, as the password report sets a new one.
+/// Like `set_password` it revokes the trusted devices; unlike it, a build that keeps the user from
+/// changing the password does not stop it.
+pub fn set_password_storage(storage: &str, salt: &str) -> ResultType<bool> {
+    change(true, || {
+        Config::set_permanent_password_storage_for_sync(storage, salt)
+    })
+}
+
 pub fn changes_password(value: &str) -> bool {
     if Config::is_disable_change_permanent_password() {
         return false;

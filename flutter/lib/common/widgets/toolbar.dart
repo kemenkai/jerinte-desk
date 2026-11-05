@@ -1459,6 +1459,9 @@ void registerToolbarShortcuts(BuildContext context, String id, FFI ffi) {
 }
 
 bool showVirtualDisplayMenu(FFI ffi) {
+  if (ffi.virtualDisplayModel.available) {
+    return true;
+  }
   if (ffi.ffiModel.pi.platform != kPeerPlatformWindows) {
     return false;
   }
@@ -1471,10 +1474,107 @@ bool showVirtualDisplayMenu(FFI ffi) {
   return false;
 }
 
+// One virtual display per monitor of this device, each the size of that monitor
+// (src/vdisplay in Rust).
+List<Widget> _virtualDisplayPerMonitorMenu(
+    FFI ffi, String id, VoidCallback? clickCallBack) {
+  final model = ffi.virtualDisplayModel;
+  final sessionId = ffi.sessionId;
+  final privacyModeState = PrivacyModeState.find(id);
+  // Built on every hover of the toolbar: no work for Rust here.
+  model.refreshSoon();
+  final monitors = model.monitors;
+  final children = <Widget>[];
+  for (final m in monitors) {
+    children.add(Obx(() => CkbMenuButton(
+          value: model.displays.containsKey(m.slot),
+          onChanged: privacyModeState.isNotEmpty || ffi.ffiModel.viewOnly
+              ? null
+              : (bool? value) {
+                  if (value != null) {
+                    model.toggle(m.slot, value);
+                    clickCallBack?.call();
+                  }
+                },
+          child: Text(
+              '${translate('Monitor')} ${m.slot + 1} (${m.width}x${m.height})'),
+          ffi: ffi,
+        )));
+  }
+  children.add(Divider());
+  children.add(CkbMenuButton(
+    value: !bind.sessionGetToggleOptionSync(
+        sessionId: sessionId, arg: kOptionDisableAutoVirtualDisplay),
+    onChanged: (bool? value) {
+      if (value == null) return;
+      bind.sessionPeerOption(
+          sessionId: sessionId,
+          name: kOptionDisableAutoVirtualDisplay,
+          value: value ? '' : 'Y');
+      clickCallBack?.call();
+    },
+    child: Text(translate('Add one for my monitor on connecting')),
+    ffi: ffi,
+  ));
+  // Only a choice where the peer cannot show HiDPI and a monitor here is HiDPI.
+  if (!model.peerHasHiDpi && monitors.any((m) => m.scale > 1.0)) {
+    children.add(CkbMenuButton(
+      value: bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: kOptionVirtualDisplayPixels),
+      onChanged: (bool? value) async {
+        if (value == null) return;
+        // Set before the held displays are asked for again at their new size.
+        await bind.sessionPeerOption(
+            sessionId: sessionId,
+            name: kOptionVirtualDisplayPixels,
+            value: value ? 'Y' : '');
+        model.resizeHeld();
+        clickCallBack?.call();
+      },
+      child: Text(translate('Use all the pixels of HiDPI monitors')),
+      ffi: ffi,
+    ));
+  }
+  // Only where the peer can hand its desktop over to the virtual display, its monitors dark and
+  // its input locked: privacy mode, which the peer may not allow.
+  if (model.peerHasPrivacy) {
+    final allowed = ffi.ffiModel.permissions['privacy_mode'] != false;
+    children.add(Obx(() => CkbMenuButton(
+          value: allowed && model.mode == 'privacy',
+          onChanged: !allowed ||
+                  privacyModeState.isNotEmpty ||
+                  ffi.ffiModel.viewOnly
+              ? null
+              : (bool? value) {
+                  if (value == null) return;
+                  model.setMode(value ? 'privacy' : 'shared');
+                  clickCallBack?.call();
+                },
+          child: Text(translate(
+              'Take the desktop over, its screen dark and its input locked')),
+          ffi: ffi,
+        )));
+  }
+  children.add(Obx(() => MenuButton(
+        onPressed: privacyModeState.isNotEmpty || model.displays.isEmpty
+            ? null
+            : () {
+                model.removeAll();
+                clickCallBack?.call();
+              },
+        ffi: ffi,
+        child: Text(translate('Plug out all')),
+      )));
+  return children;
+}
+
 List<Widget> getVirtualDisplayMenuChildren(
     FFI ffi, String id, VoidCallback? clickCallBack) {
   if (!showVirtualDisplayMenu(ffi)) {
     return [];
+  }
+  if (ffi.virtualDisplayModel.available) {
+    return _virtualDisplayPerMonitorMenu(ffi, id, clickCallBack);
   }
   final pi = ffi.ffiModel.pi;
   final privacyModeState = PrivacyModeState.find(id);

@@ -46,6 +46,11 @@ mod clipboard_service;
 pub use clipboard_service::is_clipboard_service_ok;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland;
+#[cfg(target_os = "linux")]
+pub(crate) mod mutter;
+// Built on macOS too, for its tests.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+mod mutter_policy;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) mod drm_capturer;
 #[cfg(target_os = "linux")]
@@ -192,6 +197,17 @@ async fn accept_connection_(
     // there is TIME_WAIT before socket really released, so sometimes we
     // see "Only one usage of each socket address is normally permitted" on windows sometimes,
     let listener = new_listener(local_addr, true).await?;
+    accept_on_listener(server, listener, secure, meta, slot).await
+}
+
+/// Take the one connection the peer was told to make to `listener`.
+async fn accept_on_listener(
+    server: ServerPtr,
+    listener: tokio::net::TcpListener,
+    secure: bool,
+    meta: ConnectionMeta,
+    slot: crate::rendezvous_mediator::PunchSlot,
+) -> ResultType<()> {
     log::info!("Server listening on: {}", &listener.local_addr()?);
     if let Ok((stream, addr)) = timeout(CONNECT_TIMEOUT, listener.accept()).await? {
         // The peer is in: the place goes back before the session runs, as every punch's does.
@@ -362,6 +378,21 @@ pub(crate) async fn accept_connection(
     slot: crate::rendezvous_mediator::PunchSlot,
 ) {
     if let Err(err) = accept_connection_(server, socket, secure, meta, slot).await {
+        log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
+    }
+}
+
+/// `accept_connection` on a listener already opened, for an address that is not the rendezvous
+/// connection's own (a same-intranet answer over ws).
+pub(crate) async fn accept_connection_on(
+    server: ServerPtr,
+    listener: tokio::net::TcpListener,
+    peer_addr: SocketAddr,
+    secure: bool,
+    meta: ConnectionMeta,
+    slot: crate::rendezvous_mediator::PunchSlot,
+) {
+    if let Err(err) = accept_on_listener(server, listener, secure, meta, slot).await {
         log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
     }
 }
@@ -714,6 +745,7 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         wait_initial_config_sync().await;
         allow_err!(crate::trusted_devices::initialize());
+        crate::password_report::start();
         #[cfg(target_os = "windows")]
         crate::platform::try_kill_broker();
         #[cfg(feature = "hwcodec")]
@@ -839,6 +871,19 @@ async fn wait_initial_config_sync() {
     }
 }
 
+/// Set once this process has actually received root's config, or once the sync from root has
+/// given up for good (after which nothing overwrites the local copy). `wait_initial_config_sync`
+/// also stops waiting on a 3 s timeout, so code that must not act on a copy the first sync is
+/// about to replace (such as writing the permanent password) checks this instead.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static INITIAL_CONFIG_SYNC_SETTLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn initial_config_sync_settled() -> bool {
+    INITIAL_CONFIG_SYNC_SETTLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Sender<()>>) {
     let mut cfg0 = (Config::get(), Config2::get());
@@ -891,6 +936,8 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                                         }
                                     }
                                     synced = true;
+                                    INITIAL_CONFIG_SYNC_SETTLED
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
                                     // Notify startup waiter once initial sync phase finishes successfully.
                                     if let Some(tx) = sync_done_tx.take() {
                                         let _ = tx.send(());
@@ -956,6 +1003,7 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
     if let Some(tx) = sync_done_tx.take() {
         let _ = tx.send(());
     }
+    INITIAL_CONFIG_SYNC_SETTLED.store(true, std::sync::atomic::Ordering::SeqCst);
     log::warn!("skipped config sync");
 }
 

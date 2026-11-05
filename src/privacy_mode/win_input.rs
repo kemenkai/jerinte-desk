@@ -172,6 +172,11 @@ pub fn hook() -> ResultType<()> {
     }
 }
 
+/// Whether local input is held: a hook is in place, or has yet to end after `unhook`.
+pub fn hooked() -> bool {
+    *CUR_HOOK_THREAD_ID.lock().unwrap() != 0
+}
+
 pub fn unhook() -> ResultType<()> {
     unsafe {
         let cur_hook_thread_id = CUR_HOOK_THREAD_ID.lock().unwrap();
@@ -222,6 +227,9 @@ pub extern "system" fn privacy_mode_hook_keyboard(
                     let cltr_down = (GetKeyState(VK_CONTROL) as u16) & (0x8000 as u16) > 0;
                     let key = LOBYTE((*ks).vkCode as _);
                     if cltr_down && (key == 'p' as u8 || key == 'P' as u8) {
+                        // A desktop a virtual display took over is taken back (src/vdisplay);
+                        // privacy mode below is off then, and stays so.
+                        crate::vdisplay::ctrl_p();
                         // Ctrl + P is pressed, turn off privacy mode
                         if let Some(Err(e)) = super::turn_off_privacy(
                             super::INVALID_PRIVACY_MODE_CONN_ID,

@@ -1285,6 +1285,14 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         return;
     }
 
+    // A point inside a nested-session display goes to that session's own X server, leaving the
+    // shared desktop's cursor and focus alone. Anything else falls through to the desktop below,
+    // unchanged.
+    #[cfg(target_os = "linux")]
+    if nested::mouse(evt) {
+        return;
+    }
+
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
     let buttons = evt.mask >> 3;
@@ -2489,6 +2497,12 @@ pub fn handle_key_(evt: &KeyEvent) {
         return;
     }
 
+    // While the pointer is in a nested-session display, keys go to that session, not the shared
+    // desktop. `nested::key` says whether it took the event.
+    #[cfg(target_os = "linux")]
+    if nested::key(evt) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     super::uinput::prepare_layout(evt);
 
@@ -2727,6 +2741,210 @@ lazy_static::lazy_static! {
         (ControlKey::Insert, true),
         (ControlKey::Delete, true),
     ].iter().map(|(a, b)| (a.value(), b.clone())).collect();
+}
+
+/// Routing input to the X server of a `Mode::Nested` virtual display, so it drives that nested
+/// session and never the shared desktop's one cursor and focus. A point in a nested display's
+/// rectangle goes to its server with `XTEST`; the pointer being in one is what keyboard follows,
+/// the way focus follows the pointer. Everything else falls through to the desktop, untouched.
+///
+/// State is per input thread (one per connection), so two controlling sides never share a nested
+/// target. The `XTEST` connection to the nested server dies with it; a broken one is dropped and
+/// remade. Only `Map` keyboard mode is carried in: it sends the controlled side's own keycodes,
+/// which the nested server, sharing this machine's keymap, reads the same way. Other modes are
+/// swallowed rather than typed into the shared desktop behind the black of the nested view.
+#[cfg(target_os = "linux")]
+mod nested {
+    use super::*;
+    use crate::vdisplay::{self, NestedTarget};
+    use std::{cell::RefCell, collections::HashMap};
+    use x11rb::{
+        connection::Connection, protocol::xtest::ConnectionExt as _,
+        rust_connection::RustConnection,
+    };
+
+    // Core event types, as `XTEST` wants them.
+    const KEY_PRESS: u8 = 2;
+    const KEY_RELEASE: u8 = 3;
+    const BUTTON_PRESS: u8 = 4;
+    const BUTTON_RELEASE: u8 = 5;
+    const MOTION_NOTIFY: u8 = 6;
+    // A relative pointer move, not an absolute one, is `detail = 1` on a motion.
+    const RELATIVE: u8 = 1;
+    // Guards against a wild wheel delta turning into thousands of button clicks.
+    const MAX_WHEEL_CLICKS: i32 = 16;
+
+    struct Server {
+        conn: RustConnection,
+        root: u32,
+    }
+
+    thread_local! {
+        // The nested display the pointer is in, so keyboard can follow it.
+        static CURRENT: RefCell<Option<NestedTarget>> = RefCell::new(None);
+        // One `XTEST` connection per nested X server, made on first need.
+        static SERVERS: RefCell<HashMap<String, Server>> = RefCell::new(HashMap::new());
+    }
+
+    /// Takes a mouse event when it lands in a nested display, driving that display's server
+    /// instead of the shared desktop. Returns whether it took it; `false` leaves the event to the
+    /// desktop, unchanged.
+    pub fn mouse(evt: &MouseEvent) -> bool {
+        if !vdisplay::any_nested() {
+            CURRENT.with(|c| *c.borrow_mut() = None);
+            return false;
+        }
+        let evt_type = evt.mask & MOUSE_TYPE_MASK;
+        // Events with no point of their own go where the pointer last was. Besides the wheel and
+        // relative moves, some clients send a button up/down without coordinates, as (0, 0) (see
+        // the whiteboard path); reading that as a click at the screen origin would clear the
+        // target and leak the click to the shared desktop, so it too follows the last point.
+        let coordinate_less = matches!(
+            evt_type,
+            MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD | MOUSE_TYPE_MOVE_RELATIVE
+        ) || (matches!(evt_type, MOUSE_TYPE_DOWN | MOUSE_TYPE_UP)
+            && evt.x == 0
+            && evt.y == 0);
+        let target = if coordinate_less {
+            CURRENT.with(|c| c.borrow().clone())
+        } else {
+            let hit = vdisplay::nested_at(evt.x, evt.y);
+            CURRENT.with(|c| *c.borrow_mut() = hit.clone());
+            hit
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        // In a nested display: whatever happens, do not let it reach the shared desktop.
+        inject_mouse(&target, evt, evt_type);
+        true
+    }
+
+    /// Takes a key event while the pointer is in a nested display. Returns whether it took it.
+    pub fn key(evt: &KeyEvent) -> bool {
+        if !vdisplay::any_nested() {
+            return false;
+        }
+        let Some(target) = CURRENT.with(|c| c.borrow().clone()) else {
+            return false;
+        };
+        // Only `Map` mode carries a keycode this machine's keymap reads; other modes would need
+        // translating, which v1 does not do for the nested server. Swallow them: the view is of
+        // the nested display, so the shared desktop must not get them either.
+        if evt.mode.enum_value() == Ok(KeyboardMode::Map) {
+            let code = evt.chr();
+            if code > 0 && code <= u8::MAX as u32 {
+                with_server(&target.display, |s| {
+                    let kind = if evt.down { KEY_PRESS } else { KEY_RELEASE };
+                    s.conn
+                        .xtest_fake_input(kind, code as u8, 0, s.root, 0, 0, 0)?;
+                    s.conn.flush()?;
+                    Ok(())
+                });
+            }
+        }
+        true
+    }
+
+    fn inject_mouse(target: &NestedTarget, evt: &MouseEvent, evt_type: i32) {
+        let buttons = evt.mask >> 3;
+        with_server(&target.display, |s| {
+            match evt_type {
+                MOUSE_TYPE_MOVE => {
+                    let (x, y) = ((evt.x - target.x) as i16, (evt.y - target.y) as i16);
+                    s.conn
+                        .xtest_fake_input(MOTION_NOTIFY, 0, 0, s.root, x, y, 0)?;
+                }
+                MOUSE_TYPE_MOVE_RELATIVE => {
+                    let (dx, dy) = (evt.x.clamp(-10000, 10000) as i16, evt.y.clamp(-10000, 10000) as i16);
+                    s.conn
+                        .xtest_fake_input(MOTION_NOTIFY, RELATIVE, 0, s.root, dx, dy, 0)?;
+                }
+                MOUSE_TYPE_DOWN => {
+                    if let Some(b) = x_button(buttons) {
+                        s.conn.xtest_fake_input(BUTTON_PRESS, b, 0, s.root, 0, 0, 0)?;
+                    }
+                }
+                MOUSE_TYPE_UP => {
+                    if let Some(b) = x_button(buttons) {
+                        s.conn.xtest_fake_input(BUTTON_RELEASE, b, 0, s.root, 0, 0, 0)?;
+                    }
+                }
+                MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD => {
+                    // One notch is one press-and-release of a wheel button: 4/5 up/down, 6/7
+                    // left/right. Signs follow the desktop path (which scrolls by -evt.y/-evt.x):
+                    // +y is up, +x is left.
+                    wheel(s, 4, 5, evt.y)?; // up for +y, down for -y
+                    wheel(s, 6, 7, evt.x)?; // left for +x, right for -x
+                }
+                _ => {}
+            }
+            s.conn.flush()?;
+            Ok(())
+        });
+    }
+
+    fn wheel(s: &Server, positive: u8, negative: u8, delta: i32) -> ResultType<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let button = if delta > 0 { positive } else { negative };
+        for _ in 0..delta.unsigned_abs().min(MAX_WHEEL_CLICKS as u32) {
+            s.conn.xtest_fake_input(BUTTON_PRESS, button, 0, s.root, 0, 0, 0)?;
+            s.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, s.root, 0, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    fn x_button(buttons: i32) -> Option<u8> {
+        Some(match buttons {
+            MOUSE_BUTTON_LEFT => 1,
+            MOUSE_BUTTON_WHEEL => 2,
+            MOUSE_BUTTON_RIGHT => 3,
+            MOUSE_BUTTON_BACK => 8,
+            MOUSE_BUTTON_FORWARD => 9,
+            _ => return None,
+        })
+    }
+
+    // Runs `f` against the nested server's connection, making it on first need. A connection that
+    // errors (the server gone) is dropped, so the next call makes a fresh one.
+    fn with_server(display: &str, f: impl FnOnce(&Server) -> ResultType<()>) {
+        let ok = SERVERS.with(|servers| {
+            let mut servers = servers.borrow_mut();
+            if !servers.contains_key(display) {
+                match connect(display) {
+                    Some(server) => {
+                        servers.insert(display.to_owned(), server);
+                    }
+                    None => return false,
+                }
+            }
+            let Some(server) = servers.get(display) else {
+                return false;
+            };
+            if let Err(e) = f(server) {
+                log::warn!("Nested input to {} failed, dropping it: {}", display, e);
+                servers.remove(display);
+                return false;
+            }
+            true
+        });
+        let _ = ok;
+    }
+
+    fn connect(display: &str) -> Option<Server> {
+        match x11rb::connect(Some(display)) {
+            Ok((conn, screen)) => {
+                let root = conn.setup().roots.get(screen).map(|s| s.root)?;
+                Some(Server { conn, root })
+            }
+            Err(e) => {
+                log::warn!("Failed to reach nested X server {}: {}", display, e);
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]

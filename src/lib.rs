@@ -19,6 +19,11 @@ mod lan;
 mod rendezvous_mediator;
 #[cfg(not(any(target_os = "ios")))]
 pub use self::rendezvous_mediator::*;
+#[cfg(not(any(target_os = "ios")))]
+mod server_entries;
+// Recorded by the registration loop, which iOS has none of.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+mod service_status;
 /// cbindgen:ignore
 pub mod common;
 #[cfg(not(any(target_os = "ios")))]
@@ -63,6 +68,9 @@ mod whiteboard;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod updater;
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod password_report;
+
 mod ui_cm_interface;
 mod ui_interface;
 mod ui_session_interface;
@@ -76,5 +84,8 @@ pub mod privacy_mode;
 
 #[cfg(windows)]
 pub mod virtual_display_manager;
+
+// Cross-platform virtual displays (fork); the upstream Windows path is virtual_display_manager.
+pub mod vdisplay;
 
 mod kcp_stream;

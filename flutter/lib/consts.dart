@@ -29,6 +29,17 @@ const String kPlatformAdditionsAmyuniVirtualDisplays =
 const String kPlatformAdditionsHasFileClipboard = "has_file_clipboard";
 const String kPlatformAdditionsSupportedPrivacyModeImpl =
     "supported_privacy_mode_impl";
+// The peer's cross-platform virtual displays (src/vdisplay): what it can make.
+const String kPlatformAdditionsVirtualDisplayCaps = "vdm_caps";
+
+// Per peer: don't ask for a virtual display the size of this monitor on connecting ("Y").
+const String kOptionDisableAutoVirtualDisplay = "disable-auto-virtual-display";
+// Per peer: ask a peer without HiDPI displays for all the pixels of a HiDPI monitor ("Y").
+const String kOptionVirtualDisplayPixels = "virtual-display-pixels";
+// Per peer: how a virtual display asked for is used — "" / "shared" (an extra screen, the
+// default), "privacy" (the desktop taken over on it, the peer's monitors dark), "nested" (a
+// session of its own on it). Only a mode the peer offers takes effect.
+const String kOptionVirtualDisplayMode = "virtual-display-mode";
 
 const String kPrivacyModeImplMag = 'privacy_mode_impl_mag';
 const String kPrivacyModeImplExcludeFromCapture =
@@ -115,6 +126,7 @@ const String kOptionEnableClipboard = "enable-clipboard";
 const String kOptionEnableFileTransfer = "enable-file-transfer";
 const String kOptionEnableAudio = "enable-audio";
 const String kOptionEnableCamera = "enable-camera";
+const String kOptionEnableRemoteVirtualDisplay = "enable-remote-virtual-display";
 const String kOptionEnableTerminal = "enable-terminal";
 const String kOptionTerminalPersistent = "terminal-persistent";
 const String kOptionAllowTerminalClipboardWrite =

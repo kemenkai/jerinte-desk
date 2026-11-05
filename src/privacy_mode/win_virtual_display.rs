@@ -335,6 +335,10 @@ impl PrivacyModeImpl {
     // 1. A new thread is created to handle the async privacy mode.
     // 2. The user is usually not in a hurry to turn on the privacy mode.
     pub fn ensure_virtual_display(&mut self, is_async_mode: bool) -> ResultType<()> {
+        // The virtual display manager's display would be taken as this mode's own.
+        if virtual_display_manager::amyuni_idd::backend_holds() {
+            bail!("The virtual display is in use by a remote session.");
+        }
         if self.virtual_displays.is_empty() {
             let displays =
                 virtual_display_manager::plug_in_peer_request(vec![Self::default_display_modes()])?;

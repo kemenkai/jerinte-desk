@@ -27,6 +27,21 @@ lazy_static::lazy_static! {
 
 pub fn init() {
     set_map_err(map_err_scrap);
+    super::mutter::init();
+}
+
+// Whether to capture through Mutter (`super::mutter`), asking again should nothing be captured
+// through the portal yet: GNOME Shell may have come up since the first answer.
+// try_read, as in is_inited (which calls this first, on the login's worker): an init waiting for
+// the portal's picker holds the write lock. Busy is a portal capture under way, so no asking again.
+fn through_mutter() -> bool {
+    if !super::mutter::active()
+        && !scrap::wayland::pipewire::is_rdp_session_hold()
+        && matches!(CAP_DISPLAY_INFO.try_read(), Ok(map) if map.is_empty())
+    {
+        super::mutter::decide_again();
+    }
+    super::mutter::active()
 }
 
 pub(super) fn increment_active_display_count() -> usize {
@@ -385,6 +400,12 @@ pub(super) async fn update_uinput_resolution() {
 
 #[tokio::main(flavor = "current_thread")]
 pub(super) async fn ensure_inited() -> ResultType<()> {
+    // Through Mutter, nothing to set up but the list, best effort: the physical monitors being
+    // unavailable now fails only their own capturers, in `get_capturer_for_display`.
+    if super::mutter::active() {
+        super::mutter::refresh();
+        return Ok(());
+    }
     // DRM/KMS capture (opt-in): the root service owns the reader and the capturer self-inits over
     // IPC, so there is no PipeWire recorder to initialize here. But we still must set the uinput
     // desktop rect (check_init does this on the PipeWire path, and the DRM path skips check_init).
@@ -397,7 +418,7 @@ pub(super) async fn ensure_inited() -> ResultType<()> {
 }
 
 pub(super) fn is_inited() -> Option<Message> {
-    if is_x11() {
+    if is_x11() || through_mutter() {
         None
     } else {
         #[cfg(feature = "drm")]
@@ -598,6 +619,14 @@ fn init_displays() -> ResultType<()> {
 }
 
 pub(super) async fn get_displays_and_primary() -> ResultType<(Vec<DisplayInfo>, usize)> {
+    // D-Bus calls and maybe recording, which block: off the connection's executor.
+    match hbb_common::tokio::task::spawn_blocking(|| through_mutter().then(super::mutter::login))
+        .await
+        .map_err(|err| anyhow::anyhow!("Mutter display probe task failed: {err}"))?
+    {
+        Some(login) => return login,
+        None => {}
+    }
     #[cfg(feature = "drm")]
     if super::drm_capturer::is_available_cached() {
         // This function runs once per login (update_get_sync_displays_on_login is its only
@@ -639,7 +668,8 @@ pub(super) async fn get_displays_and_primary() -> ResultType<(Vec<DisplayInfo>, 
 }
 
 pub fn clear() {
-    if is_x11() {
+    // Through Mutter, each capturer stops its own pipeline.
+    if is_x11() || super::mutter::active() {
         return;
     }
     // The DRM path augments its geometry from the compositor's Wayland outputs (logical origin +
@@ -725,6 +755,9 @@ pub(super) fn get_capturer_for_display(
 ) -> ResultType<super::video_service::CapturerInfo> {
     if is_x11() {
         bail!("Do not call this function if not wayland");
+    }
+    if super::mutter::active() {
+        return super::mutter::capturer_for(display_idx);
     }
     // DRM/KMS capture path: build the capturer straight from the service `_drm` stream, bypassing
     // the PipeWire CAP_DISPLAY_INFO machinery entirely. `is_available()` is a GLOBAL verdict, so a

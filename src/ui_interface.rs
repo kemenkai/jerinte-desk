@@ -46,6 +46,10 @@ pub struct UiStatus {
     pub id: String,
     #[cfg(feature = "flutter")]
     pub video_conn_count: usize,
+    /// What the service is connected to on our servers (`service_status`), none from a service
+    /// before it.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub services: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +70,8 @@ lazy_static::lazy_static! {
         id: "".to_owned(),
         #[cfg(feature = "flutter")]
         video_conn_count: 0,
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        services: None,
     }));
     static ref ASYNC_JOB_STATUS : Arc<Mutex<String>> = Default::default();
     static ref ASYNC_HTTP_STATUS : Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -364,6 +370,14 @@ pub fn get_options() -> String {
 
 #[inline]
 pub fn test_if_valid_server(host: String, test_with_proxy: bool) -> String {
+    if hbb_common::websocket::is_ws_endpoint(&host) {
+        return match crate::common::ws_url_host_port(&host) {
+            Ok(host_port) => {
+                hbb_common::socket_client::test_if_valid_server(&host_port, test_with_proxy)
+            }
+            Err(err) => err,
+        };
+    }
     hbb_common::socket_client::test_if_valid_server(&host, test_with_proxy)
 }
 
@@ -1399,6 +1413,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
     let mut key_confirmed = false;
     let mut rx = rx;
     let mut mouse_time = 0;
+    let mut services: Option<serde_json::Value> = None;
     #[cfg(feature = "flutter")]
     let mut video_conn_count = 0;
     #[cfg(not(feature = "flutter"))]
@@ -1427,6 +1442,12 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                             Ok(Some(ipc::Data::Options(Some(v)))) => {
                                 *OPTIONS.lock().unwrap() = v;
                                 *OPTION_SYNCED.lock().unwrap() = true;
+                            }
+                            // Written as it comes, like the mouse time; `None` from a service
+                            // before it.
+                            Ok(Some(ipc::Data::Config((name, value)))) if name == crate::service_status::IPC_NAME => {
+                                services = value.and_then(|v| serde_json::from_str(&v).ok());
+                                UI_STATUS.lock().unwrap().services = services.clone();
                             }
                             Ok(Some(ipc::Data::Config((name, Some(value))))) => {
                                 if name == "id" {
@@ -1460,6 +1481,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                     id: id.clone(),
                                     #[cfg(feature = "flutter")]
                                     video_conn_count,
+                                    services: services.clone(),
                                 };
                             }
                             Ok(Some(ipc::Data::ControlPermissionsRemoteModify(v))) => {
@@ -1482,6 +1504,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                         allow_err!(c.send(&data).await);
                     }
                     _ = timer.tick() => {
+                        c.send(&ipc::Data::Config((crate::service_status::IPC_NAME.to_owned(), None))).await.ok();
                         c.send(&ipc::Data::OnlineStatus(None)).await.ok();
                         c.send(&ipc::Data::Options(None)).await.ok();
                         c.send(&ipc::Data::Config(("id".to_owned(), None))).await.ok();
@@ -1502,6 +1525,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                 .insert("ipc-closed".to_owned(), "Y".to_owned());
             break;
         }
+        services = None;
         *UI_STATUS.lock().unwrap() = UiStatus {
             status_num: -1,
             #[cfg(not(feature = "flutter"))]
@@ -1512,6 +1536,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
             id: id.clone(),
             #[cfg(feature = "flutter")]
             video_conn_count,
+            services: None,
         };
         sleep(1.).await;
     }
@@ -1767,7 +1792,16 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_windows_service_video_save_directory;
+    use super::{test_if_valid_server, validate_windows_service_video_save_directory};
+
+    #[test]
+    fn full_websocket_urls_are_valid_servers() {
+        let valid = |s: &str| test_if_valid_server(s.to_owned(), false).is_empty();
+        assert!(valid("wss://127.0.0.1:4443/p1/id"));
+        assert!(valid("ws://[::1]/ws/relay"));
+        assert!(!valid("wss:///127.0.0.1:4443/p1/id"));
+        assert!(!valid("wss://127.0.0.1:99999/p1/id"));
+    }
 
     #[test]
     fn validate_service_video_save_directory() {

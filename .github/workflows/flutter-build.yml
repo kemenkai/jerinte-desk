@@ -9,6 +9,14 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      targets:
+        # Private builds: comma separated subset of linux, macos, windows; "all" keeps every job.
+        type: string
+        default: "all"
+      variant:
+        # Private builds: a directory under res/custom whose overlay goes over the checkout.
+        type: string
+        default: ""
       publish-update-metadata:
         type: boolean
         default: false
@@ -95,6 +103,7 @@ jobs:
         run: python res/update/generate_update_metadata.py check-key
 
   generate-sbom:
+    if: ${{ inputs.targets == 'all' }}
     needs: [validate-update-metadata-keys]
     runs-on: ubuntu-latest
 
@@ -116,7 +125,7 @@ jobs:
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
@@ -128,6 +137,7 @@ jobs:
     uses: ./.github/workflows/bridge.yml
 
   build-RustDeskTempTopMostWindow:
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'windows') }}
     needs: [validate-update-metadata-keys]
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     strategy:
@@ -138,10 +148,6 @@ jobs:
               target: windows-2022,
               platform: x64,
             }
-          - {
-              target: windows-11-arm,
-              platform: ARM64,
-            }
     with:
       upload-artifact: ${{ inputs.upload-artifact }}
       target: ${{ matrix.job.target }}
@@ -150,6 +156,7 @@ jobs:
       target_version: Windows10
 
   build-for-windows-flutter:
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'windows') }}
     name: ${{ matrix.job.target }}
     needs: [build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
@@ -167,16 +174,6 @@ jobs:
               vcpkg-triplet: x64-windows-static,
               build-args: "--vram",
             }
-          - {
-              target: aarch64-pc-windows-msvc,
-              os: windows-11-arm,
-              arch: aarch64,
-              flutter-arch: arm64,
-              vcpkg-triplet: arm64-windows-static,
-              # vram is x86/x64-only (NVENC needs CUDA, Intel MediaSDK needs __rdtsc);
-              # no NV/Intel/AMD hardware exists on Windows-on-ARM, so vram stays disabled here.
-              build-args: "",
-            }
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -190,14 +187,34 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply custom client variant
+        if: ${{ inputs.variant != '' }}
+        shell: bash
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
+          VARIANT: ${{ inputs.variant }}
+        run: bash res/custom/apply.sh "$VARIANT"
+
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          # arm64 is on Flutter 3.44, so it needs the bridge generated with the same Flutter
-          # (its *.freezed.dart must match the freezed the arm64 build resolves). x64 and every
-          # other platform keep the default 3.22.3-generated bridge.
-          name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          # The bridge is saved on Linux: a Windows runner only sees it across OSes.
+          enableCrossOsArchive: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+      # A cache miss here was logged as an error yet left the step green, and the build then
+      # failed half an hour later on the missing bridge; stop right away instead.
+      - name: Check bridge files
+        shell: bash
+        run: test -f ./src/bridge_generated.rs && test -f ./flutter/lib/generated_bridge.dart
 
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
@@ -289,6 +306,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ inputs.variant == '' }}
           prefix-key: ${{ matrix.job.os }}
 
       - name: Setup vcpkg with Github Actions binary cache
@@ -394,14 +412,22 @@ jobs:
           fi
 
       - name: Download RustDeskTempTopMostWindow artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         if: ${{ inputs.upload-artifact }}
         with:
-          name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
-          path: "./rustdesk"
+          key: topmostwindow-${{ matrix.job.arch == 'aarch64' && 'ARM64' || 'x64' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: ./RustDeskTempTopMostWindow/WindowInjection/${{ matrix.job.arch == 'aarch64' && 'ARM64' || 'x64' }}/Release/WindowInjection.dll
 
+      # The cache restores the dll where the other job built it; the artifact used to land in ./rustdesk.
+      - name: Place RustDeskTempTopMostWindow
+        if: ${{ inputs.upload-artifact }}
+        shell: bash
+        run: cp ./RustDeskTempTopMostWindow/WindowInjection/${{ matrix.job.arch == 'aarch64' && 'ARM64' || 'x64' }}/Release/WindowInjection.dll ./rustdesk/
+
+      # Private builds: skipped (artifact storage quota); exe and msi are published to the release below.
       - name: Upload unsigned
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (false) && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
@@ -450,7 +476,7 @@ jobs:
           cp ./target/${{ matrix.job.target }}/release/rustdesk-portable-packer.exe ./packer-template/rustdesk-template-${{ matrix.job.arch }}.exe
 
       - name: Upload unsigned template packer
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-packer-template-${{ matrix.job.arch }}
@@ -482,7 +508,10 @@ jobs:
         # Builds the MSI for the matrix arch. res/msi (WiX v4 + native CustomActions) carries
         # both x64 and ARM64 platform configs; WcaUtil/DUtil ship arm64 libs. msbuild platform
         # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
-        if: env.UPLOAD_ARTIFACT == 'true'
+        # Not for custom client variants (res/custom/apply.sh), which ship the exe only.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.CUSTOM_VARIANT == ''
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
         run: |
           pushd ./res/msi
           python preprocess.py --arp -d ../../rustdesk
@@ -511,7 +540,7 @@ jobs:
         # Building the arm64 template on the native arm64 runner makes the ARM
         # package available: the build agents are x64 and cannot run
         # preprocess.py against an ARM exe.
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && env.CUSTOM_VARIANT == ''
         run: |
           git checkout -- res/msi
           cp -r ./rustdesk ./rustdesk-msi-template
@@ -534,8 +563,9 @@ jobs:
           git checkout -- res/msi
           rm -r -fo ./rustdesk-msi-template
 
+      # Private builds: skipped (artifact storage quota); only publish_unsigned, a full build, used it.
       - name: Upload unsigned msi template
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (false) && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-msi-template-${{ matrix.job.arch }}
@@ -548,7 +578,7 @@ jobs:
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput
 
       - name: Upload signed Windows Flutter EXE
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-flutter-${{ matrix.job.arch }}-exe
@@ -556,7 +586,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload signed Windows Flutter MSI
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-flutter-${{ matrix.job.arch }}-msi
@@ -565,7 +595,7 @@ jobs:
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant == ''
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
@@ -573,8 +603,22 @@ jobs:
             ./SignOutput/rustdesk-*.msi
             ./SignOutput/rustdesk-*.exe
 
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(./SignOutput/rustdesk-*.msi ./SignOutput/rustdesk-*.exe)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
+  # Private builds select it with `sciter` in targets: Windows 7 without a WDDM display driver
+  # cannot run the Flutter UI.
   build-for-windows-sciter:
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'sciter') }}
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.os }}
@@ -606,6 +650,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply custom client variant
+        if: ${{ inputs.variant != '' }}
+        shell: bash
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
+          VARIANT: ${{ inputs.variant }}
+        run: bash res/custom/apply.sh "$VARIANT"
+
       - name: Install LLVM and Clang
         uses: rustdesk-org/install-llvm-action-32bit@6aa7d9ad3df84dff01cd4596dd0fc880a7f47fce # no release tag; commit 2026-05-26
         with:
@@ -629,6 +681,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ inputs.variant == '' }}
           prefix-key: ${{ matrix.job.os }}-sciter
 
       - name: Setup vcpkg with Github Actions binary cache
@@ -695,8 +748,9 @@ jobs:
             ls -l ./libs/portable/Runner.res;
           fi
 
+      # Private builds: skipped (artifact storage quota); the exe is published to the release below.
       - name: Upload unsigned
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (false) && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
@@ -745,7 +799,7 @@ jobs:
           cp ./target/${{ matrix.job.target }}/release/rustdesk-portable-packer.exe ./packer-template/rustdesk-template-${{ matrix.job.arch }}.exe
 
       - name: Upload unsigned template packer
-        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL != '-2') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-packer-template-${{ matrix.job.arch }}
@@ -770,7 +824,7 @@ jobs:
           BASE_URL=${{ env.SIGN_BASE_URL }} SECRET_KEY=${{ secrets.SIGN_SECRET_KEY }} python3 res/job.py sign_files ./SignOutput/
 
       - name: Upload signed Windows Sciter EXE
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.SIGN_BASE_URL != '-2') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-sciter-x86-exe
@@ -779,15 +833,26 @@ jobs:
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant == ''
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
             ./SignOutput/rustdesk-*.exe
 
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(./SignOutput/rustdesk-*.exe)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
   build-rustdesk-ios:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -863,14 +928,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ inputs.variant == '' }}
           prefix-key: rustdesk-lib-cache-ios
           key: ${{ matrix.job.target }}
 
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - name: Build rustdesk lib
         run: |
@@ -878,6 +951,7 @@ jobs:
           cargo build --locked --features flutter,hwcodec --release --target aarch64-apple-ios --lib
           
       - name: Upload liblibrustdesk.a Artifacts
+        if: inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: liblibrustdesk.a
@@ -909,6 +983,7 @@ jobs:
 
 
   build-for-macOS:
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'macos') }}
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -916,14 +991,6 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - {
-              target: x86_64-apple-darwin,
-              os: macos-15-intel, #macos-latest or macos-14 use M1 now, https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#:~:text=14%20GB-,macos%2Dlatest%20or%20macos%2D14,-The%20macos%2Dlatestlabel
-              extra-build-args: "",
-              extra-cargo-features: "",
-              arch: x86_64,
-              vcpkg-triplet: x64-osx,
-            }
           - {
               target: aarch64-apple-darwin,
               os: macos-14,
@@ -945,6 +1012,14 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
+
+      - name: Apply custom client variant
+        if: ${{ inputs.variant != '' }}
+        shell: bash
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
+          VARIANT: ${{ inputs.variant }}
+        run: bash res/custom/apply.sh "$VARIANT"
 
       - name: Import the codesign cert
         if: env.MACOS_P12_BASE64 != null
@@ -1030,13 +1105,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ inputs.variant == '' }}
           prefix-key: ${{ matrix.job.os }}
 
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - name: Run the Dart tests
         if: ${{ !inputs.upload-artifact && matrix.job.arch == 'aarch64' }}
@@ -1104,6 +1187,24 @@ jobs:
           cargo test --locked --release --lib --features "$FEATURES"
           # Opt-in, and its macOS tests run nowhere else.
           cargo test --locked --release -p clipboard --features unix-file-copy-paste
+      # Info.plist sets LSHasLocalizedDisplayName (res/custom/apply.sh); Finder then shows the
+      # display name from these strings instead of the bundle's file name, RustDesk.app.
+      - name: Localized display name
+        if: env.CUSTOM_APP_DISPLAY_NAME != ''
+        run: |
+          for lproj in Base en; do
+            dir=./flutter/build/macos/Build/Products/Release/RustDesk.app/Contents/Resources/$lproj.lproj
+            mkdir -p "$dir"
+            printf 'CFBundleDisplayName = "%s";\nCFBundleName = "%s";\n' \
+              "$CUSTOM_APP_DISPLAY_NAME" "$CUSTOM_APP_DISPLAY_NAME" > "$dir/InfoPlist.strings"
+          done
+
+      # Without a signing identity the app keeps Xcode's ad-hoc signature with the hardened runtime,
+      # under which dyld refuses the ad-hoc frameworks ("different Team IDs"), and the service
+      # binary copied in later is outside the seal. Re-sign the bundle ad-hoc, without the runtime.
+      - name: Ad-hoc re-sign unsigned app
+        if: env.MACOS_P12_BASE64 == null && env.UPLOAD_ARTIFACT == 'true'
+        run: codesign --force --deep --sign - ./flutter/build/macos/Build/Products/Release/RustDesk.app
 
       - name: create unsigned dmg
         if: env.UPLOAD_ARTIFACT == 'true'
@@ -1111,10 +1212,11 @@ jobs:
           CREATE_DMG="$(command -v create-dmg)"
           CREATE_DMG="$(readlink -f "$CREATE_DMG")"
           sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
-          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+          create-dmg --volname "${CUSTOM_APP_DISPLAY_NAME:-RustDesk}" --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
 
+      # Private builds: skipped (artifact storage quota); the dmg is published to the release below.
       - name: Upload unsigned macOS app
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (false) && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-unsigned-macos-${{ matrix.job.arch }}
@@ -1144,7 +1246,7 @@ jobs:
               exit 1
             fi
           fi
-          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
+          create-dmg --volname "${CUSTOM_APP_DISPLAY_NAME:-RustDesk}" --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 rustdesk-${{ env.VERSION }}.dmg ./flutter/build/macos/Build/Products/Release/RustDesk.app
           codesign --force --options runtime -s ${{ secrets.MACOS_CODESIGN_IDENTITY }} --deep --strict rustdesk-${{ env.VERSION }}.dmg -vvv
           # notarize the rustdesk-${{ env.VERSION }}.dmg
           rcodesign notary-submit --api-key-path ${{ github.workspace }}/rustdesk.json  --staple rustdesk-${{ env.VERSION }}.dmg
@@ -1162,7 +1264,7 @@ jobs:
           test -f "rustdesk-${VERSION}-${ARCH}.dmg"
 
       - name: Upload signed macOS DMG
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.MACOS_P12_BASE64 != null
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA == 'true' && env.MACOS_P12_BASE64 != null) && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-${{ matrix.job.arch }}-dmg
@@ -1170,13 +1272,24 @@ jobs:
           if-no-files-found: error
 
       - name: Publish DMG package
-        if: env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
           files: |
             rustdesk*-${{ matrix.job.arch }}.dmg
+
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_UPDATE_METADATA != 'true') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(rustdesk*-${{ matrix.job.arch }}.dmg)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
 
   publish-signed-update-metadata:
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
@@ -1280,6 +1393,7 @@ jobs:
             --release-base-url https://github.com/rustdesk/rustdesk/releases/download
 
       - name: Upload signed update artifacts
+        if: inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1294,9 +1408,21 @@ jobs:
             ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.dmg
             ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.dmg
 
+      - name: Upload to the draft release (custom client)
+        if: (true) && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(./artifacts/rustdesk-${{ env.VERSION }}-x86_64.exe ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.msi ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.exe ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.msi ./artifacts/rustdesk-${{ env.VERSION }}-x86-sciter.exe ./artifacts/rustdesk-${{ env.VERSION }}-aarch64.dmg ./artifacts/rustdesk-${{ env.VERSION }}-x86_64.dmg)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
       # The release action replaces same-name assets, so keep published sidecars
       # until replacements are ready.
       - name: Upload signed update metadata signature
+        if: inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1306,6 +1432,7 @@ jobs:
 
       # Clients discover the release through metadata, so publish it only after every referenced asset.
       - name: Publish signed update metadata
+        if: inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1319,7 +1446,7 @@ jobs:
       - build-for-windows-flutter
       - build-for-windows-sciter
     runs-on: ubuntu-latest
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1393,6 +1520,7 @@ jobs:
           tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64 windows-aarch64 windows-x86 msi-template "${packer_template[@]}"
 
       - name: Publish unsigned app
+        if: inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1400,6 +1528,7 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
+    if: ${{ inputs.targets == 'all' }}
     needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
@@ -1541,10 +1670,17 @@ jobs:
         shell: bash
 
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -1554,6 +1690,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          save-if: ${{ inputs.variant == '' }}
           prefix-key: rustdesk-lib-cache-android # TODO: drop '-android' part after caches are invalidated
           key: ${{ matrix.job.target }}
 
@@ -1588,6 +1725,7 @@ jobs:
           esac
 
       - name: Upload Rustdesk library to Artifacts
+        if: inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: librustdesk.so.${{ matrix.job.target }}
@@ -1668,14 +1806,14 @@ jobs:
           BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
 
       - name: Upload Artifacts
-        if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
-        if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1684,7 +1822,7 @@ jobs:
             ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
-        if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1695,7 +1833,7 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1773,10 +1911,17 @@ jobs:
           fi
 
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - name: Download Rustdesk library from Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1853,14 +1998,14 @@ jobs:
           BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
 
       - name: Upload Artifacts
-        if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
-        if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1869,7 +2014,7 @@ jobs:
             ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
-        if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
+        if: (env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -1878,6 +2023,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'linux') }}
     needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -1893,14 +2039,6 @@ jobs:
               on: ubuntu-22.04,
               deb_arch: amd64,
               vcpkg-triplet: x64-linux,
-            }
-          - {
-              arch: aarch64,
-              target: aarch64-unknown-linux-gnu,
-              distro: ubuntu18.04,
-              on: ubuntu-22.04-arm,
-              deb_arch: arm64,
-              vcpkg-triplet: arm64-linux,
             }
     steps:
       - name: Export GitHub Actions cache environment variables
@@ -1925,6 +2063,14 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
+
+      - name: Apply custom client variant
+        if: ${{ inputs.variant != '' }}
+        shell: bash
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
+          VARIANT: ${{ inputs.variant }}
+        run: bash res/custom/apply.sh "$VARIANT"
 
       - name: Set Swap Space
         uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
@@ -1956,10 +2102,17 @@ jobs:
 
       - name: Restore bridge files
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       # vcpkg 2026.07.29's SPDX scripts require CMake 4.3+, but this ARM64 runner selects CMake 3.31.
       - name: Install CMake for vcpkg on Linux ARM64
@@ -2000,10 +2153,17 @@ jobs:
 
       - name: Restore bridge files
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
         name: Build rustdesk
@@ -2177,7 +2337,7 @@ jobs:
             done
 
       - name: Publish debian/rpm package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -2186,9 +2346,60 @@ jobs:
             rustdesk-*.deb
             rustdesk-*.rpm
 
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(rustdesk-*.deb rustdesk-*.rpm)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Private builds: build-appimage needs the deb as an artifact, which is not uploaded (artifact
+      # storage quota), so the AppImage is made here from the deb built above.
+      - name: Build appimage package
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.targets != 'all'
+        shell: bash
+        run: |
+          sudo cp rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb appimage/rustdesk.deb
+          # libarchive-tools for the recipe's bsdtar; https://github.com/AppImage/AppImageKit/wiki/FUSE
+          sudo apt-get update -y
+          sudo apt-get install -y libarchive-tools libfuse2
+          # https://github.com/AppImage/AppImageKit/issues/1395
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          pushd appimage
+          ./build-apprun.sh ${{ matrix.job.arch }}
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-${{ matrix.job.arch }}.yml
+          cmp AppDir/AppRun appimage-build/AppRun/v2.0.0/AppRun-Release-${{ matrix.job.arch }}
+
+      # The file is named after the recipe's app name, which a custom client variant changes.
+      - name: Publish appimage package
+        if: (env.UPLOAD_ARTIFACT == 'true' && inputs.targets != 'all') && inputs.variant == ''
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ./appimage/*-${{ env.VERSION }}-*.AppImage
+
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true' && inputs.targets != 'all') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(./appimage/*-${{ env.VERSION }}-*.AppImage)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Private builds: skipped (artifact storage quota); the deb is published to the release above.
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (false) && inputs.variant == ''
         with:
           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
@@ -2197,7 +2408,7 @@ jobs:
       # old arch image does not make sense for arch since it is "arch" which always update to date
       # and failed to makepkg arm64 on x86_64
       - name: Patch archlinux PKGBUILD
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true' && inputs.targets == 'all'
         run: |
           sed -i "s/x86_64/${{ matrix.job.arch }}/g" res/PKGBUILD
           if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
@@ -2205,7 +2416,7 @@ jobs:
           fi
 
       - name: Build archlinux package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true' && inputs.targets == 'all'
         uses: rustdesk-org/arch-makepkg-action@04200739ed1d0bf6f2188b6736b26a767c57a7f9 # no release tag; commit 2026-05-26
         with:
           packages:
@@ -2213,7 +2424,7 @@ jobs:
             cd res && HBB=`pwd`/.. FLUTTER=1 makepkg -f
 
       - name: Publish archlinux package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: (matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true' && inputs.targets == 'all') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -2227,6 +2438,7 @@ jobs:
   # old for it. A separate job rather than a matrix entry of build-rustdesk-linux: appimage and
   # flatpak need that job, and a failure here must not skip them.
   build-rustdesk-linux-drm:
+    if: ${{ inputs.targets == 'all' }}
     needs: [generate-bridge]
     name: build rustdesk linux drm x86_64
     runs-on: ubuntu-22.04
@@ -2280,10 +2492,17 @@ jobs:
           sed -i  "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
 
       - name: Restore bridge files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: bridge-artifact
-          path: ./
+          key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
@@ -2528,7 +2747,7 @@ jobs:
         shell: bash
 
       - name: Publish debian package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -2539,14 +2758,14 @@ jobs:
       # No UPLOAD_ARTIFACT gate: on a PR this is the only way to get at the deb that was just built.
       # always(), because a deb that failed the check above is the one most worth downloading.
       - name: Upload deb
-        if: always() && env.DRM_DEB != ''
+        if: (always() && env.DRM_DEB != '') && inputs.variant == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.DRM_DEB }}
           path: ${{ env.DRM_DEB }}
 
   build-rustdesk-linux-sciter:
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.on }}
     name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
@@ -2773,7 +2992,7 @@ jobs:
           done
 
       - name: Publish debian package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -2783,7 +3002,7 @@ jobs:
 
       - name: Upload deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         with:
           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
@@ -2792,7 +3011,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2833,7 +3052,7 @@ jobs:
           cmp AppDir/AppRun appimage-build/AppRun/v2.0.0/AppRun-Release-${{ matrix.job.arch }}
 
       - name: Publish appimage package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -2841,13 +3060,24 @@ jobs:
           files: |
             ./appimage/rustdesk-${{ env.VERSION }}-*.AppImage
 
+      - name: Upload to the draft release (custom client)
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(./appimage/rustdesk-${{ env.VERSION }}-*.AppImage)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::nothing to upload"; exit 1; fi
+          gh release upload "$TAG_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
   build-flatpak:
     name: Build flatpak ${{ matrix.job.target }}${{ matrix.job.suffix }}
     needs:
       - build-rustdesk-linux
       - build-rustdesk-linux-sciter
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2919,6 +3149,7 @@ jobs:
             flatpak build-bundle ./repo rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak com.rustdesk.RustDesk
 
       - name: Publish flatpak package
+        if: inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true
@@ -3003,7 +3234,7 @@ jobs:
           popd
 
       - name: Publish web
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: (env.UPLOAD_ARTIFACT == 'true') && inputs.variant == ''
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           prerelease: true

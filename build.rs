@@ -90,8 +90,23 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
+/// Puts the settings `res/custom/apply.sh` writes for a custom build into OUT_DIR, where
+/// `include_str!` takes them. The file itself stays out of git: the repository is public and the
+/// settings say where our servers are. A stock build has none, and compiles an empty file.
+fn bake_custom_client() {
+    // The directory, not the file: a missing file would make every build rerun this script.
+    println!("cargo:rerun-if-changed=res");
+    let settings = std::fs::read_to_string("res/custom-client.json").unwrap_or_default();
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("custom-client.json");
+    // Rewritten only when changed, so an unchanged file does not rebuild the crate.
+    if std::fs::read_to_string(&out).ok().as_deref() != Some(settings.as_str()) {
+        std::fs::write(&out, settings).unwrap();
+    }
+}
+
 fn main() {
     hbb_common::gen_version();
+    bake_custom_client();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
     build_manifest();

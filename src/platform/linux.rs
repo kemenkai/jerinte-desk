@@ -1084,6 +1084,11 @@ fn should_start_server(
             // We also need to keep `cm0` unchanged, so that we can reach this branch the next time.
             return false;
         }
+        if crate::vdisplay::leases_held() {
+            // A virtual display is there, or waits out its grace for its session to come back:
+            // restarting the server would take it away. Likewise keep `cm0`.
+            return false;
+        }
         // restart server if new connections all closed, or every one hour,
         // as a workaround to resolve "SpotUdp" (dns resolve)
         // and x server get displays failure issue
@@ -1130,6 +1135,14 @@ pub fn start_os_service() {
         allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
     });
 
+    // Lights connectors for the session's virtual displays (src/vdisplay/x11), as only root may.
+    if let Err(err) = std::thread::Builder::new()
+        .name("vdisplay-root".into())
+        .spawn(crate::vdisplay::serve_root)
+    {
+        log::warn!("failed to spawn the virtual display thread: {err}; no virtual displays");
+    }
+
     // DRM/KMS capture producer (opt-in `drm` feature): a dedicated thread + runtime that streams
     // scanout frames to the user `--server` over the `_drm` service-scoped channel. Runs here
     // because this process is the root service that already holds CAP_SYS_ADMIN for the in-process
@@ -1156,6 +1169,7 @@ pub fn start_os_service() {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
+    let (mut wl_display, mut dbus): (String, String) = ("".to_owned(), "".to_owned());
     let mut desktop = Desktop::default();
     let mut sid = "".to_owned();
     let mut uid = "".to_owned();
@@ -1226,9 +1240,23 @@ pub fn start_os_service() {
             // try kill subprocess "--server"
             stop_server(&mut server);
 
-            let is_display_changed = desktop.display != display || desktop.xauth != xauth;
-            display = desktop.display.clone();
-            xauth = desktop.xauth.clone();
+            let mut is_display_changed = desktop.display != display || desktop.xauth != xauth;
+            // On Wayland the session is its compositor and bus: Xwayland started or stopped on
+            // demand changes only the display and xauth, and a restart for that would take away
+            // the virtual displays Mutter keeps for this server. Seen to once there are none.
+            if is_display_changed
+                && desktop.is_wayland()
+                && desktop.wl_display == wl_display
+                && desktop.dbus == dbus
+                && crate::vdisplay::leases_held()
+            {
+                is_display_changed = false;
+            } else {
+                display = desktop.display.clone();
+                xauth = desktop.xauth.clone();
+            }
+            wl_display = desktop.wl_display.clone();
+            dbus = desktop.dbus.clone();
 
             // try start subprocess "--server"
             if should_start_server(
@@ -1242,6 +1270,9 @@ pub fn start_os_service() {
             ) {
                 force_stop_server();
                 start_server(Some(&desktop), &mut user_server);
+                // What the new server was started with, a change put off or not.
+                display = desktop.display.clone();
+                xauth = desktop.xauth.clone();
             }
         } else {
             force_stop_server();
@@ -2001,16 +2032,24 @@ fn get_xrandr_conn_pat(name: &str) -> String {
     )
 }
 
+// On Wayland, xrandr reaches Xwayland, whose outputs only stand for the compositor's to X clients:
+// it can neither list a monitor's modes nor change them.
+
 // The mode lines below an output. A mode name can have a suffix after its size, like the "i" of
 // "1920x1080i", so a TV's interlaced mode does not end the list.
 const XRANDR_MODES_PAT: &str = r"(?P<resolutions>(\s*\d+x\d+\S*\s+\d+.*\n)+)";
 
 pub fn resolutions(name: &str) -> Vec<Resolution> {
+    if !is_x11() {
+        return vec![];
+    }
     let resolutions_pat = XRANDR_MODES_PAT;
     let connected_pat = get_xrandr_conn_pat(name);
     let mut v = vec![];
     if let Ok(re) = Regex::new(&format!("{}{}", connected_pat, resolutions_pat)) {
-        match run_cmds("xrandr --query | tr -s ' '") {
+        // --current: the configuration as it is, without probing every connector, which a lit
+        // connector without a monitor answers slowly while the X server waits.
+        match run_cmds("xrandr --current | tr -s ' '") {
             Ok(xrandr_output) => {
                 // There'are different kinds of xrandr output.
                 /*
@@ -2068,7 +2107,10 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
-    let xrandr_output = run_cmds("xrandr --query | tr -s ' '")?;
+    if !is_x11() {
+        bail!("The resolution of a Wayland monitor is not known here");
+    }
+    let xrandr_output = run_cmds("xrandr --current | tr -s ' '")?;
     let re = Regex::new(&get_xrandr_conn_pat(name))?;
     if let Some(caps) = re.captures(&xrandr_output) {
         if let Some((width, height)) = get_width_height_from_captures(&caps) {
@@ -2125,8 +2167,13 @@ DP-0 disconnected (normal left inverted right x axis y axis)
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
+    if !is_x11() {
+        bail!("A Wayland monitor's resolution is not changed here");
+    }
     Command::new("xrandr")
         .args(vec![
+            // Without probing every connector first; see `resolutions`.
+            "--current",
             "--output",
             name,
             "--mode",

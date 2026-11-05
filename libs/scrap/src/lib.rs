@@ -17,6 +17,11 @@ pub mod x11;
 #[cfg(all(x11, feature = "wayland"))]
 pub mod wayland;
 
+// Used on Linux; built on macOS too, for the tests of whoever uses it.
+#[cfg(any(all(x11, feature = "wayland"), target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub mod mutter_model;
+
 #[cfg(dxgi)]
 pub mod dxgi;
 

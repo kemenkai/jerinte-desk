@@ -26,6 +26,7 @@ import 'package:flutter_hbb/models/user_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/models/desktop_render_texture.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
+import 'package:flutter_hbb/models/virtual_display_model.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
@@ -55,6 +56,8 @@ typedef ReconnectHandle = Function(OverlayDialogManager, SessionID, bool);
 final _constSessionId = Uuid().v4obj();
 // Empirical restart reconnect cadence: keep the last frame briefly and retry quickly.
 const _restartReconnectSilentDelaySecs = 5;
+// Reconnecting on its own stops this long after it began, leaving the Reconnect button.
+const _autoReconnectFor = Duration(minutes: 10);
 
 class CachedPeerData {
   Map<String, dynamic> updatePrivacyMode = {};
@@ -121,6 +124,7 @@ class FfiModel with ChangeNotifier {
   Timer? _timer;
   Timer? _restartReconnectDelayTimer;
   var _reconnects = 1;
+  DateTime? _autoReconnectSince;
   DateTime? _offlineReconnectStartTime;
   bool _androidDocumentPickerActive = false;
   bool _androidDocumentPickerInterruptedConnection = false;
@@ -343,6 +347,8 @@ class FfiModel with ChangeNotifier {
         handleSyncPeerInfo(evt, sessionId, peerId);
       } else if (name == 'sync_platform_additions') {
         handlePlatformAdditions(evt, sessionId, peerId);
+      } else if (name == 'virtual_display_result') {
+        parent.target?.virtualDisplayModel.onResult(evt);
       } else if (name == 'connection_ready') {
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
@@ -844,6 +850,9 @@ class FfiModel with ChangeNotifier {
             evt['original_height'] ?? kInvalidResolutionValue.toString()) ??
         kInvalidResolutionValue;
     newDisplay._scale = _pi.scaleOfDisplay(display);
+    // A switch carries no name: the display keeps the one the display list gave it, by which
+    // the virtual displays of this session are known.
+    newDisplay.name = _pi.displays[display].name;
     _pi.displays[display] = newDisplay;
 
     if (!_pi.isSupportMultiUiSession || _pi.currentDisplay == display) {
@@ -930,6 +939,8 @@ class FfiModel with ChangeNotifier {
       // Treat restart messages as reconnect control events. Rust still sends
       // title/text for legacy UI and translation reuse; Flutter keeps the last
       // frame briefly, then shows the Connecting overlay.
+      // Reconnecting on its own for a restart counts towards its limit too.
+      _autoReconnectSince ??= DateTime.now();
       if (_restartReconnectDelayTimer == null) {
         parent.target?.inputModel.setRelativeMouseMode(false);
         _cancelPendingMonitorRestore();
@@ -947,6 +958,7 @@ class FfiModel with ChangeNotifier {
         });
       }
     } else if (type == 'restarting-show') {
+      _autoReconnectSince ??= DateTime.now();
       _restartReconnectDelayTimer?.cancel();
       _restartReconnectDelayTimer = null;
       reconnect(dialogManager, sessionId, false);
@@ -1064,6 +1076,7 @@ class FfiModel with ChangeNotifier {
   showMsgBox(SessionID sessionId, String type, String title, String text,
       String link, bool hasRetry, OverlayDialogManager dialogManager,
       {bool? hasCancel}) async {
+    final wait = hasRetry ? _autoReconnectWait() : null;
     final noteAllowed = parent.target != null &&
         allowAskForNoteAtEndOfConnection(parent.target, false) &&
         (title == "Connection Error" || type == "restarting");
@@ -1086,20 +1099,38 @@ class FfiModel with ChangeNotifier {
       }
       msgBox(sessionId, type, title, text, link, dialogManager,
           hasCancel: hasCancel,
-          reconnect: hasRetry ? reconnect : null,
-          reconnectTimeout: hasRetry ? _reconnects : null,
+          reconnect: hasRetry ? (wait != null ? reconnect : _reconnectByHand) : null,
+          reconnectTimeout: wait,
           onSubmit: onSubmit);
     }
     _timer?.cancel();
-    if (hasRetry) {
-      _timer = Timer(Duration(seconds: _reconnects), () {
+    if (wait != null) {
+      _timer = Timer(Duration(seconds: wait), () {
         reconnect(dialogManager, sessionId, false);
       });
       _reconnects *= 2;
-    } else {
+    } else if (!hasRetry) {
       _reconnects = 1;
       _offlineReconnectStartTime = null;
+      _autoReconnectSince = null;
     }
+  }
+
+  /// The wait before reconnecting on its own, doubling each time, or null once
+  /// [_autoReconnectFor] has passed since the first: every wait ends by then.
+  int? _autoReconnectWait() {
+    final since = _autoReconnectSince ??= DateTime.now();
+    final left = _autoReconnectFor - DateTime.now().difference(since);
+    if (left <= Duration.zero) return null;
+    return min(_reconnects, (left.inMilliseconds / 1000).ceil());
+  }
+
+  /// The user reconnecting once reconnecting on its own has stopped: it starts over.
+  void _reconnectByHand(OverlayDialogManager dialogManager, SessionID sessionId,
+      bool forceRelay) {
+    _reconnects = 1;
+    _autoReconnectSince = null;
+    reconnect(dialogManager, sessionId, forceRelay);
   }
 
   void _cancelPendingMonitorRestore() {
@@ -1340,6 +1371,9 @@ class FfiModel with ChangeNotifier {
   /// Handle the peer info event based on [evt].
   handlePeerInfo(Map<String, dynamic> evt, String peerId, bool isCache) async {
     parent.target?.chatModel.voiceCallStatus.value = VoiceCallStatus.notStarted;
+    if (!isCache) {
+      parent.target?.virtualDisplayModel.beforePeerInfo();
+    }
 
     _queryAuditGuid(peerId);
 
@@ -1452,6 +1486,7 @@ class FfiModel with ChangeNotifier {
       }
       if (displays.isNotEmpty) {
         _reconnects = 1;
+        _autoReconnectSince = null;
         _offlineReconnectStartTime = null;
         resetRestartReconnectState();
         waitForFirstImage.value = true;
@@ -1499,6 +1534,7 @@ class FfiModel with ChangeNotifier {
     if (!isCache) {
       tryUseAllMyDisplaysForTheRemoteSession(peerId);
     }
+    parent.target?.virtualDisplayModel.onPeerInfo(isCache);
   }
 
   checkDesktopKeyboardMode() async {
@@ -1633,6 +1669,7 @@ class FfiModel with ChangeNotifier {
     d.cursorEmbedded = evt['cursor_embedded'] == 1;
     d.originalWidth = evt['original_width'] ?? kInvalidResolutionValue;
     d.originalHeight = evt['original_height'] ?? kInvalidResolutionValue;
+    d.name = evt['name'] ?? '';
     d._scale = 1.0;
     final scaledWidth = evt['scaled_width'];
     if (scaledWidth != null) {
@@ -1678,8 +1715,11 @@ class FfiModel with ChangeNotifier {
       for (int i = 0; i < displays.length; ++i) {
         newDisplays.add(evtToDisplay(displays[i]));
       }
+      final shown = _pi.tryGetDisplayIfNotAllDisplay()?.name;
       _pi.displays.value = newDisplays;
       _pi.displaysCount.value = _pi.displays.length;
+      // A virtual display of ours shown here is followed by name at once, before the check below.
+      parent.target?.virtualDisplayModel.onDisplaysChanged(shown);
 
       if (_pi.currentDisplay == kAllDisplayValue) {
         updateCurDisplay(sessionId);
@@ -2382,6 +2422,9 @@ class CanvasModel with ChangeNotifier {
   updateSize() => _size = getSize();
 
   updateViewStyle({refreshMousePos = true, notify = true}) async {
+    // Whatever changed, the view or the display shown, a virtual display of this session shown
+    // here follows the view once it settles.
+    parent.target?.virtualDisplayModel.followView();
     final style = await bind.sessionGetViewStyle(sessionId: sessionId);
     if (style == null) {
       return;
@@ -2403,9 +2446,14 @@ class CanvasModel with ChangeNotifier {
     // ViewStyle fields and is not captured by the equality check. Therefore, we must
     // allow updates to proceed when style == kRemoteViewStyleCustom, even if the
     // rest of the ViewStyle fields are unchanged.
+    // Nor when the original size of the display shown has changed: it became known as a virtual
+    // display of this session's (see `_originalScale`).
     if (_lastViewStyle == viewStyle &&
         _devicePixelRatio == ui.window.devicePixelRatio &&
-        style != kRemoteViewStyleCustom) {
+        style != kRemoteViewStyleCustom &&
+        !(kIgnoreDpi &&
+            style == kRemoteViewStyleOriginal &&
+            _scale != _originalScale)) {
       return;
     }
     if (_lastViewStyle.style != viewStyle.style) {
@@ -2428,7 +2476,7 @@ class CanvasModel with ChangeNotifier {
     _devicePixelRatio = ui.window.devicePixelRatio;
     if (kIgnoreDpi) {
       if (style == kRemoteViewStyleOriginal) {
-        _scale = 1.0 / _devicePixelRatio;
+        _scale = _originalScale;
       } else if (_scale != 0 && style == kRemoteViewStyleCustom) {
         _scale /= _devicePixelRatio;
       }
@@ -2754,12 +2802,24 @@ class CanvasModel with ChangeNotifier {
     notifyListeners();
   }
 
+  // The scale of the original size: a pixel of the display to a pixel of this screen; but a
+  // virtual display the peer made for a monitor here, at the monitor's size in points, a pixel to
+  // a point, which fills the monitor as its own resolution does (a quarter of it, otherwise, on a
+  // Retina screen).
+  double get _originalScale {
+    final ffi = parent.target;
+    if (ffi != null && ffi.virtualDisplayModel.showsOneInPoints(ffi.ffiModel.pi)) {
+      return 1.0;
+    }
+    return 1.0 / _devicePixelRatio;
+  }
+
   // For reset canvas to the last view style
   reset() {
     _scale = _lastViewStyle.scale;
     _devicePixelRatio = ui.window.devicePixelRatio;
     if (kIgnoreDpi && _lastViewStyle.style == kRemoteViewStyleOriginal) {
-      _scale = 1.0 / _devicePixelRatio;
+      _scale = _originalScale;
     }
     _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
     bind.sessionSetViewStyle(sessionId: sessionId, value: _lastViewStyle.style);
@@ -4052,6 +4112,7 @@ class FFI {
   late final RecordingModel recordingModel; // session
   late final InputModel inputModel; // session
   late final ElevationModel elevationModel; // session
+  late final VirtualDisplayModel virtualDisplayModel; // session
   late final CmFileModel cmFileModel; // cm
   late final TextureModel textureModel; //session
   late final ShortcutModel shortcutModel; // session
@@ -4082,6 +4143,7 @@ class FFI {
     recordingModel = RecordingModel(WeakReference(this));
     inputModel = InputModel(WeakReference(this));
     elevationModel = ElevationModel(WeakReference(this));
+    virtualDisplayModel = VirtualDisplayModel(WeakReference(this));
     cmFileModel = CmFileModel(WeakReference(this));
     textureModel = TextureModel(WeakReference(this));
     shortcutModel = ShortcutModel(WeakReference(this));
@@ -4328,7 +4390,8 @@ class FFI {
       ffiModel.waitForFirstImage.value = false;
       ffiModel.cancelPendingRestoreTimer();
       ffiModel.resetRestartReconnectState();
-      dialogManager.dismissAll();
+      // A sticky dialog, shown before the first image, stays.
+      dialogManager.dismissTransient();
       try {
         await canvasModel.updateViewStyle();
         await canvasModel.updateScrollStyle();
@@ -4456,6 +4519,8 @@ class Display {
   bool cursorEmbedded = false;
   int originalWidth = kInvalidResolutionValue;
   int originalHeight = kInvalidResolutionValue;
+  // The peer's name for it, which a virtual display is found by.
+  String name = '';
   double _scale = 1.0;
   double get scale => _scale > 1.0 ? _scale : 1.0;
 

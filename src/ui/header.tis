@@ -523,6 +523,8 @@ if (!(is_file_transfer || is_port_forward)) {
 
 handler.updatePi = function(v) {
     pi = v;
+    // Connected: a later failure starts retrying from the beginning.
+    resetReconnect();
     recording = handler.is_recording();
     header.update();
     if (is_port_forward) {

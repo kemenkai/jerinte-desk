@@ -50,10 +50,11 @@ jobs:
           cd RustDeskTempTopMostWindow && git checkout ecd8d6a139eee76845ea66423fb739af450fda90
           msbuild ${{ env.project_path }} -p:Configuration=${{ inputs.configuration }} -p:Platform=${{ inputs.platform }} /p:TargetVersion=${{ inputs.target_version }}
 
-      - name: Archive build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Private builds: the account's artifact storage quota is used up, so the dll reaches the
+      # Windows build through the Actions cache instead of an artifact.
+      - name: Save build output to cache
+        uses: actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c # v3
         if: ${{ inputs.upload-artifact }}
         with:
-            name: topmostwindow-artifacts-${{ inputs.platform }}
-            path: |
-              ./${{ env.build_output_dir }}/WindowInjection.dll
+            key: topmostwindow-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+            path: ./${{ env.build_output_dir }}/WindowInjection.dll

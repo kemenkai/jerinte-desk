@@ -24,9 +24,28 @@ fn map_err<E: ToString>(err: E) -> io::Error {
     }
 }
 
+// A display recorded through Mutter that changed, or is busy, is no fault of the portal or the
+// platform, which is all `MAP_ERR` makes out of an error: the caller builds its capturer again.
+// Its stream busy is `TimedOut`, to be tried again soon.
+fn map_err_of(display: &Display, err: Box<dyn std::error::Error>) -> io::Error {
+    if display.0.held.is_some() {
+        let kind = if err.downcast_ref::<crate::mutter_model::Busy>().is_some() {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, err.to_string())
+    } else {
+        map_err(err)
+    }
+}
+
 impl Capturer {
     pub fn new(display: Display) -> io::Result<Capturer> {
-        let r = display.0.recorder(false).map_err(map_err)?;
+        let r = display
+            .0
+            .recorder(false)
+            .map_err(|err| map_err_of(&display, err))?;
         Ok(Capturer(display, r, Default::default()))
     }
 
@@ -41,7 +60,12 @@ impl Capturer {
 
 impl TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
-        match self.1.capture(timeout.as_millis() as _).map_err(map_err)? {
+        let display = &self.0;
+        match self
+            .1
+            .capture(timeout.as_millis() as _)
+            .map_err(|err| map_err_of(display, err))?
+        {
             PixelProvider::BGR0(w, h, x) => Ok(Frame::PixelBuffer(PixelBuffer::new(
                 x,
                 crate::Pixfmt::BGRA,
@@ -124,6 +148,6 @@ impl Display {
     }
 
     pub fn name(&self) -> String {
-        "".to_owned()
+        self.0.connector.clone()
     }
 }

@@ -277,12 +277,71 @@ pub(super) fn input_map_label(gen: u64, from_compositor: bool) -> u64 {
     }
 }
 
-// The uinput ABS range currently programmed into the device, for the DRM path's "reapply only when
-// it changed" check. The PipeWire path compares it inline in refresh_wayland_uinput_rect_if_changed.
-#[cfg(all(target_os = "linux", feature = "drm"))]
+// The uinput ABS range currently programmed into the device, for the DRM and Mutter paths' "reapply
+// only when it changed" check. The PipeWire path compares it inline in
+// refresh_wayland_uinput_rect_if_changed.
+#[cfg(target_os = "linux")]
 pub(super) fn wayland_uinput_rect() -> Option<(i32, i32, i32, i32)> {
     WAYLAND_UINPUT_RECT.lock().unwrap().rect
 }
+
+/// The Mutter path's uinput range and layout baseline, for a display list it is about to publish:
+/// the range applied first should it differ (on a thread of its own, the caller maybe inside a
+/// runtime; a failure is retried at a refresh `WAYLAND_LAYOUT_RETRY` later), then the baseline,
+/// which is always the list's: that path publishes every layout change, so nothing needs
+/// remapping (rustdesk#15601).
+#[cfg(target_os = "linux")]
+pub(super) fn apply_wayland_layout(
+    rect: (i32, i32, i32, i32),
+    rects: Vec<scrap::wayland::display::DisplayRect>,
+) {
+    // The range that last failed, and when.
+    static FAILED: Mutex<Option<((i32, i32, i32, i32), std::time::Instant)>> = Mutex::new(None);
+    let mut failed = FAILED.lock().unwrap();
+    let retry_due =
+        failed.map_or(true, |(r, at)| r != rect || at.elapsed() >= WAYLAND_LAYOUT_RETRY);
+    if wayland_uinput_rect() != Some(rect) && retry_due {
+        let (minx, maxx, miny, maxy) = rect;
+        log::info!("update mouse resolution: ({minx}, {maxx}), ({miny}, {maxy})");
+        let applied = std::thread::spawn(move || -> ResultType<()> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            // Bounded: `set_resolution()` has no timeout on the response read.
+            match rt.block_on(async {
+                timeout(
+                    3_000,
+                    crate::input_service::update_mouse_resolution(minx, maxx, miny, maxy),
+                )
+                .await
+            }) {
+                Ok(applied) => applied,
+                Err(elapsed) => Err(elapsed.into()),
+            }
+        })
+        .join();
+        *failed = match applied {
+            Ok(Ok(())) => {
+                set_wayland_uinput_rect(rect);
+                None
+            }
+            Ok(Err(err)) => {
+                log::error!("Failed to update mouse resolution: {}", err);
+                Some((rect, std::time::Instant::now()))
+            }
+            Err(_) => {
+                log::error!("Failed to update mouse resolution: the thread panicked");
+                Some((rect, std::time::Instant::now()))
+            }
+        };
+    }
+    set_wayland_layout_baseline(rects);
+}
+
+// How long after failing to apply a uinput range it is tried again (the uinput service of the
+// root service not up yet, say): every refresh would be every 300 ms.
+#[cfg(target_os = "linux")]
+const WAYLAND_LAYOUT_RETRY: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
 pub(super) fn set_wayland_layout_baseline(baseline: Vec<scrap::wayland::display::DisplayRect>) {
@@ -324,7 +383,8 @@ pub(super) fn remap_wayland_uinput_coord(x: i32, y: i32) -> (i32, i32) {
 // range and land offset, https://github.com/rustdesk/rustdesk/issues/15601
 #[cfg(target_os = "linux")]
 fn refresh_wayland_uinput_rect_if_changed() {
-    if is_x11() || !crate::input_service::wayland_use_uinput() {
+    // The Mutter path publishes every layout change, and sets the range with it.
+    if is_x11() || !crate::input_service::wayland_use_uinput() || super::mutter::active() {
         return;
     }
     {
@@ -550,8 +610,8 @@ pub(super) fn check_display_changed(
 ) -> Option<DisplayInfo> {
     #[cfg(target_os = "linux")]
     {
-        // wayland do not support changing display for now
-        if !is_x11() {
+        // wayland do not support changing display for now, but through Mutter
+        if !is_x11() && !super::mutter::active() {
             return None;
         }
     }
@@ -655,6 +715,10 @@ fn displays_to_msg(displays: Vec<DisplayInfo>) -> Message {
 fn check_get_displays_changed_msg() -> Option<Message> {
     #[cfg(target_os = "linux")]
     {
+        if !is_x11() && super::mutter::active() {
+            super::mutter::refresh();
+            return get_displays_msg();
+        }
         if !is_x11() {
             // On the DRM/KMS capture path the PipeWire enumeration (which is what feeds
             // `SYNC_DISPLAYS` via `check_update_displays`) is bypassed, so populate the sync list
@@ -691,9 +755,17 @@ pub fn check_displays_changed() -> ResultType<()> {
     {
         // Currently, wayland need to call wayland::clear() before call Display::all(), otherwise it will cause
         // block, or even crash here, https://github.com/rustdesk/rustdesk/blob/0bb4d43e9ea9d9dfb9c46c8d27d1a97cd0ad6bea/libs/scrap/src/wayland/pipewire.rs#L235
+        // Not through Mutter, which waits for a virtual display to be named as below.
         if !is_x11() {
+            if super::mutter::active() && !crate::vdisplay::layout_settling() {
+                super::mutter::refresh();
+            }
             return Ok(());
         }
+    }
+    // Like the display service's own loop, this waits for a virtual display to be named.
+    if crate::vdisplay::layout_settling() {
+        return Ok(());
     }
     check_update_displays(&try_get_displays()?);
     Ok(())
@@ -716,9 +788,18 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
             Ok(())
         })?;
 
-        if let Some(msg_out) = check_get_displays_changed_msg() {
+        // A virtual display being plugged in or out is listed once it is named.
+        if !crate::vdisplay::layout_settling() {
+            if let Some(msg_out) = check_get_displays_changed_msg() {
+                sp.send(msg_out);
+                log::info!("Displays changed");
+            }
+        }
+
+        // What became of the capture through Mutter: the screen locked, the sharing stopped.
+        #[cfg(target_os = "linux")]
+        if let Some(msg_out) = super::mutter::take_notice() {
             sp.send(msg_out);
-            log::info!("Displays changed");
         }
 
         #[cfg(target_os = "linux")]
@@ -743,6 +824,9 @@ pub(super) fn get_original_resolution(
         crate::virtual_display_manager::rustdesk_idd::is_virtual_display(&display_name);
     #[cfg(not(windows))]
     let is_rustdesk_virtual_display = false;
+    // 0x0 marks a virtual display, which the controlling side can size freely.
+    let is_rustdesk_virtual_display =
+        is_rustdesk_virtual_display || crate::vdisplay::is_virtual(display_name);
     Some(if is_rustdesk_virtual_display {
         Resolution {
             width: 0,
@@ -838,11 +922,15 @@ fn wayland_has_compositor() -> bool {
 pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
     // For compatibility: if only one display, scale remains 1.0 and we use the physical size for `uinput`.
     // If there are multiple displays, we use the logical size for `uinput` by setting scale to d.scale().
+    // Through Mutter, the list is the one the uinput range is set from, so its own count says.
     #[cfg(target_os = "linux")]
     let use_logical_scale = !is_x11()
         && crate::is_server()
-        && wayland_has_compositor()
-        && scrap::wayland::display::get_displays().displays.len() > 1;
+        && if super::mutter::active() {
+            all.len() > 1
+        } else {
+            wayland_has_compositor() && scrap::wayland::display::get_displays().displays.len() > 1
+        };
     let displays = all
         .iter()
         .map(|d| {
@@ -865,6 +953,8 @@ pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
                 ((d.width() as f64) / scale).round() as usize,
                 (d.height() as f64 / scale).round() as usize,
             );
+            // The amyuni driver has the system draw the cursor into our displays' frames.
+            let cursor_embedded = cfg!(windows) && crate::vdisplay::is_virtual(&display_name);
             DisplayInfo {
                 x: d.origin().0 as _,
                 y: d.origin().1 as _,
@@ -872,7 +962,7 @@ pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
                 height: d.height() as _,
                 name: display_name,
                 online: d.is_online(),
-                cursor_embedded: false,
+                cursor_embedded,
                 original_resolution,
                 scale,
                 ..Default::default()
@@ -955,10 +1045,27 @@ fn no_displays(displays: &Vec<Display>) -> bool {
     }
 }
 
+/// Every display, with our virtual displays (`crate::vdisplay`) last in the order they were made,
+/// so plugging one in or out never renumbers a physical display. Whatever indexes displays reads
+/// them from here.
+#[inline]
+pub fn all_displays() -> ResultType<Vec<Display>> {
+    // Through Mutter: `Display::all` would open a portal session, asking the person at the device.
+    #[cfg(target_os = "linux")]
+    if !is_x11() && super::mutter::active() {
+        return super::mutter::all_displays();
+    }
+    let listed = Display::all()?
+        .into_iter()
+        .filter(|d| crate::vdisplay::listed(&d.name()))
+        .collect();
+    Ok(crate::vdisplay::stable_order(listed, |d| d.name()))
+}
+
 #[inline]
 #[cfg(not(windows))]
 pub fn try_get_displays() -> ResultType<Vec<Display>> {
-    Ok(Display::all()?)
+    all_displays()
 }
 
 #[inline]
@@ -980,7 +1087,7 @@ pub fn try_get_displays_add_amyuni_headless() -> ResultType<Vec<Display>> {
 #[inline]
 #[cfg(windows)]
 pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> {
-    let mut displays = Display::all()?;
+    let mut displays = all_displays()?;
 
     // Do not add virtual display if the platform is not installed or the virtual display is not supported.
     if !crate::platform::is_installed() || !virtual_display_manager::is_virtual_display_supported()
@@ -1019,7 +1126,7 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
         if let Err(e) = virtual_display_manager::plug_in_headless() {
             log::error!("plug in headless failed {}", e);
         } else {
-            displays = Display::all()?;
+            displays = all_displays()?;
         }
     }
     Ok(displays)

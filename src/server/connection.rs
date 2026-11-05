@@ -430,6 +430,11 @@ pub struct Connection {
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
     closed: bool,
+    /// A message that may be the last was sent (a close reason, a login error): the peer is waited
+    /// for to read it before the stream goes, unless it closed first (`closed_by_peer`).
+    parting_sent: bool,
+    /// The peer sent its close reason: it is closing, this side only answers.
+    closed_by_peer: bool,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     start_cm_ipc_para: Option<StartCmIpcPara>,
     auto_disconnect_timer: Option<(Instant, u64)>,
@@ -507,6 +512,10 @@ const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
+// How long the last messages may take to reach the peer before the stream is dropped (see
+// `Stream::linger`/`flush`): without the wait a WebRTC peer misses the close reason and takes the
+// close for a dropped connection, retrying.
+const CLOSE_FLUSH_LIMIT: Duration = Duration::from_secs(1);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether the DRM backend can serve a Wayland login screen here.
@@ -637,6 +646,8 @@ impl Connection {
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
             closed: false,
+            parting_sent: false,
+            closed_by_peer: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             start_cm_ipc_para: Some(StartCmIpcPara {
                 rx_to_cm,
@@ -870,6 +881,11 @@ impl Connection {
                                 conn.block_input = enabled;
                                 conn.send_permission(Permission::BlockInput, enabled).await;
                             } else if &name == "privacy_mode" {
+                                // A virtual display that has the desktop to itself is privacy
+                                // mode too (src/vdisplay): it gives the desktop back.
+                                if !enabled {
+                                    crate::vdisplay::privacy_revoked(conn.inner.id());
+                                }
                                 // Keep permission state and runtime state consistent:
                                 // when revoking the permission, try to leave privacy mode first.
                                 // Otherwise we could end up in an inconsistent state where
@@ -1247,6 +1263,14 @@ impl Connection {
             try_stop_record_cursor_pos();
         }
         conn.on_close("End", true).await;
+        // The last messages out before the stream is dropped, where sending only queues them
+        // (WebRTC): the peer waited for to read a parting message (it closes on it), or, answering
+        // its close, only what was sent acknowledged.
+        if conn.parting_sent && !conn.closed_by_peer {
+            conn.stream.linger(CLOSE_FLUSH_LIMIT).await;
+        } else {
+            conn.stream.flush(CLOSE_FLUSH_LIMIT).await;
+        }
         log::info!("#{} connection loop exited", id);
     }
 
@@ -2004,6 +2028,12 @@ impl Connection {
                 json!(privacy_mode::get_supported_privacy_mode_impl()),
             );
         }
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        if self.is_remote() {
+            if let Some(caps) = crate::vdisplay::caps(&self.vdisplay_owner()) {
+                platform_additions.insert("vdm_caps".into(), caps);
+            }
+        }
 
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
         {
@@ -2428,6 +2458,8 @@ impl Connection {
             self.lr.trusted_device_v2_supported && self.trusted_device.is_some();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
+        // The last should the connection end on it.
+        self.parting_sent = true;
     }
 
     #[inline]
@@ -2894,8 +2926,12 @@ impl Connection {
             // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
             if let Some(misc::Union::CloseReason(s)) = &misc.union {
                 log::info!("receive close reason: {}", s);
+                self.closed_by_peer = true;
                 self.on_close("Peer close", true).await;
                 raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+                // "kcp" is sent when a KCP session ended without being closed, which is a
+                // connection loss the controlling side may reconnect after.
+                crate::vdisplay::conn_ended(self.inner.id(), s != "kcp");
                 return false;
             }
         }
@@ -3015,8 +3051,16 @@ impl Connection {
                 return false;
             }
 
+            // With password-only approval, a request without a password has nothing to accept on
+            // this side, so it gets no connection manager at all: a window would only let anyone
+            // who knows the ID put a name of their choosing on this screen. The peer asks its
+            // user for the password either way, and the next request starts the window as usual.
+            let silent_request =
+                lr.password.is_empty() && password::approve_mode() == ApproveMode::Password;
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
+            if !silent_request
+                && !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username)
+            {
                 self.try_start_cm_ipc();
             }
 
@@ -3075,7 +3119,9 @@ impl Connection {
                         return keep_alive;
                     }
                 }
-                self.try_start_cm(lr.my_id, lr.my_name, false);
+                if !silent_request {
+                    self.try_start_cm(lr.my_id, lr.my_name, false);
+                }
             } else {
                 let (failure, res) = self.check_failure(0).await;
                 if !res {
@@ -3911,10 +3957,14 @@ impl Connection {
                         let set = displays.set.iter().map(|d| *d as usize).collect::<Vec<_>>();
                         self.capture_displays(&add, &sub, &set).await;
                     }
-                    #[cfg(windows)]
                     Some(misc::Union::ToggleVirtualDisplay(t)) => {
                         if !self.view_camera {
-                            self.toggle_virtual_display(t).await;
+                            if t.spec.is_some() {
+                                self.request_virtual_display(t);
+                            } else {
+                                #[cfg(windows)]
+                                self.toggle_virtual_display(t).await;
+                            }
                         }
                     }
                     Some(misc::Union::TogglePrivacyMode(t)) => {
@@ -3999,7 +4049,12 @@ impl Connection {
                     #[cfg(feature = "flutter")]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchSidesRequest(s)) => {
-                        if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
+                        // A machine that only accepts connections never controls another one;
+                        // without the pending uuid, the outgoing block in client.rs holds.
+                        if config::is_incoming_only() {
+                            // A peer can repeat it at will, and refusing it is expected here.
+                            log::trace!("Ignoring a switch sides request on an incoming-only client");
+                        } else if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
                             if crate::server::insert_pending_switch_sides_uuid(
                                 self.lr.my_id.clone(),
                                 uuid.clone(),
@@ -4822,6 +4877,38 @@ impl Connection {
         }
     }
 
+    // A request with a `spec` is for the cross-platform virtual displays (src/vdisplay). The
+    // answer comes later, from the manager's thread, so this connection's loop never waits.
+    fn request_virtual_display(&mut self, t: ToggleVirtualDisplay) {
+        let refusal = if !self.peer_keyboard_enabled() {
+            Some("No permission to control the remote device")
+        } else if privacy_mode::is_in_privacy_mode() {
+            Some("Not available in privacy mode")
+        } else {
+            None
+        };
+        let owner = self.vdisplay_owner();
+        let mut inner = self.inner.clone();
+        let reply = Box::new(move |result| {
+            let mut misc = Misc::new();
+            misc.set_virtual_display_result(result);
+            let mut msg_out = Message::new();
+            msg_out.set_misc(misc);
+            inner.send(Arc::new(msg_out));
+        });
+        // A display that has the desktop to itself is privacy mode, under its permission.
+        crate::vdisplay::toggle(self.inner.id(), owner, t, refusal, self.privacy_mode, reply);
+    }
+
+    // The session that owns the virtual displays this connection asks for.
+    fn vdisplay_owner(&self) -> crate::vdisplay::Owner {
+        crate::vdisplay::Owner {
+            peer_id: self.lr.my_id.clone(),
+            peer_name: self.lr.my_name.clone(),
+            session_id: self.lr.session_id,
+        }
+    }
+
     async fn toggle_privacy_mode(&mut self, t: TogglePrivacyMode) {
         if t.on {
             self.turn_on_privacy(t.impl_key).await;
@@ -4837,6 +4924,16 @@ impl Connection {
                 let display_idx = d.unwrap_or(self.display_idx);
                 if let Some(display) = displays.get(display_idx) {
                     let name = display.name();
+                    // Our virtual displays have no original resolution to restore.
+                    if crate::vdisplay::resize(self.vdisplay_owner(), &name, r.width, r.height) {
+                        return;
+                    }
+                    // A monitor of a Wayland desktop is not ours to resize: xrandr would only
+                    // change what Xwayland tells its X clients.
+                    #[cfg(target_os = "linux")]
+                    if !crate::platform::linux::is_x11() {
+                        return;
+                    }
                     #[cfg(windows)]
                     if let Some(_ok) =
                         virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
@@ -5355,7 +5452,9 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(msg_out).await;
+        self.parting_sent = true;
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+        crate::vdisplay::conn_ended(self.inner.id(), true);
     }
 
     async fn handle_read_job_init_result(
@@ -7083,6 +7182,11 @@ mod raii {
                     .unwrap()
                     .on_connection_close(self.0);
             }
+            // Every way a connection ends comes through here; a session closed for good has
+            // already had its virtual displays removed, the rest keep them for a while.
+            if self.1 == AuthConnType::Remote {
+                crate::vdisplay::conn_ended(self.0, false);
+            }
             // Clear per-connection state to avoid stale behavior if conn ids are reused.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             clear_relative_mouse_active(self.0);
@@ -7105,6 +7209,7 @@ mod raii {
                 #[cfg(target_os = "linux")]
                 if self.1 == AuthConnType::Remote || self.1 == AuthConnType::ViewCamera {
                     wayland::try_close_portal_session();
+                    super::mutter::last_connection_ended();
                 }
             }
             Self::check_wake_lock();

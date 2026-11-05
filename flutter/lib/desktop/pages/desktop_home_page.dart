@@ -662,7 +662,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                                   ])
                             ]
                           : <Widget>[]) +
-                      (help != null
+                      // The help links go to rustdesk.com, which a custom client does not send its users to.
+                      (help != null && !bind.isCustomClient()
                           ? <Widget>[
                               Center(
                                   child: InkWell(

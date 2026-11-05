@@ -379,7 +379,7 @@ pub fn test_create_capturer(
 ) -> String {
     let test_begin = Instant::now();
     loop {
-        let err = match Display::all() {
+        let err = match super::display_service::all_displays() {
             Ok(mut displays) => {
                 if displays.len() <= display_idx {
                     anyhow!(
@@ -460,7 +460,7 @@ fn get_capturer_monitor(
         }
     }
 
-    let mut displays = Display::all()?;
+    let mut displays = super::display_service::all_displays()?;
     let ndisplay = displays.len();
     if ndisplay <= current {
         bail!(
@@ -1433,7 +1433,10 @@ pub fn make_display_changed_msg(
         width: display.width,
         height: display.height,
         cursor_embedded: match source {
-            VideoSource::Monitor => display_service::capture_cursor_embedded(),
+            // The display's own, or the client takes this one for it and draws a second cursor.
+            VideoSource::Monitor => {
+                display_service::capture_cursor_embedded() || display.cursor_embedded
+            }
             VideoSource::Camera => false,
         },
         #[cfg(not(target_os = "android"))]

@@ -81,6 +81,12 @@ pub struct Session<T: InvokeUiSession> {
     // peer sends a shape once, and a window asks for it whenever it has to draw it again.
     #[cfg(feature = "flutter")]
     pub cursor_shapes: Arc<RwLock<HashMap<u64, CursorData>>>,
+    // The virtual displays this session holds on the peer, by slot: asked for again after a
+    // reconnection, and the same for every window of the session (src/vdisplay).
+    pub virtual_displays: Arc<Mutex<crate::vdisplay::HeldDisplays>>,
+    // Whether a window of this session has added its virtual display on connecting: once per
+    // session, by whichever window gets there first.
+    pub virtual_display_auto_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -460,6 +466,218 @@ impl<T: InvokeUiSession> Session<T> {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(Data::Message(msg_out));
+    }
+
+    // What the peer's virtual displays can do, if it offers them (src/vdisplay).
+    fn virtual_display_caps(&self) -> Option<crate::vdisplay::PeerCaps> {
+        let lc = self.lc.read().unwrap();
+        crate::vdisplay::PeerCaps::parse(&lc.peer_info.as_ref()?.platform_additions)
+    }
+
+    fn virtual_display_wants_pixels(&self) -> bool {
+        self.get_option(base::config::keys::OPTION_VIRTUAL_DISPLAY_PIXELS.to_owned()) == "Y"
+    }
+
+    // The virtual-display mode this session asks for, as the wire value of `VirtualDisplaySpec`:
+    // dropped to the shared screen (0) when the peer does not offer the chosen one.
+    fn virtual_display_mode(&self, caps: &crate::vdisplay::PeerCaps) -> i32 {
+        let name = self.get_option(base::config::keys::OPTION_VIRTUAL_DISPLAY_MODE.to_owned());
+        let (wire, key) = match name.as_str() {
+            "nested" => (2, "nested"),
+            // The desktop to itself is privacy mode, which the peer may not allow.
+            "privacy" if self.lc.read().unwrap().privacy_mode_permission => (1, "privacy"),
+            _ => return 0,
+        };
+        if caps.has_mode(key) {
+            wire
+        } else {
+            0
+        }
+    }
+
+    /// This device's monitors, each with the size of the virtual display it would get on the peer
+    /// (the size of the view it is shown in, once a window told), and the displays this session
+    /// holds there, as JSON for the UI:
+    /// `{"monitors": [...], "held": {"<slot>": "<name, empty until the peer answers>"}}`.
+    /// Both are empty if the peer offers no virtual displays.
+    pub fn get_virtual_displays(&self) -> String {
+        let mut monitors = Vec::new();
+        if let Some(caps) = self.virtual_display_caps() {
+            let pixels = self.virtual_display_wants_pixels();
+            for (slot, m) in crate::vdisplay::local_monitors().into_iter().enumerate() {
+                let view = self.virtual_displays.lock().unwrap().view(slot as i32);
+                let spec = match view {
+                    Some(view) => crate::vdisplay::spec_for_view(&view, &caps, pixels),
+                    None => crate::vdisplay::spec_for(&m, &caps, pixels),
+                };
+                monitors.push(serde_json::json!({
+                    "x": m.x,
+                    "y": m.y,
+                    "w": m.w,
+                    "h": m.h,
+                    "scale": m.scale,
+                    "primary": m.primary,
+                    "width": spec.width,
+                    "height": spec.height,
+                }));
+            }
+        }
+        let held: serde_json::Map<String, serde_json::Value> = self
+            .virtual_displays
+            .lock()
+            .unwrap()
+            .names()
+            .into_iter()
+            .map(|(slot, name)| (slot.to_string(), serde_json::json!(name)))
+            .collect();
+        serde_json::json!({ "monitors": monitors, "held": held }).to_string()
+    }
+
+    /// True for the one window that adds the session's virtual display on connecting.
+    pub fn take_auto_virtual_display(&self) -> bool {
+        !self
+            .virtual_display_auto_done
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Asks the peer for a virtual display for this device's monitor `slot`, the size of the view
+    /// it is shown in if a window told, else of the monitor; or removes it; `slot` -1 with `on`
+    /// false removes them all. Asking again for a slot already held resizes it. The answer comes as
+    /// a `virtual_display_result` event.
+    pub fn toggle_virtual_display_slot(&self, slot: i32, on: bool) {
+        // Both ways: a peer of upstream would read a removal of -1 as "every virtual display".
+        let Some(caps) = self.virtual_display_caps() else {
+            return;
+        };
+        let mut spec = VirtualDisplaySpec::default();
+        if on {
+            let pixels = self.virtual_display_wants_pixels();
+            let view = self.virtual_displays.lock().unwrap().view(slot);
+            spec = if let Some(view) = view {
+                crate::vdisplay::spec_for_view(&view, &caps, pixels)
+            } else {
+                let monitors = crate::vdisplay::local_monitors();
+                let Some(monitor) = usize::try_from(slot).ok().and_then(|i| monitors.get(i))
+                else {
+                    log::warn!("No local monitor {} to size a virtual display after", slot);
+                    return;
+                };
+                crate::vdisplay::spec_for(monitor, &caps, pixels)
+            };
+            spec.mode = self.virtual_display_mode(&caps);
+        }
+        log::info!(
+            "Asking the peer to turn virtual display slot {} {} ({}x{}@{}, mode {})",
+            slot,
+            if on { "on" } else { "off" },
+            spec.width,
+            spec.height,
+            spec.scale,
+            spec.mode
+        );
+        // Noted and sent under the lock, so requests go out in the order they are numbered.
+        let mut held = self.virtual_displays.lock().unwrap();
+        held.ask(slot, on, spec.clone());
+        self.send(Data::Message(crate::vdisplay::toggle_msg(slot, on, spec)));
+    }
+
+    /// Notes the view a window shows virtual display `slot` in, `width`x`height` logical pixels at
+    /// `scale` pixels each, and asks for the display at its size if it is held at another. True if
+    /// it asked.
+    pub fn set_virtual_display_view(&self, slot: i32, width: f64, height: f64, scale: f64) -> bool {
+        if slot < 0 || ![width, height, scale].iter().all(|v| v.is_finite() && *v > 0.0) {
+            return false;
+        }
+        let view = crate::vdisplay::View {
+            w: width,
+            h: height,
+            scale,
+        };
+        self.virtual_displays.lock().unwrap().set_view(slot, view);
+        self.follow_virtual_display_view(slot)
+    }
+
+    // Asks for `slot` at the size of the view it is shown in, unless it has it, or a request
+    // concerning it is still waiting for its answer, which brings the view in again.
+    fn follow_virtual_display_view(&self, slot: i32) -> bool {
+        let Some(caps) = self.virtual_display_caps() else {
+            return false;
+        };
+        let pixels = self.virtual_display_wants_pixels();
+        let mode = self.virtual_display_mode(&caps);
+        let mut held = self.virtual_displays.lock().unwrap();
+        let Some(spec) = held.follow(slot, |view| {
+            let mut spec = crate::vdisplay::spec_for_view(view, &caps, pixels);
+            spec.mode = mode;
+            spec
+        }) else {
+            return false;
+        };
+        log::info!(
+            "Asking the peer to resize virtual display slot {} to its view ({}x{}@{})",
+            slot,
+            spec.width,
+            spec.height,
+            spec.scale
+        );
+        self.send(Data::Message(crate::vdisplay::toggle_msg(slot, true, spec)));
+        true
+    }
+
+    pub fn handle_virtual_display_result(&self, result: VirtualDisplayResult) {
+        if result.notice {
+            // Answers no request: the display is an extra screen now, not used as this session
+            // asked (the peer's desktop no longer its alone), which its user must know. Asked so
+            // from now on, and said so to the peer, which waits to hear it.
+            log::warn!(
+                "Virtual display slot {} is an extra screen now: {}",
+                result.slot,
+                result.error
+            );
+            self.set_option(
+                base::config::keys::OPTION_VIRTUAL_DISPLAY_MODE.to_owned(),
+                String::new(),
+            );
+            // Noted and sent under the lock, as every request.
+            let mut held = self.virtual_displays.lock().unwrap();
+            if let Some(spec) = held.now_shared(result.slot) {
+                self.send(Data::Message(crate::vdisplay::toggle_msg(result.slot, true, spec)));
+            }
+            drop(held);
+            self.msgbox("custom-nocancel-sticky", "Virtual display", &result.error, "");
+            self.ui_handler
+                .on_virtual_display_result(&result, Some(crate::vdisplay::mode_option(0)));
+            return;
+        }
+        if !result.error.is_empty() {
+            // What the slot is left at, not what was asked; the mode plus one, 0 when not told.
+            log::warn!(
+                "The peer failed a request for virtual display slot {}, left {} (used {}): {}",
+                result.slot,
+                if result.on { "on" } else { "off" },
+                result.used,
+                result.error
+            );
+        }
+        let kept = self.virtual_displays.lock().unwrap().answer(&result);
+        let mode = kept.map(crate::vdisplay::mode_option);
+        if let Some(mode) = mode {
+            // The mode the peer refused is not the session's: asked for no more, nor shown as.
+            // Before following the view, which asks in this mode.
+            self.set_option(
+                base::config::keys::OPTION_VIRTUAL_DISPLAY_MODE.to_owned(),
+                mode.to_owned(),
+            );
+        }
+        if result.slot >= 0 {
+            self.follow_virtual_display_view(result.slot);
+        }
+        if mode.is_some() && !result.error.is_empty() {
+            // Not used as asked, maybe with nobody having asked just now (a display added on
+            // connecting): its user must know, as for word from the peer.
+            self.msgbox("custom-nocancel-sticky", "Virtual display", &result.error, "");
+        }
+        self.ui_handler.on_virtual_display_result(&result, mode);
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -1329,7 +1547,6 @@ impl<T: InvokeUiSession> Session<T> {
         // override only if true
         if true == force_relay {
             let mut lc = self.lc.write().unwrap();
-            lc.force_relay = true;
             // An explicit retry-via-relay is a decision about this peer, not transport
             // necessity: Relay-only ICE for this round like any force-always-relay session,
             // and it is the one kind of relay that belongs in the peer's saved config.
@@ -1764,6 +1981,10 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn is_multi_ui_session(&self) -> bool;
     fn update_record_status(&self, start: bool);
     fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
+    /// `mode`: the mode option set back to (empty for the shared screen), when the display is not
+    /// used as the session asked; the user told why already. Set before this is called: a read of
+    /// the option from here on sees it, or a choice made since.
+    fn on_virtual_display_result(&self, _result: &VirtualDisplayResult, _mode: Option<&str>) {}
     fn printer_request(&self, id: i32, path: String);
     fn handle_screenshot_resp(&self, sid: String, msg: String);
     fn handle_terminal_response(&self, response: TerminalResponse);
@@ -1928,6 +2149,25 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
         if !t.from_client {
+            // 阶段 1 遥测:首个 RTT 到达时,结合建连时记下的传输打一行 [CONN-RTT](每条连接只打一次)。
+            // 先取 id 再拿 lc 写锁:get_id() 内部要读同一把 lc 锁,持写锁时调用会自死锁。
+            if t.last_delay > 0 {
+                let id = self.get_id();
+                let mut lc = self.lc.write().unwrap();
+                if let Some(p) = lc.conn_path.as_mut() {
+                    if !p.rtt_logged {
+                        p.rtt_logged = true;
+                        log::info!(
+                            "[CONN-RTT] id={} transport={} direct={} connect_ms={} rtt_ms={}",
+                            id,
+                            p.transport,
+                            p.direct,
+                            p.connect_ms,
+                            t.last_delay
+                        );
+                    }
+                }
+            }
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),
                 target_bitrate: Some(t.target_bitrate as _),

@@ -1272,6 +1272,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             _OptionCheckBox(
                 context, 'Enable remote restart', kOptionEnableRemoteRestart,
                 enabled: enabled, fakeValue: fakeValue),
+            // Only where there is a backend for them so far (src/vdisplay).
+            if (isLinux)
+              _OptionCheckBox(context, 'Enable remote virtual display',
+                  kOptionEnableRemoteVirtualDisplay,
+                  enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
                 context, 'Enable recording session', kOptionEnableRecordSession,
                 enabled: enabled, fakeValue: fakeValue),
@@ -1906,7 +1911,10 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
           tooltipMessage: tooltipMessage,
           trailing: Switch(
             value: mainGetBoolOptionSync(optionKey),
-            onChanged: locked || isOptionFixed(optionKey)
+            onChanged: locked ||
+                    isOptionFixed(optionKey) ||
+                    (optionKey == kOptionAllowWebSocket &&
+                        isWebSocketLockedOn())
                 ? null
                 : (value) {
                     mainSetBoolOption(optionKey, value);
@@ -2615,22 +2623,25 @@ class _AboutState extends State<_About> {
               SelectionArea(
                   child: Text('${translate('ID')}: $myId')
                       .marginSymmetric(vertical: 4.0)),
-              InkWell(
-                  onTap: () {
-                    launchUrlString('https://rustdesk.com/privacy.html');
-                  },
-                  child: Text(
-                    translate('Privacy Statement'),
-                    style: linkStyle,
-                  ).marginSymmetric(vertical: 4.0)),
-              InkWell(
-                  onTap: () {
-                    launchUrlString('https://rustdesk.com');
-                  },
-                  child: Text(
-                    translate('Website'),
-                    style: linkStyle,
-                  ).marginSymmetric(vertical: 4.0)),
+              // A custom client links to neither rustdesk.com page; the copyright below stays.
+              if (!bind.isCustomClient()) ...[
+                InkWell(
+                    onTap: () {
+                      launchUrlString('https://rustdesk.com/privacy.html');
+                    },
+                    child: Text(
+                      translate('Privacy Statement'),
+                      style: linkStyle,
+                    ).marginSymmetric(vertical: 4.0)),
+                InkWell(
+                    onTap: () {
+                      launchUrlString('https://rustdesk.com');
+                    },
+                    child: Text(
+                      translate('Website'),
+                      style: linkStyle,
+                    ).marginSymmetric(vertical: 4.0)),
+              ],
               Container(
                 decoration: const BoxDecoration(color: Color(0xFF2c8cff)),
                 padding:

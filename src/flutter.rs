@@ -226,7 +226,7 @@ pub unsafe extern "C" fn free_c_args(ptr: *mut *mut c_char, len: c_int) {
 #[cfg(windows)]
 #[no_mangle]
 pub unsafe extern "C" fn get_rustdesk_app_name(buffer: *mut u16, length: i32) -> i32 {
-    let name = crate::platform::wide_string(&crate::get_app_name());
+    let name = crate::platform::wide_string(&crate::get_app_display_name());
     if length > name.len() as i32 {
         std::ptr::copy_nonoverlapping(name.as_ptr(), buffer, name.len());
         return 0;
@@ -632,16 +632,18 @@ impl FlutterHandler {
     fn make_displays_msg(displays: &Vec<DisplayInfo>) -> String {
         let mut msg_vec = Vec::new();
         for ref d in displays.iter() {
-            let mut h: HashMap<&str, i32> = Default::default();
-            h.insert("x", d.x);
-            h.insert("y", d.y);
-            h.insert("width", d.width);
-            h.insert("height", d.height);
-            h.insert("cursor_embedded", if d.cursor_embedded { 1 } else { 0 });
+            let mut h: HashMap<&str, serde_json::Value> = Default::default();
+            h.insert("x", json!(d.x));
+            h.insert("y", json!(d.y));
+            h.insert("width", json!(d.width));
+            h.insert("height", json!(d.height));
+            h.insert("cursor_embedded", json!(if d.cursor_embedded { 1 } else { 0 }));
             if let Some(original_resolution) = d.original_resolution.as_ref() {
-                h.insert("original_width", original_resolution.width);
-                h.insert("original_height", original_resolution.height);
+                h.insert("original_width", json!(original_resolution.width));
+                h.insert("original_height", json!(original_resolution.height));
             }
+            // Finds a virtual display the peer named in a `virtual_display_result`.
+            h.insert("name", json!(d.name));
             // Don't convert scale (x 100) to i32 directly.
             // (d.scale * 100.0f64) as i32 may produces inaccuracies.
             //
@@ -656,7 +658,7 @@ impl FlutterHandler {
             // Send scaled_width for accurate logical scale calculation.
             if d.scale > 0.0 {
                 let scaled_width = (d.width as f64 / d.scale).round() as i32;
-                h.insert("scaled_width", scaled_width);
+                h.insert("scaled_width", json!(scaled_width));
             }
             msg_vec.push(h);
         }
@@ -954,6 +956,26 @@ impl InvokeUiSession for FlutterHandler {
             &[("platform_additions", &data)],
             &[],
         )
+    }
+
+    fn on_virtual_display_result(&self, result: &VirtualDisplayResult, mode: Option<&str>) {
+        let (slot, on, notice) = (
+            result.slot.to_string(),
+            result.on.to_string(),
+            result.notice.to_string(),
+        );
+        let mut event = vec![
+            ("slot", slot.as_str()),
+            ("on", on.as_str()),
+            // Not "name": that key is the event's own.
+            ("display", result.name.as_str()),
+            ("error", result.error.as_str()),
+            ("notice", notice.as_str()),
+        ];
+        if let Some(mode) = mode {
+            event.push(("mode", mode));
+        }
+        self.push_event("virtual_display_result", &event, &[])
     }
 
     fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {

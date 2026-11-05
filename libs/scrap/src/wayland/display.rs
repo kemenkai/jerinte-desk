@@ -421,6 +421,11 @@ pub fn logical_rects_of_displays(displays: &[WaylandDisplayInfo]) -> Vec<Display
     logical_rects_of(displays)
 }
 
+/// The uinput desktop rect of a display list, for a caller that already has the list.
+pub fn desktop_rect_of_displays(displays: &[WaylandDisplayInfo]) -> Option<(i32, i32, i32, i32)> {
+    desktop_rect_of(displays)
+}
+
 fn logical_rects_of(displays: &[WaylandDisplayInfo]) -> Vec<DisplayRect> {
     // Match `desktop_rect_of`: a single display uses its physical size (its scale is
     // reported as 1.0 to the client), multiple displays use logical size. This keeps a

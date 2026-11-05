@@ -873,6 +873,10 @@ class RustdeskImpl {
     return js.context.callMethod('getByName', ['app-name']);
   }
 
+  String mainGetAppDisplayName({dynamic hint}) {
+    return mainGetAppNameSync(hint: hint);
+  }
+
   String mainUriPrefixSync({dynamic hint}) {
     throw UnimplementedError("mainUriPrefixSync");
   }
@@ -1415,6 +1419,35 @@ class RustdeskImpl {
           'toggle_virtual_display',
           jsonEncode({'index': index, 'on': on})
         ]));
+  }
+
+  // The web client offers no virtual displays: no monitors, nothing held.
+  String sessionGetVirtualDisplays(
+      {required UuidValue sessionId, dynamic hint}) {
+    return '{"monitors":[],"held":{}}';
+  }
+
+  bool sessionTakeAutoVirtualDisplay(
+      {required UuidValue sessionId, dynamic hint}) {
+    return false;
+  }
+
+  Future<void> sessionToggleVirtualDisplaySlot(
+      {required UuidValue sessionId,
+      required int slot,
+      required bool on,
+      dynamic hint}) {
+    return Future.value();
+  }
+
+  bool sessionSetVirtualDisplayView(
+      {required UuidValue sessionId,
+      required int slot,
+      required double width,
+      required double height,
+      required double scale,
+      dynamic hint}) {
+    return false;
   }
 
   Future<void> mainSetHomeDir({required String home, dynamic hint}) {

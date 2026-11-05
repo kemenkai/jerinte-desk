@@ -64,5 +64,5 @@ on run {user, cur_pid, source_path, expected_sha256}
 
   set sh to "set -e; transaction_started=0; transaction_committed=0; bundle_backed_up=0; bundle_swapped=0; trap " & quoted form of rollback_update & " EXIT;" & check_source & prepare_verified & validate_verified_app & resolve_uid & prepare_swap_paths & cleanup_swap_paths & backup_plists & stage_bundle & protect_staged_bundle & "transaction_started=1;" & unload_agent & unload_service & kill_others & move_current_bundle & install_staged_bundle & write_new_plists & load_service & wait_for_service & load_agent & wait_for_agent & verify_readiness & commit_update
 
-  do shell script sh with prompt "RustDesk wants to update itself" with administrator privileges
+  do shell script sh with prompt "APP_DISPLAY_NAME wants to update itself" with administrator privileges
 end run

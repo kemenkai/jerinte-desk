@@ -365,6 +365,20 @@ fn tcp_punch_allowed() -> bool {
             || crate::get_webrtc_enabled())
 }
 
+/// Under ws the one classic direct path is the LAN one: the server found both ends on one
+/// intranet (`is_local`) and handed over the address the target listens on. Taken with
+/// `allow-ws-lan-direct` on and no relay policy, whether or not the request carried an offer:
+/// the TCP leg then connects from any local port (there is no punch to reuse one for), and its
+/// win is kept rather than overridden by the relay ws otherwise forces.
+fn ws_lan_direct_leg(is_local: bool, ws: bool, allowed: bool, policy_relay: bool) -> bool {
+    is_local && ws && allowed && !policy_relay
+}
+
+/// How long the LAN leg under ws waits for the peer's signed id. A peer reached over the LAN signs
+/// at once; silence this long means something else took the connection (a TUN proxy faking the
+/// handshake), and falling back to the relay beats waiting out the full read timeout.
+const LAN_HANDSHAKE_TIMEOUT: u64 = 3_000;
+
 impl Client {
     const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
 
@@ -958,7 +972,16 @@ impl Client {
             conn_type: conn_type.into(),
             version: crate::VERSION.to_owned(),
             udp_port: udp_nat_port as _,
-            force_relay: interface.is_force_relay(),
+            // Under ws, `allow-ws-lan-direct` clears this to declare that this side takes a
+            // same-intranet connection, which the server then answers with the target's LAN
+            // address (`connect()`'s LAN leg). Only here: locally ws still forces relay, and
+            // `nat_type` still says SYMMETRIC, so a target off the intranet relays as before.
+            // `my_addr` is an end of the connection to the ws server, whose route tells whether
+            // this host has a LAN address at all.
+            force_relay: interface.is_force_relay()
+                && !(use_ws()
+                    && !interface.is_policy_relay()
+                    && crate::ws_lan_direct_usable(my_addr)),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             switch_code,
             // The offer's envelope itself declares its ICE policy (`ice_policy: "all"` under
@@ -1463,9 +1486,18 @@ impl Client {
 
         // Each attempt carries whether its path is direct (4th field). TCP/UDP/IPv6 punch are
         // always direct; WebRTC is direct only when ICE nominated a non-TURN pair.
+        let lan_over_ws = ws_lan_direct_leg(
+            is_local,
+            use_ws(),
+            crate::ws_lan_direct_allowed(),
+            interface.is_policy_relay(),
+        );
         let mut direct_futures = Vec::new();
-        if allow_tcp_punch {
-            let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+        if allow_tcp_punch || lan_over_ws {
+            // The LAN leg over ws binds no address: there is no punch to reuse a port for, the
+            // rendezvous socket's being that of its connection through the ws server.
+            let bind = if lan_over_ws { None } else { Some(local_addr) };
+            let fut = connect_tcp_local(peer, bind, connect_timeout);
             direct_futures.push(
                 async move {
                     let conn = fut.await?;
@@ -1543,11 +1575,14 @@ impl Client {
         // webrtc_guard stays armed across the relay override and secure_connection below; it is
         // disarmed only at the successful return when WebRTC is the kept transport.
 
-        // Keep a WebRTC win instead of replacing it with the RustDesk relay: under relay-by-
-        // policy the pc was built with Relay-only ICE (TURN configured), which already honors
+        // Wins that stand in for the relay ws or policy otherwise forces, so are not replaced by
+        // the RustDesk relay, and fall back to it if their handshake fails. WebRTC: under relay-
+        // by-policy the pc was built with Relay-only ICE (TURN configured), which already honors
         // the relay requirement, and under ws-forced relay a direct full-ICE connection is the
-        // preferred outcome, not a violation.
-        if (interface.is_force_relay() && typ != "WebRTC") || conn.is_err() {
+        // preferred outcome, not a violation. The LAN leg under ws: the only TCP leg there is,
+        // sent only with no relay policy.
+        let stands_in_for_relay = typ == "WebRTC" || (lan_over_ws && typ == "TCP");
+        if (interface.is_force_relay() && !stands_in_for_relay) || conn.is_err() {
             if !relay_server.is_empty() {
                 let switch_code = interface.get_switch_code();
                 conn = Self::request_relay(
@@ -1578,14 +1613,23 @@ impl Client {
             start.elapsed(),
             punch_type
         );
-        let res = Self::secure_connection(peer_id, signed_id_pk.clone(), key, &mut conn).await;
+        let res = Self::secure_connection_with(
+            peer_id,
+            signed_id_pk.clone(),
+            key,
+            &mut conn,
+            lan_over_ws && typ == "TCP",
+        )
+        .await;
         let pk: Option<Vec<u8>> = match res {
             Ok(pk) => pk,
-            Err(e) if typ == "WebRTC" && !relay_server.is_empty() => {
+            Err(e) if stands_in_for_relay && !relay_server.is_empty() => {
                 // WebRTC won the race but identity/DTLS binding failed; fall back to a freshly
                 // coordinated relay instead of failing the whole attempt. The guard is dropped
-                // first so the bad pc is closed promptly.
-                log::warn!("WebRTC secure handshake failed ({}), falling back to relay", e);
+                // first so the bad pc is closed promptly. Likewise the LAN leg under ws, which
+                // something on the way can complete at the TCP level without being the peer: a
+                // TUN proxy answering for the address, or another host with the same LAN address.
+                log::warn!("{} secure handshake failed ({}), falling back to relay", typ, e);
                 drop(webrtc_guard.take());
                 match Self::request_relay(
                     peer_id,
@@ -1618,7 +1662,8 @@ impl Client {
                     Err(relay_e) => {
                         interface.update_direct(Some(direct));
                         bail!(
-                            "WebRTC secure failed ({}); relay fallback also failed: {}",
+                            "{} secure failed ({}); relay fallback also failed: {}",
+                            typ,
                             e,
                             relay_e
                         );
@@ -1656,6 +1701,21 @@ impl Client {
         key: &str,
         conn: &mut Stream,
     ) -> ResultType<Option<Vec<u8>>> {
+        Self::secure_connection_with(peer_id, signed_id_pk, key, conn, false).await
+    }
+
+    /// `secure_connection`, failing closed on the LAN leg under ws (`lan_over_ws`) as on WebRTC.
+    /// ws users had no plaintext fallback on the wire before it: their only direct path was
+    /// WebRTC, which fails closed, and their relay runs inside the ws server's TLS. So the leg
+    /// takes a verified identity or nothing, waits for it only `LAN_HANDSHAKE_TIMEOUT`, and
+    /// leaves every failure to the relay fallback.
+    async fn secure_connection_with(
+        peer_id: &str,
+        signed_id_pk: Vec<u8>,
+        key: &str,
+        conn: &mut Stream,
+        lan_over_ws: bool,
+    ) -> ResultType<Option<Vec<u8>>> {
         let rs_pk = get_rs_pk(if key.is_empty() {
             config::RS_PUB_KEY
         } else {
@@ -1670,6 +1730,8 @@ impl Client {
         // binding is possible at all; WebRTC then proceeds like TCP's non-secure fallback —
         // DTLS-encrypted but reported unsecured. TCP/UDP/relay keep their existing behavior.
         let is_webrtc = conn.is_webrtc();
+        let strict = is_webrtc || lan_over_ws;
+        let leg = if is_webrtc { "WebRTC" } else { "LAN" };
         let mut sign_pk = None;
         let mut option_pk = None;
         if !signed_id_pk.is_empty() {
@@ -1691,13 +1753,23 @@ impl Client {
                 // No trusted peer identity (key-less deployment, or a blob that does not verify
                 // under our root), so no fingerprint binding is possible. Fall through like TCP's
                 // non-secure path with is_secured() false: bailing would only move the session to
-                // a relay that fails the same check and then runs in plaintext.
+                // a relay that fails the same check and then runs in plaintext. The LAN leg under
+                // ws is the exception: its relay runs inside the ws server's TLS, while plaintext
+                // here would cross the LAN in the clear.
+                if lan_over_ws {
+                    bail!("LAN leg without a verified peer identity");
+                }
                 // send an empty message out in case server is setting up secure and waiting for first message
                 conn.send(&Message::new()).await?;
                 return Ok(option_pk);
             }
         };
-        match timeout(READ_TIMEOUT, conn.next()).await? {
+        let read_timeout = if lan_over_ws {
+            LAN_HANDSHAKE_TIMEOUT
+        } else {
+            READ_TIMEOUT
+        };
+        match timeout(read_timeout, conn.next()).await? {
             Some(res) => {
                 let bytes = res?;
                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
@@ -1746,15 +1818,15 @@ impl Client {
                                     },
                                 )?;
                             } else {
-                                if is_webrtc {
-                                    bail!("WebRTC handshake id mismatch (possible MITM)");
+                                if strict {
+                                    bail!("{leg} handshake id mismatch (possible MITM)");
                                 }
                                 log::error!("Handshake failed: sign failure");
                                 conn.send(&Message::new()).await?;
                             }
                         } else {
-                            if is_webrtc {
-                                bail!("WebRTC peer identity could not be verified (refusing unbound channel)");
+                            if strict {
+                                bail!("{leg} peer identity could not be verified (refusing unbound channel)");
                             }
                             // fall back to non-secure connection in case pk mismatch
                             log::info!("pk mismatch, fall back to non-secure");
@@ -1763,15 +1835,15 @@ impl Client {
                             conn.send(&msg_out).await?;
                         }
                     } else {
-                        if is_webrtc {
-                            bail!("WebRTC handshake received an unexpected message type");
+                        if strict {
+                            bail!("{leg} handshake received an unexpected message type");
                         }
                         log::error!("Handshake failed: invalid message type");
                         conn.send(&Message::new()).await?;
                     }
                 } else {
-                    if is_webrtc {
-                        bail!("WebRTC handshake received a malformed message");
+                    if strict {
+                        bail!("{leg} handshake received a malformed message");
                     }
                     log::error!("Handshake failed: invalid message format");
                     conn.send(&Message::new()).await?;
@@ -2359,7 +2431,7 @@ impl AudioHandler {
 
         self.simple = Some(Simple::new(
             None,                   // Use the default server
-            &crate::get_app_name(), // Our application’s name
+            &crate::get_app_display_name(), // Our application’s name
             Direction::Playback,    // We want a playback stream
             None,                   // Use the default device
             "playback",             // Description of our stream
@@ -2825,6 +2897,19 @@ struct ConnToken {
     session_id: u64,
 }
 
+/// 连接路径遥测(阶段 1,仅采集不改选路):记录本次连接实际走的传输、所用服务器、是否直连、
+/// 建连耗时;首个控制通道 RTT 到达时合并打一行 `[CONN-RTT]`,便于部署后统计各传输的赢面与延迟。
+#[derive(Clone, Default)]
+pub struct ConnPathInfo {
+    pub transport: String,
+    pub server: String,
+    pub direct: bool,
+    pub secured: bool,
+    pub connect_ms: u64,
+    /// 首个 RTT 已打印,避免每个心跳都刷一行。
+    pub rtt_logged: bool,
+}
+
 /// Login config handler for [`Client`].
 #[derive(Default)]
 pub struct LoginConfigHandler {
@@ -2851,15 +2936,17 @@ pub struct LoginConfigHandler {
     pub version: i64,
     features: Option<Features>,
     pub session_id: u64, // used for local <-> server communication
+    /// 本次连接的路径遥测(阶段 1),连接建立时填,首个 RTT 到达时读。
+    pub conn_path: Option<ConnPathInfo>,
     pub supported_encoding: SupportedEncoding,
     restarting_remote_device: bool,
     // Start time of the restart grace window. On Windows the peer may briefly
     // reconnect before the real reboot disconnect.
     restart_remote_device_at: Option<Instant>,
-    pub force_relay: bool,
-    // force_relay minus the WebSocket transport. ws forces relay for classic punching but says
-    // nothing about ICE, so every WebRTC decision keys off this: policy means Relay-only ICE,
-    // transport may still go direct.
+    // Relay forced minus the WebSocket transport (`is_force_relay` adds that one as it is when
+    // asked, since the entry in use, and with it ws, can change between connections). ws forces
+    // relay for classic punching but says nothing about ICE, so every WebRTC decision keys off
+    // this: policy means Relay-only ICE, transport may still go direct.
     pub policy_relay: bool,
     // The peer-scoped part of it, and the only part that may be written back to the peer.
     pub peer_relay: bool,
@@ -2881,6 +2968,9 @@ pub struct LoginConfigHandler {
     pub enable_trusted_devices: bool,
     pub record_state: bool,
     pub record_permission: bool,
+    /// Whether the peer lets this session have privacy mode, which a virtual display that has the
+    /// peer's desktop to itself is (src/vdisplay).
+    pub privacy_mode_permission: bool,
 }
 
 impl Deref for LoginConfigHandler {
@@ -2913,7 +3003,9 @@ impl LoginConfigHandler {
         conn_token: Option<String>,
     ) {
         let mut id = id;
-        if id.contains("@") {
+        // With compiled-in servers `id@server` stays one opaque ID, which the build's own
+        // rendezvous server then reports as unknown.
+        if id.contains("@") && !crate::common::is_baked_custom_client() {
             let mut v = id.split("@");
             let raw_id: &str = v.next().unwrap_or_default();
             let mut server_key = v.next().unwrap_or_default().split('?');
@@ -2981,7 +3073,6 @@ impl LoginConfigHandler {
             config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
                 || force_relay;
         self.policy_relay = self.peer_relay || Config::is_proxy();
-        self.force_relay = self.policy_relay || use_ws();
         if let Some((real_id, server, key)) = &self.other_server {
             let other_server_key = self.get_option("other-server-key");
             if !other_server_key.is_empty() && key.is_empty() {
@@ -3002,6 +3093,7 @@ impl LoginConfigHandler {
         self.shared_password = shared_password;
         self.record_state = false;
         self.record_permission = true;
+        self.privacy_mode_permission = true;
 
         // `std::env::remove_var("IS_TERMINAL_ADMIN");` is called in `session_add_sync()` - `flutter_ffi.rs`.
         let is_terminal_admin = conn_type == ConnType::TERMINAL
@@ -4934,7 +5026,7 @@ pub trait Interface: Send + Clone + 'static + Sized {
     }
 
     fn is_force_relay(&self) -> bool {
-        self.get_lch().read().unwrap().force_relay
+        self.get_lch().read().unwrap().policy_relay || use_ws()
     }
 
     fn is_policy_relay(&self) -> bool {
@@ -5310,13 +5402,36 @@ async fn hc_connection_(
 pub mod peer_online {
     use hbb_common::{
         anyhow::bail,
-        config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT},
+        config::{Config, READ_TIMEOUT, RENDEZVOUS_PORT},
         log,
         rendezvous_proto::*,
         sleep,
         socket_client::connect_tcp,
+        websocket::is_ws_endpoint,
         ResultType, Stream,
     };
+
+    /// The peer list polls every few seconds and reads each answer for 3s, so waiting out the
+    /// general 18s connect timeout on a bad link only stacks connections up.
+    const ONLINE_CONNECT_TIMEOUT: u64 = 5_000;
+
+    lazy_static::lazy_static! {
+        // Queries that failed in a row, and when the next may go out: the list's polling does
+        // not stop while the server is away, so the queries back off instead.
+        static ref BACKOFF: std::sync::Mutex<(u32, Option<std::time::Instant>)> = Default::default();
+    }
+
+    /// The wait after `failures` queries in a row failed: 5, 10, 20, 40, then 60 s.
+    fn retry_after(failures: u32) -> std::time::Duration {
+        (std::time::Duration::from_secs(5) * 2u32.pow(failures.saturating_sub(1).min(4)))
+            .min(std::time::Duration::from_secs(60))
+    }
+
+    fn query_failed() {
+        let mut backoff = BACKOFF.lock().unwrap();
+        backoff.0 += 1;
+        backoff.1 = Some(std::time::Instant::now() + retry_after(backoff.0));
+    }
 
     pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
         let test = false;
@@ -5332,31 +5447,47 @@ pub mod peer_online {
                     f(onlines, offlines);
                 }
                 Err(e) => {
+                    query_failed();
                     log::debug!("query onlines, {}", &e);
                 }
             }
         }
     }
 
+    /// Where to send OnlineRequest. hbbs answers it on the port below the rendezvous port, which
+    /// ws mode maps to the signaling endpoint; a full ws(s):// URL is that endpoint already, so it
+    /// is used as is. None when the address carries no usable port.
+    fn online_query_server(rendezvous_server: &str) -> Option<String> {
+        if is_ws_endpoint(rendezvous_server) {
+            return Some(rendezvous_server.to_owned());
+        }
+        let server = crate::check_port(rendezvous_server, RENDEZVOUS_PORT);
+        let online_server = crate::increase_port(&server, -1);
+        (online_server != server).then_some(online_server)
+    }
+
     async fn create_online_stream() -> ResultType<Stream> {
         let (rendezvous_server, _servers, _contained) =
             crate::get_rendezvous_server(READ_TIMEOUT).await;
-        let tmp: Vec<&str> = rendezvous_server.split(":").collect();
-        if tmp.len() != 2 {
+        let Some(online_server) = online_query_server(&rendezvous_server) else {
             bail!("Invalid server address: {}", rendezvous_server);
-        }
-        let port: u16 = tmp[1].parse()?;
-        if port == 0 {
-            bail!("Invalid server address: {}", rendezvous_server);
-        }
-        let online_server = format!("{}:{}", tmp[0], port - 1);
-        connect_tcp(online_server, CONNECT_TIMEOUT).await
+        };
+        connect_tcp(online_server, ONLINE_CONNECT_TIMEOUT).await
     }
 
     async fn query_online_states_(
         ids: &Vec<String>,
         timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
+        // Backing off: reported as when the server cannot be reached, without trying it.
+        if BACKOFF
+            .lock()
+            .unwrap()
+            .1
+            .map_or(false, |next| std::time::Instant::now() < next)
+        {
+            return Ok((vec![], ids.clone()));
+        }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
             id: Config::get_id(),
@@ -5368,6 +5499,7 @@ pub mod peer_online {
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
+                query_failed();
                 return Ok((vec![], ids.clone()));
             }
         };
@@ -5377,6 +5509,7 @@ pub mod peer_online {
         // An established connection was aborted by the software in your host machine. (os error 10053)
         if let Err(e) = socket.send(&msg_out).await {
             log::debug!("Failed to send peers online states query, {e}");
+            query_failed();
             return Ok((vec![], ids.clone()));
         }
         // Retry for 2 times to get the online response
@@ -5408,6 +5541,7 @@ pub mod peer_online {
                                 offlines.push(ids[i].clone());
                             }
                         }
+                        *BACKOFF.lock().unwrap() = Default::default();
                         return Ok((onlines, offlines));
                     }
                     _ => {
@@ -5429,6 +5563,12 @@ pub mod peer_online {
         use hbb_common::rendezvous_proto::IceCandidate;
 
         #[test]
+        fn failing_online_queries_back_off_to_a_minute() {
+            let secs: Vec<u64> = (1..=6).map(|n| super::retry_after(n).as_secs()).collect();
+            assert_eq!(secs, [5, 10, 20, 40, 60, 60]);
+        }
+
+        #[test]
         fn accepts_webrtc_ice_by_session_key_only() {
             let ice = IceCandidate {
                 session_key: "session-a".to_owned(),
@@ -5439,6 +5579,18 @@ pub mod peer_online {
             assert!(Client::is_expected_webrtc_ice_candidate(&ice, "session-a"));
             assert!(!Client::is_expected_webrtc_ice_candidate(&ice, "session-b"));
         }
+
+        #[test]
+        fn online_query_server_keeps_ws_urls_and_steps_ports() {
+            use super::online_query_server as q;
+            let url = "wss://rd.example.com:4443/p1/id";
+            assert_eq!(q(url).as_deref(), Some(url));
+            assert_eq!(q("1.2.3.4:21116").as_deref(), Some("1.2.3.4:21115"));
+            assert_eq!(q("rd.example.com").as_deref(), Some("rd.example.com:21115"));
+            assert_eq!(q("[2001:db8::1]:21116").as_deref(), Some("[2001:db8::1]:21115"));
+            assert_eq!(q("rd.example.com:0"), None);
+        }
+
     }
 }
 
@@ -5564,7 +5716,7 @@ async fn udp_nat_connect(
 
 #[cfg(test)]
 mod webrtc_race_tests {
-    use super::race_transports_prefer_webrtc;
+    use super::{race_transports_prefer_webrtc, request_allows_tcp_punch, ws_lan_direct_leg};
     use hbb_common::{
         anyhow::anyhow,
         futures::future::{BoxFuture, FutureExt},
@@ -5590,6 +5742,23 @@ mod webrtc_race_tests {
     }
 
     const NOT_P2P: fn(&&'static str) -> bool = |_| false;
+
+    #[test]
+    fn webrtc_request_never_reuses_its_signaling_socket_for_tcp_punch() {
+        assert!(request_allows_tcp_punch(""));
+        assert!(!request_allows_tcp_punch("webrtc://offer"));
+    }
+
+    // The LAN leg under ws: only for an answer the server sent as local, under ws, with the
+    // option on and no relay policy. Off ws the ordinary TCP leg serves the LAN as it always has.
+    #[test]
+    fn ws_lan_leg_needs_a_local_answer_ws_the_option_and_no_policy() {
+        assert!(ws_lan_direct_leg(true, true, true, false));
+        assert!(!ws_lan_direct_leg(false, true, true, false), "not a local answer");
+        assert!(!ws_lan_direct_leg(true, false, true, false), "not ws");
+        assert!(!ws_lan_direct_leg(true, true, false, false), "option off");
+        assert!(!ws_lan_direct_leg(true, true, true, true), "relay policy");
+    }
 
     // A direct result must win even when it lands first — the LAN ordering, where ICE beats the
     // relay's TCP connect. Parking it as if it were a relay commits the relay on arrival.

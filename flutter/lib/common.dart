@@ -783,8 +783,19 @@ class OverlayKeyState {
   GlobalKey<OverlayState>? get key => _overlayKey;
 }
 
+// A dialog staying until answered: how to put it on an overlay, and the one it is on.
+class _StickyDialog {
+  final OverlayEntry Function(OverlayState) entryOn;
+  OverlayState on;
+  _StickyDialog(this.entryOn, this.on);
+}
+
 class OverlayDialogManager {
   final Map<String, Dialog> _dialogs = {};
+  // Dialogs that stay until answered, by tag. A page clearing up after a change of its state
+  // (`dismissTransient`) leaves them, and they move to the overlay it builds anew
+  // (`setOverlayState`).
+  final Map<String, _StickyDialog> _sticky = {};
   var _overlayKeyState = OverlayKeyState();
   int _tagCount = 0;
 
@@ -807,6 +818,32 @@ class OverlayDialogManager {
 
   void setOverlayState(OverlayKeyState overlayKeyState) {
     _overlayKeyState = overlayKeyState;
+    if (_sticky.isNotEmpty) {
+      // The new overlay is in the tree once this frame is done.
+      WidgetsBinding.instance
+          .addPostFrameCallback((_) => _moveSticky(overlayKeyState));
+    }
+  }
+
+  // The dialogs that stay, on the overlay of `keyState` if it is still the one: their entries'
+  // overlay is gone, or going.
+  void _moveSticky(OverlayKeyState keyState) {
+    final overlay = keyState._overlayKey.currentState;
+    if (!identical(keyState, _overlayKeyState) || overlay == null) return;
+    for (final tag in _sticky.keys.toList()) {
+      final dialog = _dialogs[tag];
+      if (dialog == null) {
+        _sticky.remove(tag);
+        continue;
+      }
+      final sticky = _sticky[tag]!;
+      // On the global overlay, say, the page's not in the tree yet when it was shown.
+      if (identical(sticky.on, overlay) && dialog.entry?.mounted == true) continue;
+      dialog.entry?.remove();
+      dialog.entry = sticky.entryOn(overlay);
+      sticky.on = overlay;
+      overlay.insert(dialog.entry!);
+    }
   }
 
   void dismissAll() {
@@ -815,11 +852,21 @@ class OverlayDialogManager {
       BackButtonInterceptor.removeByName(key);
     });
     _dialogs.clear();
+    _sticky.clear();
+  }
+
+  /// Dismisses all dialogs but those shown `sticky`, which stay until answered: clearing up what
+  /// a change of the page's state leaves, not what its user is to read.
+  void dismissTransient() {
+    for (final tag in _dialogs.keys.toList()) {
+      if (!_sticky.containsKey(tag)) dismissByTag(tag);
+    }
   }
 
   void dismissByTag(String tag) {
     _dialogs[tag]?.complete(null);
     _dialogs.remove(tag);
+    _sticky.remove(tag);
     BackButtonInterceptor.removeByName(tag);
   }
 
@@ -828,7 +875,8 @@ class OverlayDialogManager {
       bool backDismiss = false,
       String? tag,
       bool useAnimation = true,
-      bool forceGlobal = false}) {
+      bool forceGlobal = false,
+      bool sticky = false}) {
     final overlayState =
         forceGlobal ? globalKey.currentState?.overlay : _overlayKeyState.state;
 
@@ -847,9 +895,12 @@ class OverlayDialogManager {
 
     final dialog = Dialog<T>();
     _dialogs[dialogTag] = dialog;
+    // A tag used again is this dialog's now, sticky or not.
+    _sticky.remove(dialogTag);
 
     close([res]) {
       _dialogs.remove(dialogTag);
+      _sticky.remove(dialogTag);
       try {
         dialog.complete(res);
       } catch (e) {
@@ -858,26 +909,32 @@ class OverlayDialogManager {
       BackButtonInterceptor.removeByName(dialogTag);
     }
 
-    dialog.entry = OverlayEntry(builder: (context) {
-      bool innerClicked = false;
-      return Listener(
-          onPointerUp: (_) {
-            if (!innerClicked && clickMaskDismiss) {
-              close();
-            }
-            innerClicked = false;
-          },
-          child: Container(
-              color: Theme.of(context).brightness == Brightness.light
-                  ? Colors.black12
-                  : Colors.black45,
-              child: StatefulBuilder(builder: (context, setState) {
-                return Listener(
-                  onPointerUp: (_) => innerClicked = true,
-                  child: builder(setState, close, overlayState.context),
-                );
-              })));
-    });
+    OverlayEntry entryOn(OverlayState overlayState) =>
+        OverlayEntry(builder: (context) {
+          bool innerClicked = false;
+          return Listener(
+              onPointerUp: (_) {
+                if (!innerClicked && clickMaskDismiss) {
+                  close();
+                }
+                innerClicked = false;
+              },
+              child: Container(
+                  color: Theme.of(context).brightness == Brightness.light
+                      ? Colors.black12
+                      : Colors.black45,
+                  child: StatefulBuilder(builder: (context, setState) {
+                    return Listener(
+                      onPointerUp: (_) => innerClicked = true,
+                      child: builder(setState, close, overlayState.context),
+                    );
+                  })));
+        });
+    dialog.entry = entryOn(overlayState);
+    // The global overlay is never built anew.
+    if (sticky && !forceGlobal) {
+      _sticky[dialogTag] = _StickyDialog(entryOn, overlayState);
+    }
     overlayState.insert(dialog.entry!);
     BackButtonInterceptor.add((stopDefaultButtonEvent, routeInfo) {
       if (backDismiss) {
@@ -1278,22 +1335,24 @@ void msgBox(SessionID sessionId, String type, String title, String text,
           dialogManager.dismissAll();
         }));
   }
-  if (reconnect != null &&
-      title == "Connection Error" &&
-      reconnectTimeout != null) {
+  if (reconnect != null && title == "Connection Error") {
     // `enabled` is used to disable the dialog button once the button is clicked.
     final enabled = true.obs;
-    final button = Obx(() => _CountDownButton(
-          text: 'Reconnect',
-          second: reconnectTimeout,
-          onPressed: enabled.isTrue
-              ? () {
-                  // Disable the button
-                  enabled.value = false;
-                  reconnect(dialogManager, sessionId, false);
-                }
-              : null,
-        ));
+    VoidCallback? onPressed() => enabled.isTrue
+        ? () {
+            // Disable the button
+            enabled.value = false;
+            reconnect(dialogManager, sessionId, false);
+          }
+        : null;
+    // Without a timeout, reconnecting on its own has stopped and only the user retries.
+    final button = reconnectTimeout != null
+        ? Obx(() => _CountDownButton(
+              text: 'Reconnect',
+              second: reconnectTimeout,
+              onPressed: onPressed(),
+            ))
+        : Obx(() => dialogButton('Reconnect', onPressed: onPressed()));
     buttons.insert(0, button);
   }
   if (link.isNotEmpty) {
@@ -1308,6 +1367,8 @@ void msgBox(SessionID sessionId, String type, String title, String text,
       onCancel: hasCancel == true ? cancel : null,
     ),
     tag: '$sessionId-$type-$title-$text-$link',
+    // Says what its user must know, maybe with nobody having just asked: stays until answered.
+    sticky: type.split('-').contains('sticky'),
   );
 }
 
@@ -3021,7 +3082,7 @@ int versionCmp(String v1, String v2) {
 }
 
 String getWindowName({WindowType? overrideType}) {
-  final name = bind.mainGetAppNameSync();
+  final name = appDisplayName;
   switch (overrideType ?? kWindowType) {
     case WindowType.Main:
       return name;
@@ -3578,6 +3639,14 @@ importConfig(List<TextEditingController>? controllers, List<RxString>? errMsgs,
   }
 }
 
+bool isWebSocketUrl(String server) =>
+    server.startsWith('ws://') || server.startsWith('wss://');
+
+/// Turning WebSocket off would leave a ws(s):// ID server unable to register.
+bool isWebSocketLockedOn() =>
+    isWebSocketUrl(bind.mainGetOptionSync(key: 'custom-rendezvous-server')) &&
+    mainGetBoolOptionSync(kOptionAllowWebSocket);
+
 Future<bool> setServerConfig(
   List<TextEditingController>? controllers,
   List<RxString>? errMsgs,
@@ -3627,6 +3696,11 @@ Future<bool> setServerConfig(
   }
   final oldApiServer = await bind.mainGetApiServer();
 
+  // A ws(s):// ID server only registers in WebSocket mode. Switch it on first,
+  // so the restart the new address triggers already goes over WebSocket.
+  if (isWebSocketUrl(config.idServer)) {
+    await mainSetBoolOption(kOptionAllowWebSocket, true);
+  }
   // should set one by one
   await bind.mainSetOption(
       key: 'custom-rendezvous-server', value: config.idServer);
@@ -4190,6 +4264,16 @@ String get appName {
     _appName = bind.mainGetAppNameSync();
   }
   return _appName;
+}
+
+String? _appDisplayName;
+
+/// The name users see. A custom client sets it apart from [appName], which also names its files,
+/// service and install folder. Taken from `get_app_display_name` in src/common.rs, so the main
+/// window's title is the one Windows finds it by.
+String get appDisplayName {
+  _appDisplayName ??= bind.mainGetAppDisplayName();
+  return _appDisplayName!;
 }
 
 String getConnectionText(bool secure, bool direct, String streamType) {

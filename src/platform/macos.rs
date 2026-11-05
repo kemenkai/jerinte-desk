@@ -369,6 +369,8 @@ fn correct_app_name(s: &str) -> String {
     }
     s = s.replace("rustdesk", &crate::get_app_name().to_lowercase());
     s = s.replace("RustDesk", &crate::get_app_name());
+    // Last, so the replacements above, which name files and labels, cannot touch it.
+    s = s.replace("APP_DISPLAY_NAME", &crate::get_app_display_name());
     s
 }
 

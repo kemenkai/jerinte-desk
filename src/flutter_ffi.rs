@@ -1071,6 +1071,7 @@ pub fn main_set_option(key: String, value: String) -> hbb_common::anyhow::Result
         || key.eq(keys::OPTION_ALLOW_WEBSOCKET)
         || key.eq(keys::OPTION_DISABLE_UDP)
         || key.eq("api-server")
+        || key.eq(keys::OPTION_SERVER_ENTRIES)
     {
         if is_allow_tls_fallback {
             hbb_common::tls::reset_tls_cache();
@@ -1146,6 +1147,10 @@ pub fn main_get_app_name() -> String {
 
 pub fn main_get_app_name_sync() -> SyncReturn<String> {
     SyncReturn(get_app_name())
+}
+
+pub fn main_get_app_display_name() -> SyncReturn<String> {
+    SyncReturn(crate::get_app_display_name())
 }
 
 pub fn main_uri_prefix_sync() -> SyncReturn<String> {
@@ -2164,6 +2169,49 @@ pub fn session_toggle_virtual_display(session_id: SessionID, index: i32, on: boo
         session.toggle_virtual_display(index, on);
         flutter::session_update_virtual_display(&session, index, on);
     }
+}
+
+// This device's monitors with the virtual display each gets on the peer (slot k is entry k), and
+// the displays the session holds there; see `Session::get_virtual_displays`.
+pub fn session_get_virtual_displays(session_id: SessionID) -> SyncReturn<String> {
+    SyncReturn(
+        sessions::get_session_by_session_id(&session_id)
+            .map(|session| session.get_virtual_displays())
+            .unwrap_or_default(),
+    )
+}
+
+// True for the one window that adds the session's virtual display on connecting.
+pub fn session_take_auto_virtual_display(session_id: SessionID) -> SyncReturn<bool> {
+    SyncReturn(
+        sessions::get_session_by_session_id(&session_id)
+            .map_or(false, |session| session.take_auto_virtual_display()),
+    )
+}
+
+// Adds or removes the virtual display of this device's monitor `slot` on the peer (-1 with
+// `on` false: all of them). The answer comes as a `virtual_display_result` event.
+pub fn session_toggle_virtual_display_slot(session_id: SessionID, slot: i32, on: bool) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.toggle_virtual_display_slot(slot, on);
+    }
+}
+
+// The view a window shows virtual display `slot` in, in logical pixels at `scale` pixels each: the
+// display follows its size. Sync, so a toggle asked right after is sized by it. True if it asked
+// the peer for a new size; see `Session::set_virtual_display_view`.
+pub fn session_set_virtual_display_view(
+    session_id: SessionID,
+    slot: i32,
+    width: f64,
+    height: f64,
+    scale: f64,
+) -> SyncReturn<bool> {
+    SyncReturn(
+        sessions::get_session_by_session_id(&session_id).map_or(false, |session| {
+            session.set_virtual_display_view(slot, width, height, scale)
+        }),
+    )
 }
 
 pub fn session_printer_response(

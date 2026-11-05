@@ -1,24 +1,69 @@
 name: Full Flutter CI
 
+# Private builds: dispatch with `targets` to build only those platforms and publish the unsigned
+# packages to a release of this repo. The file keeps its name because workflow_dispatch only runs
+# workflows whose file also exists on the default branch. Nothing is uploaded as an artifact: the
+# account's artifact storage quota is used up, so the bridge travels through the Actions cache
+# (see bridge.yml). `variant` builds a custom client from res/custom/<variant> (see its README),
+# with the settings this public repository keeps out (CUSTOM_CLIENT_SECRETS), into a draft release
+# under its own tag: a draft is seen only by the repository's collaborators, and a custom client
+# has our servers compiled in. .github/scripts/variant_guard.py keeps flutter-build.yml from
+# publishing anything else in such a build.
+
 on:
   workflow_dispatch:
-  pull_request:
-    paths-ignore:
-    - "docs/**"
-    - "README.md"
-  push:
-    branches:
-      - master
-    paths-ignore:
-      - ".github/**"
-      - "docs/**"
-      - "README.md"
-      - "res/**"
-      - "appimage/**"
-      - "flatpak/**"
+    inputs:
+      targets:
+        description: "Comma separated: linux, macos, windows, sciter (32-bit Windows, for Windows 7)"
+        required: true
+        default: "linux"
+      variant:
+        description: "Custom client under res/custom (e.g. jerinte); empty for the plain build"
+        required: false
+        default: ""
 
 jobs:
+  check-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject a variant with targets=all
+        if: ${{ inputs.variant != '' && inputs.targets == 'all' }}
+        run: |
+          echo "::error::targets=all also runs jobs that do not apply the variant; list the platforms"
+          exit 1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: ${{ inputs.variant != '' }}
+      - name: Check that a variant build publishes nothing but the draft
+        if: ${{ inputs.variant != '' }}
+        run: python3 .github/scripts/variant_guard.py check .github/workflows/flutter-build.yml
+
+  # The release a variant build's packages go to, made before the builds so they all find it: the
+  # release action they use otherwise cannot see drafts and would make one draft each.
+  draft-release:
+    needs: check-inputs
+    if: ${{ inputs.variant != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: "${{ inputs.variant }}-${{ github.run_number }}"
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "$TAG" --notes "${{ inputs.variant }} for ${{ inputs.targets }}, from $GITHUB_SHA"
+
   run-ci:
+    needs: [check-inputs, draft-release]
+    # The draft release is skipped for a plain build.
+    if: ${{ !failure() && !cancelled() }}
+    permissions:
+      contents: write
     uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
     with:
-      upload-artifact: false
+      upload-artifact: true
+      upload-tag: "${{ inputs.variant || 'private' }}-${{ github.run_number }}"
+      targets: ${{ inputs.targets }}
+      variant: ${{ inputs.variant }}

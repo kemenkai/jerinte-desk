@@ -18,6 +18,11 @@ pub use ipc_drm::{start_drm, DmabufDesc, DrmDisplayInfo};
 pub(crate) use ipc_drm::DrmConn;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) use ipc_drm::connect_drm;
+#[cfg(target_os = "linux")]
+#[path = "ipc/vdisplay.rs"]
+mod ipc_vdisplay;
+#[cfg(target_os = "linux")]
+pub(crate) use ipc_vdisplay::{connect_vdisplay, listen_vdisplay};
 
 use crate::{
     common::{is_server, CheckTestNatType},
@@ -65,7 +70,7 @@ use ipc_auth::{
 #[cfg(target_os = "linux")]
 pub(crate) use ipc_auth::{
     ensure_peer_executable_matches_current_by_fd, is_allowed_service_peer_uid,
-    log_rejected_uinput_connection, peer_uid_from_fd,
+    log_rejected_uinput_connection, peer_pid_from_fd, peer_uid_from_fd,
 };
 #[cfg(target_os = "linux")]
 use ipc_fs::terminal_count_candidate_uids;
@@ -74,8 +79,8 @@ use ipc_fs::{
     check_pid, ensure_secure_ipc_parent_dir, scrub_secure_ipc_parent_dir,
     should_scrub_parent_entries_after_check_pid, write_pid,
 };
-// Gated with the module that uses it, so a `drm`-less build does not carry an unused import.
-#[cfg(all(target_os = "linux", feature = "drm"))]
+// Used by the `_drm` and `_vdisplay` listeners; `_vdisplay` is in every Linux build.
+#[cfg(target_os = "linux")]
 use ipc_fs::remove_ipc_entry_via_secure_parent_fd;
 use parity_tokio_ipc::{
     Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
@@ -791,9 +796,12 @@ pub struct CheckIfRestart {
     audio_input: String,
     voice_call_input: String,
     ws: String,
+    // Declared to the server when registering, so a change has to register again.
+    ws_lan_direct: String,
     disable_udp: String,
     allow_insecure_tls_fallback: String,
     api_server: String,
+    server_entries: String,
 }
 
 impl CheckIfRestart {
@@ -804,11 +812,13 @@ impl CheckIfRestart {
             audio_input: Config::get_option("audio-input"),
             voice_call_input: Config::get_option("voice-call-input"),
             ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
+            ws_lan_direct: Config::get_option(keys::OPTION_ALLOW_WS_LAN_DIRECT),
             disable_udp: Config::get_option(keys::OPTION_DISABLE_UDP),
             allow_insecure_tls_fallback: Config::get_option(
                 keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
             ),
             api_server: Config::get_option("api-server"),
+            server_entries: Config::get_option(keys::OPTION_SERVER_ENTRIES),
         }
     }
 }
@@ -823,8 +833,10 @@ impl Drop for CheckIfRestart {
             || self.stop_service != Config::get_option("stop-service")
             || self.rendezvous_servers != Config::get_rendezvous_servers()
             || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
+            || self.ws_lan_direct != Config::get_option(keys::OPTION_ALLOW_WS_LAN_DIRECT)
             || self.disable_udp != Config::get_option(keys::OPTION_DISABLE_UDP)
             || self.api_server != Config::get_option("api-server")
+            || self.server_entries != Config::get_option(keys::OPTION_SERVER_ENTRIES)
         {
             if allow_insecure_tls_fallback_changed {
                 hbb_common::tls::reset_tls_cache();
@@ -869,6 +881,9 @@ async fn handle(data: Data, stream: &mut Connection) {
                 #[cfg(not(target_os = "android"))]
                 crate::server::input_service::fix_key_down_timeout_at_exit();
                 if is_server() {
+                    // A desktop a virtual display took over is given back first (src/vdisplay).
+                    #[cfg(windows)]
+                    crate::vdisplay::shutdown();
                     let _ = privacy_mode::turn_off_privacy(0, Some(PrivacyModeState::OffByPeer));
                 }
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1001,6 +1016,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = crate::audio_service::get_voice_call_input_device();
                 } else if name == "unlock-pin" {
                     value = Some(Config::get_unlock_pin());
+                } else if name == crate::service_status::IPC_NAME {
+                    value = crate::service_status::snapshot();
                 } else {
                     value = None;
                 }
@@ -1609,7 +1626,7 @@ pub async fn start_pa() {
                             let mut buf: Vec<u8> = vec![0; AUDIO_DATA_SIZE_U8];
                             match psimple::Simple::new(
                                 None,                             // Use the default server
-                                &crate::get_app_name(),           // Our application’s name
+                                &crate::get_app_display_name(),   // Our application’s name
                                 pulse::stream::Direction::Record, // We want a record stream
                                 Some(&device),                    // Use the default device
                                 "record",                         // Description of our stream
@@ -1980,6 +1997,12 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
         let mut urls = v.split(",");
         let a = urls.next().unwrap_or_default().to_owned();
         let b: Vec<String> = urls.map(|x| x.to_owned()).collect();
+        // The service's pick among `server-entries`, taken up so that this process goes the
+        // same way: over WebSocket or not, and the relay, follow the entry in use. Not where the
+        // service runs in this very process, which picks it and would only write it back late.
+        if !crate::common::is_server_running() {
+            Config::follow_server_entry(&a);
+        }
         (a, b)
     } else {
         (
@@ -2074,7 +2097,12 @@ pub async fn get_nat_type(ms_timeout: u64) -> i32 {
 
 pub async fn get_rendezvous_servers(ms_timeout: u64) -> Vec<String> {
     if let Ok(Some(v)) = get_config_async("rendezvous_servers", ms_timeout).await {
-        return v.split(',').map(|x| x.to_owned()).collect();
+        let servers: Vec<String> = v.split(',').map(|x| x.to_owned()).collect();
+        // As in `get_rendezvous_server`: the entry in use is the one server listed.
+        if !crate::common::is_server_running() {
+            Config::follow_server_entry(&servers[0]);
+        }
+        return servers;
     }
     return Config::get_rendezvous_servers();
 }

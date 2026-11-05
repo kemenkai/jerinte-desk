@@ -8,6 +8,8 @@ Type=simple
 ExecStart=/usr/bin/rustdesk --service
 # kill --tray and --server both
 ExecStop=pkill -f "rustdesk --"
+# put back connectors lit for virtual displays, however the service stopped
+ExecStopPost=/usr/bin/rustdesk --release-virtual-displays
 # below two lines do not work, have to use above one line
 #ExecStop=pkill -f "rustdesk --tray"
 #ExecStop=pkill -f "rustdesk --server"

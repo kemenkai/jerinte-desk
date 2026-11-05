@@ -65,7 +65,7 @@ impl Session {
             .other_server
             .as_ref()
             .map(|(_, server, _)| vec![server.clone()])
-            .unwrap_or_else(Config::get_rendezvous_servers);
+            .unwrap_or_else(Config::get_id_servers);
         servers.sort();
         let namespace = serde_json::to_string(&servers)?;
         let credentials = Credentials::new(login.get_id().to_owned(), namespace, key)?;

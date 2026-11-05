@@ -16,6 +16,7 @@ import 'package:flutter_hbb/models/peer_model.dart';
 
 import '../../common.dart';
 import '../../common/formatter/id_formatter.dart';
+import '../../common/service_status.dart';
 import '../../common/widgets/peer_tab_page.dart';
 import '../../common/widgets/autocomplete.dart';
 import '../../models/platform_model.dart';
@@ -35,6 +36,12 @@ class OnlineStatusWidget extends StatefulWidget {
 class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
   final _svcStopped = Get.find<RxBool>(tag: 'stop-service');
   final _svcIsUsingPublicServer = true.obs;
+  // What the service is connected to on our servers (common/service_status.dart).
+  final _services = Rxn<Map<String, dynamic>>();
+  // A customer's client, the one that only takes connections (`conn-type: incoming`), shows
+  // none: the details would name our servers on the customer's machine, and it is 226 px wide.
+  // Not by `hide-server-settings`, which our own staff's client has too.
+  final _isCustomersClient = bind.isIncomingOnly();
   Timer? _updateTimer;
 
   double get em => 14.0;
@@ -79,63 +86,68 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
         );
 
     setupServerWidget() => Flexible(
-          child: Offstage(
-            offstage: !(!_svcStopped.value &&
-                stateGlobal.svcStatus.value == SvcStatus.ready &&
-                _svcIsUsingPublicServer.value),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Text(', ', style: TextStyle(fontSize: em)),
-                Flexible(
-                  child: InkWell(
-                    onTap: onUsePublicServerGuide,
-                    child: Row(
-                      children: [
-                        Flexible(
-                          child: Text(
-                            translate('setup_server_tip'),
-                            style: TextStyle(
-                                decoration: TextDecoration.underline,
-                                fontSize: em),
-                          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Text(', ', style: TextStyle(fontSize: em)),
+              Flexible(
+                child: InkWell(
+                  onTap: onUsePublicServerGuide,
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          translate('setup_server_tip'),
+                          style: TextStyle(
+                              decoration: TextDecoration.underline,
+                              fontSize: em),
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                )
-              ],
-            ),
+                ),
+              )
+            ],
           ),
         );
 
-    basicWidget() => Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            Container(
-              height: 8,
-              width: 8,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(4),
-                color: _svcStopped.value ||
-                        stateGlobal.svcStatus.value == SvcStatus.connecting
-                    ? kColorWarn
-                    : (stateGlobal.svcStatus.value == SvcStatus.ready
-                        ? Color.fromARGB(255, 50, 190, 166)
-                        : Color.fromARGB(255, 224, 79, 95)),
-              ),
-            ).marginSymmetric(horizontal: em),
-            Container(
-              width: isIncomingOnly ? 226 : null,
-              child: _buildConnStatusMsg(),
+    basicWidget() {
+      // Read in the Obx below. The guide only in the Row when it shows: a second Flexible would
+      // take half the width.
+      final showSetupServer = !_svcStopped.value &&
+          stateGlobal.svcStatus.value == SvcStatus.ready &&
+          _svcIsUsingPublicServer.value;
+      final services = _shownServices();
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            height: 8,
+            width: 8,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(4),
+              color: _svcStopped.value ||
+                      stateGlobal.svcStatus.value == SvcStatus.connecting
+                  ? kColorWarn
+                  : (stateGlobal.svcStatus.value == SvcStatus.ready
+                      ? Color.fromARGB(255, 50, 190, 166)
+                      : Color.fromARGB(255, 224, 79, 95)),
             ),
-            // stop
-            if (!isIncomingOnly) startServiceWidget(),
-            // ready && public
-            // No need to show the guide if is custom client.
-            if (!isIncomingOnly) setupServerWidget(),
-          ],
-        );
+          ).marginSymmetric(horizontal: em),
+          if (isIncomingOnly)
+            Container(width: 226, child: _buildConnStatusMsg(services))
+          else if (serviceSummary(services, translate).isEmpty)
+            _buildConnStatusMsg(services)
+          else
+            Flexible(child: _buildConnStatusMsg(services)),
+          // stop
+          if (!isIncomingOnly) startServiceWidget(),
+          // ready && public
+          // No need to show the guide if is custom client.
+          if (!isIncomingOnly && showSetupServer) setupServerWidget(),
+        ],
+      );
+    }
 
     return Container(
       height: height,
@@ -153,25 +165,53 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
     ).paddingOnly(right: isIncomingOnly ? 8 : 0);
   }
 
-  _buildConnStatusMsg() {
+  /// The snapshot to show after the status word, none on the public server, whose guide shows
+  /// there, nor on a customer's client.
+  Map<String, dynamic>? _shownServices() =>
+      _svcStopped.value || _svcIsUsingPublicServer.value || _isCustomersClient
+          ? null
+          : _services.value;
+
+  _buildConnStatusMsg(Map<String, dynamic>? services) {
     widget.onSvcStatusChanged?.call();
-    return Text(
-      _svcStopped.value
-          ? translate("Service is not running")
-          : stateGlobal.svcStatus.value == SvcStatus.connecting
-              ? translate("connecting_status")
-              : stateGlobal.svcStatus.value == SvcStatus.notReady
-                  ? translate("not_ready_status")
-                  : translate('Ready'),
+    final summary = serviceSummary(services, translate);
+    final status = stateGlobal.svcStatus.value;
+    // Followed by the summary, the words are short.
+    final word = _svcStopped.value
+        ? translate("Service is not running")
+        : status == SvcStatus.connecting
+            ? translate(summary.isEmpty
+                ? "connecting_status"
+                : "Connecting to the server")
+            : status == SvcStatus.notReady
+                ? translate(summary.isEmpty ? "not_ready_status" : "Not ready")
+                : translate('Ready');
+    // One line only with the summary, the tooltip telling the rest; upstream's words wrap.
+    final text = Text(
+      summary.isEmpty ? word : '$word · $summary',
+      maxLines: summary.isEmpty ? null : 1,
+      overflow: summary.isEmpty ? null : TextOverflow.ellipsis,
       style: TextStyle(fontSize: em),
     );
+    final details = serviceDetails(services, translate);
+    return details.isEmpty ? text : Tooltip(message: details, child: text);
   }
 
   updateStatus() async {
     final status =
         jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
     final statusNum = status['status_num'] as int;
-    if (statusNum == 0) {
+    final services = status['services'];
+    _services.value = services is Map<String, dynamic> ? services : null;
+    // The snapshot says it when there is one: the status number stays 0 while TCP cannot connect.
+    final word = serviceWord(_services.value);
+    if (word != null) {
+      stateGlobal.svcStatus.value = word == 'ready'
+          ? SvcStatus.ready
+          : word == 'connecting'
+              ? SvcStatus.connecting
+              : SvcStatus.notReady;
+    } else if (statusNum == 0) {
       stateGlobal.svcStatus.value = SvcStatus.connecting;
     } else if (statusNum == -1) {
       stateGlobal.svcStatus.value = SvcStatus.notReady;

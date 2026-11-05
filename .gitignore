@@ -58,5 +58,10 @@ libsciter.dylib
 flutter/web/
 # libdrmtap is cloned at build time by build.py (not a submodule)
 /third_party/libdrmtap/
+# Custom client variants keep their logo sources and generated images in the tree.
+!res/custom/**
 # Local git worktrees
 .worktrees/
+
+# Written by res/custom/apply.sh for a custom build, with where our servers are: never commit it.
+res/custom-client.json

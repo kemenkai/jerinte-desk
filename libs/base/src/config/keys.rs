@@ -47,6 +47,16 @@ pub const OPTION_ENABLE_REMOTE_RESTART: &str = "enable-remote-restart";
 pub const OPTION_ENABLE_RECORD_SESSION: &str = "enable-record-session";
 pub const OPTION_ENABLE_BLOCK_INPUT: &str = "enable-block-input";
 pub const OPTION_ENABLE_PRIVACY_MODE: &str = "enable-privacy-mode";
+// Whether a controlling side may plug virtual displays into this device (src/vdisplay).
+pub const OPTION_ENABLE_REMOTE_VIRTUAL_DISPLAY: &str = "enable-remote-virtual-display";
+// Controlling side, per peer: ask a peer without HiDPI displays for a monitor's full pixels rather
+// than its logical size; "Y" turns it on.
+pub const OPTION_VIRTUAL_DISPLAY_PIXELS: &str = "virtual-display-pixels";
+// Controlling side, per peer: how a virtual display asked for is used — "" / "shared" (an extra
+// screen, the default), "privacy" (the desktop taken over on it, the peer's monitors dark),
+// "nested" (a session of its own on it). Only a mode in `vdm_caps.modes` is sent; others fall back
+// to the shared screen.
+pub const OPTION_VIRTUAL_DISPLAY_MODE: &str = "virtual-display-mode";
 pub const OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW: &str = "enable-perm-change-in-accept-window";
 pub const OPTION_HIDE_ELEVATE_BUTTON_IN_ACCEPT_WINDOW: &str =
     "hide-elevate-button-in-accept-window";
@@ -183,6 +193,10 @@ pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str = "keep-awake-during-
 pub const OPTION_DISABLE_GROUP_PANEL: &str = "disable-group-panel";
 pub const OPTION_DISABLE_DISCOVERY_PANEL: &str = "disable-discovery-panel";
 pub const OPTION_PRE_ELEVATE_SERVICE: &str = "pre-elevate-service";
+/// Under WebSocket, still connect over the LAN when the server finds both ends on one intranet
+/// (off by default: an `allow-` option is on only at "Y"). A Config option, not a LocalConfig
+/// one: the controlled side decides in the `--server` process, which LocalConfig never reaches.
+pub const OPTION_ALLOW_WS_LAN_DIRECT: &str = "allow-ws-lan-direct";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const KEYS_DISPLAY_SETTINGS: &[&str] = &[
@@ -284,6 +298,7 @@ pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_ENABLE_RECORD_SESSION,
     OPTION_ENABLE_BLOCK_INPUT,
     OPTION_ENABLE_PRIVACY_MODE,
+    OPTION_ENABLE_REMOTE_VIRTUAL_DISPLAY,
     OPTION_ALLOW_SCOPE_VIOLATION_CLOSE,
     OPTION_ALLOW_SCOPE_VIOLATION_ALARM,
     OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
@@ -326,6 +341,7 @@ pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_ENABLE_TRUSTED_DEVICES,
     OPTION_TRUSTED_DEVICE_EXPIRATION,
     OPTION_RELAY_SERVER,
+    OPTION_SERVER_ENTRIES,
     OPTION_ICE_SERVERS,
     OPTION_DISABLE_UDP,
     OPTION_ALLOW_INSECURE_TLS_FALLBACK,

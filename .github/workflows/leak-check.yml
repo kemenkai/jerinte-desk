@@ -1,0 +1,40 @@
+name: Leak check
+
+# This repository is public. LEAK_PATTERNS, a secret because the list itself would tell what to look
+# for, holds the extended regexes (one per line) of what must never be committed here: where our
+# servers are, their path prefixes, internal addresses and names (see .github/scripts/leak_scan.sh).
+# Also checks that a custom client build of flutter-build.yml publishes nothing but its draft.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Scan the tree and the new commit messages
+        env:
+          PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # A fork's pull request cannot read the secret: it is not checked, which must not pass.
+          if [ -z "$PATTERNS" ]; then
+            echo "::error::LEAK_PATTERNS is not available here, so this was not checked"
+            exit 1
+          fi
+          printf '%s\n' "$PATTERNS" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/patterns"
+          range=""
+          if [ -n "$BASE" ]; then
+            range="$BASE..$GITHUB_SHA"
+          elif [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]]; then
+            range="$BEFORE..$GITHUB_SHA"
+          fi
+          bash .github/scripts/leak_scan.sh "$RUNNER_TEMP/patterns" "$range"
+      - name: A custom client build publishes nothing but its draft
+        run: python3 .github/scripts/variant_guard.py check .github/workflows/flutter-build.yml

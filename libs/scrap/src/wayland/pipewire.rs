@@ -152,13 +152,18 @@ impl Error for GStreamerError {}
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
     dbus_conn: Arc<SyncConnection>,
-    fd: OwnedFd,
+    // The portal's PipeWire remote; none for Mutter's own streams, on the default daemon.
+    fd: Option<OwnedFd>,
     path: u64,
     source_type: u64,
     pub primary: bool,
     pub position: (i32, i32),
     pub logical_size: (usize, usize),
     pub physical_size: (usize, usize),
+    // The monitor's connector, `HDMI-1`, where it is known (Mutter's streams).
+    pub(crate) connector: String,
+    // A Mutter display's pipeline, kept between capturers (`mutter_capture`).
+    pub(crate) held: Option<super::mutter_capture::Held>,
     // False when `physical_size` is the portal size standing in for a resolution get_res() could
     // not read.
     physical_size_measured: bool,
@@ -175,13 +180,15 @@ impl PipeWireCapturable {
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
         let measured = get_res(Self {
             dbus_conn: conn.clone(),
-            fd: fd.clone(),
+            fd: Some(fd.clone()),
             path: stream.path,
             source_type: stream.source_type,
             primary: false,
             position: stream.position,
             logical_size: stream.size,
             physical_size: (0, 0),
+            connector: String::new(),
+            held: None,
             physical_size_measured: false,
         });
         let physical_size_measured = measured.is_ok();
@@ -189,14 +196,43 @@ impl PipeWireCapturable {
         *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,
-            fd,
+            fd: Some(fd),
             path: stream.path,
             source_type: stream.source_type,
             primary: false,
             position: stream.position,
             logical_size: stream.size,
             physical_size,
+            connector: String::new(),
+            held: None,
             physical_size_measured,
+        }
+    }
+}
+
+impl PipeWireCapturable {
+    /// A display recorded through Mutter (`mutter_capture`): its stream on the default PipeWire
+    /// daemon, its place as `DisplayConfig` says, its frames of `physical_size`.
+    pub(crate) fn of_mutter(
+        conn: Arc<SyncConnection>,
+        node: u32,
+        shown: &super::mutter::Shown,
+        physical_size: (usize, usize),
+        held: super::mutter_capture::Held,
+    ) -> Self {
+        Self {
+            dbus_conn: conn,
+            fd: None,
+            path: node as u64,
+            source_type: 1,
+            primary: shown.primary,
+            position: shown.position,
+            logical_size: shown.logical,
+            physical_size,
+            connector: shown.connector.clone(),
+            held: Some(held),
+            // Mutter's `DisplayConfig` gives this size; no portal size stands in for it.
+            physical_size_measured: true,
         }
     }
 }
@@ -205,11 +241,12 @@ impl std::fmt::Debug for PipeWireCapturable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PipeWireCapturable {{dbus: {}, fd: {}, path: {}, source_type: {}}}",
+            "PipeWireCapturable {{dbus: {}, fd: {:?}, path: {}, source_type: {}, connector: {}}}",
             self.dbus_conn.unique_name(),
-            self.fd.as_raw_fd(),
+            self.fd.as_ref().map(|fd| fd.as_raw_fd()),
             self.path,
-            self.source_type
+            self.source_type,
+            self.connector
         )
     }
 }
@@ -233,6 +270,11 @@ impl Capturable for PipeWireCapturable {
     }
 
     fn recorder(&self, _capture_cursor: bool) -> Result<Box<dyn Recorder>, Box<dyn Error>> {
+        if let Some(held) = &self.held {
+            return Ok(Box::new(
+                held.lease().map_err(crate::mutter_model::Busy::boxed)?,
+            ));
+        }
         Ok(Box::new(PipeWireRecorder::new(self.clone())?))
     }
 }
@@ -270,7 +312,20 @@ pub struct PipeWireRecorder {
     width: usize,
     height: usize,
     saved_raw_data: Vec<u8>, // for faster compare and copy
+    // The pipeline said its stream ended or failed.
+    ended: bool,
 }
+
+/// GStreamer initialized, once, before any pipeline: the bindings panic on a pipeline before.
+pub(crate) fn init_gstreamer() -> ResultType<()> {
+    static INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| gst::init().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+// Pipelines are started and stopped one at a time: see the workaround in `PipeWireRecorder::new`.
+static PIPELINES: Mutex<()> = Mutex::new(());
 
 // Element creation fails the same way for a plugin that is not installed as for one that is
 // broken, so the tag does not claim which. Only the name travels to the peer -- it is what
@@ -284,13 +339,28 @@ fn gst_element(name: &str) -> ResultType<gst::Element> {
 
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
+        Self::build(capturable.fd.as_ref(), capturable.path, None)
+    }
+
+    /// A pipeline consuming PipeWire node `node`, on the portal's remote `fd` or else on the
+    /// default daemon, settling `size` with the stream where given (width and height only:
+    /// Mutter offers a range of frame rates, and a fixed one fails to negotiate).
+    pub(crate) fn build(
+        fd: Option<&OwnedFd>,
+        node: u64,
+        size: Option<(i32, i32)>,
+    ) -> ResultType<Self> {
+        init_gstreamer()?;
+        let _one_at_a_time = PIPELINES.lock().unwrap();
         let pipeline = gst::Pipeline::new(None);
         // Clock waits on stale capture timestamps can exhaust the compositor's buffers.
         pipeline.use_clock(None::<&gst::Clock>);
 
         let src = gst_element("pipewiresrc")?;
-        src.set_property("fd", &capturable.fd.as_raw_fd())?;
-        src.set_property("path", &format!("{}", capturable.path))?;
+        if let Some(fd) = fd {
+            src.set_property("fd", &fd.as_raw_fd())?;
+        }
+        src.set_property("path", &format!("{}", node))?;
         src.set_property("keepalive_time", &1_000.as_raw_fd())?;
 
         // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
@@ -310,7 +380,20 @@ impl PipeWireRecorder {
         sink.set_property("max-buffers", &1u32)?;
 
         pipeline.add_many(&[&src, &convert, &sink])?;
-        src.link(&convert)?;
+        match size {
+            Some((width, height)) => {
+                let filter = gst_element("capsfilter")?;
+                let caps = gst::Caps::new_simple(
+                    "video/x-raw",
+                    &[("width", &width), ("height", &height)],
+                );
+                filter.set_property("caps", &caps)?;
+                pipeline.add(&filter)?;
+                src.link(&filter)?;
+                filter.link(&convert)?;
+            }
+            None => src.link(&convert)?,
+        }
         convert.link(&sink)?;
 
         let appsink = sink
@@ -332,10 +415,7 @@ impl PipeWireRecorder {
         // `pipeline.get_state()` can significantly reduce the probability of crashes,
         // but cannot completely resolve this issue.
         // Adding a short sleep period can also reduce the probability of crashes.
-        debug!(
-            "[gstreamer] Setting pipeline {} to PLAYING state...",
-            capturable.fd.as_raw_fd()
-        );
+        debug!("[gstreamer] Setting pipeline {} to PLAYING state...", node);
         pipeline.set_state(gst::State::Playing)?;
 
         // If `is_server_running()` is false, it means using remote_desktop_portal,
@@ -346,15 +426,12 @@ impl PipeWireRecorder {
             let state_change = pipeline.get_state(gst::ClockTime::from_mseconds(2000));
             match state_change {
                 (Ok(_), gst::State::Playing, _) => {
-                    debug!(
-                        "[gstreamer] Pipeline {} state confirmed as PLAYING.",
-                        capturable.fd.as_raw_fd()
-                    );
+                    debug!("[gstreamer] Pipeline {} state confirmed as PLAYING.", node);
                 }
                 (result, state, pending) => {
                     warn!(
                     "[gstreamer] Pipeline {} state change incomplete: result={:?}, state={:?}, pending={:?}",
-                    capturable.fd.as_raw_fd(), result, state, pending
+                    node, result, state, pending
                 );
                 }
             }
@@ -371,7 +448,26 @@ impl PipeWireRecorder {
             buffer_cropped: vec![],
             is_cropped: false,
             saved_raw_data: Vec::new(),
+            ended: false,
         })
+    }
+
+    /// Whether a frame reached it yet: its sink is playing only from then on.
+    pub(crate) fn playing(&self) -> bool {
+        self.pipeline.get_state(gst::ClockTime::from_mseconds(0)).1 == gst::State::Playing
+    }
+
+    /// Whether the stream ended or the pipeline failed: its node gone, say, the stream closed.
+    /// No frame comes any more then, and nothing else would tell.
+    pub(crate) fn ended(&mut self) -> bool {
+        if !self.ended {
+            self.ended = self.appsink.is_eos()
+                || self.pipeline.get_bus().map_or(false, |bus| {
+                    bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
+                        .is_some()
+                });
+        }
+        self.ended
     }
 }
 
@@ -476,6 +572,7 @@ impl Recorder for PipeWireRecorder {
 
 impl Drop for PipeWireRecorder {
     fn drop(&mut self) {
+        let _one_at_a_time = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(err) = self.pipeline.set_state(gst::State::Null) {
             warn!("Failed to stop GStreamer pipeline: {}.", err);
         }
@@ -756,7 +853,6 @@ fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<P
     .unwrap_or_default()
 }
 
-static mut INIT: bool = false;
 const RESTORE_TOKEN: &str = "restore_token";
 const RESTORE_TOKEN_CONF_KEY: &str = "wayland-restore-token";
 const PIPEWIRE_DISPLAY_OFFSET_CONF_KEY: &str = "wayland-pipewire-display-offset";
@@ -777,12 +873,7 @@ pub fn request_remote_desktop(
     dbus::Path<'static>,
     bool,
 )> {
-    unsafe {
-        if !INIT {
-            gstreamer::init()?;
-            INIT = true;
-        }
-    }
+    init_gstreamer()?;
     let conn =
         SyncConnection::new_session().map_err(|e| anyhow!(dbus_stage_err("session-bus", &e)))?;
     let portal = get_portal(&conn);
@@ -1670,13 +1761,15 @@ fn fill_multi_matched_positions_cursor(
 
                 let mut rec = PipeWireRecorder::new(PipeWireCapturable {
                     dbus_conn: conn.clone(),
-                    fd: fd.clone(),
+                    fd: Some(fd.clone()),
                     path: pw_stream_with_cursor.path,
                     source_type: pw_stream_with_cursor.source_type,
                     primary: false,
                     position: pw_stream_with_cursor.position,
                     logical_size: pw_stream_with_cursor.size,
                     physical_size: (0, 0),
+                    connector: String::new(),
+                    held: None,
                     physical_size_measured: false,
                 })?;
                 // Take first frame and copy owned buffer to avoid borrow across second capture

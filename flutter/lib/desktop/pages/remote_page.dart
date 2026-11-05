@@ -806,9 +806,9 @@ class _RemotePageState extends State<RemotePage>
           // we should not dismiss the dialog immediately.
           if (DateTime.now().difference(togglePrivacyModeTime) >
               const Duration(milliseconds: 3000)) {
-            // `dismissAll()` is to ensure that the state is clean.
-            // It's ok to call dismissAll() here.
-            _ffi.dialogManager.dismissAll();
+            // `dismissTransient()` is to ensure that the state is clean.
+            // A sticky dialog stays, and moves to the overlay recreated below.
+            _ffi.dialogManager.dismissTransient();
             // Recreate the block state to refresh the state.
             _blockableOverlayState = BlockableOverlayState();
             _blockableOverlayState.applyFfi(_ffi);

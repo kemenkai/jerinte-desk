@@ -1,0 +1,23 @@
+{
+  "app-display-name": "jerinteDesk",
+  "default-settings": {
+    "image-quality": "best"
+  },
+  "override-settings": {
+    "custom-rendezvous-server": "@secret",
+    "relay-server": "@secret",
+    "server-entries": "@secret",
+    "api-server": "@secret",
+    "key": "@secret",
+    "allow-websocket": "Y",
+    "enable-webrtc": "Y",
+    "ice-servers": "stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.hitv.com:3478,stun:stun.cloudflare.com:3478,stun:stun.nextcloud.com:443",
+    "allow-insecure-tls-fallback": "N",
+    "allow-auto-update": "N",
+    "enable-check-update": "N",
+    "hide-server-settings": "Y",
+    "hide-websocket-settings": "Y",
+    "hide-powered-by-me": "Y",
+    "hide-remote-printer-settings": "Y"
+  }
+}

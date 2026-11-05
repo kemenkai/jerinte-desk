@@ -311,19 +311,35 @@ handler.cancel_msgbox = function(tag) {
 }
 
 var reconnectTimeout = 1000;
+// Retrying on its own stops this long after the first retry; the Retry button still retries.
+var RECONNECT_FOR = 10 * 60 * 1000;
+var reconnectSince = 0;
 handler.msgbox_retry = function(type, title, text, link, hasRetry) {
     handler.msgbox(type, title, text, link, hasRetry);
     if (hasRetry) {
-        self.timer(0, retryConnect);
-        self.timer(reconnectTimeout, retryConnect);
-        reconnectTimeout *= 2;
+        if (!reconnectSince) reconnectSince = getTime();
+        var left = reconnectSince + RECONNECT_FOR - getTime();
+        if (left > 0) {
+            self.timer(0, retryConnect);
+            self.timer(reconnectTimeout < left ? reconnectTimeout : left, retryConnect);
+            reconnectTimeout *= 2;
+        }
     } else {
-        reconnectTimeout = 1000;
+        resetReconnect();
     }
 }
 
+function resetReconnect() {
+    reconnectTimeout = 1000;
+    reconnectSince = 0;
+}
+
 function retryConnect(cancelTimer=false) {
-    if (cancelTimer) self.timer(0, retryConnect);
+    if (cancelTimer) {
+        self.timer(0, retryConnect);
+        // The user retrying starts retrying on its own over.
+        resetReconnect();
+    }
     if (!is_port_forward) connecting();
     handler.reconnect(false);
 }

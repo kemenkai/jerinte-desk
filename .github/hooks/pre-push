@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Refuses a push that would make public what must not be (see .github/scripts/leak_scan.sh).
+# Enable in a clone with:  git config core.hooksPath .github/hooks
+# The patterns come from $LEAK_PATTERNS_FILE, by default ~/.config/jerinte/leak-patterns, which is
+# never committed. Without it the push is refused: an unchecked push to a public repository cannot
+# be taken back.
+set -euo pipefail
+patterns=${LEAK_PATTERNS_FILE:-$HOME/.config/jerinte/leak-patterns}
+if [ ! -s "$patterns" ]; then
+  echo "pre-push: no leak patterns at $patterns; refusing to push unchecked" >&2
+  exit 1
+fi
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  if [ "$remote_sha" = "$zero" ]; then
+    range="$local_sha --not --remotes"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  # The tree as it will be pushed, not the work tree.
+  hits=$(git grep -n -I -E -f "$patterns" "$local_sha" -- . | cut -d: -f2,3 || true)
+  if [ -n "$hits" ]; then
+    echo "pre-push: $local_ref has something that must not be public, at:" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+  for c in $(git rev-list $range); do
+    if git log -1 --format=%B "$c" | grep -q -E -f "$patterns"; then
+      echo "pre-push: the message of commit $c has something that must not be public" >&2
+      exit 1
+    fi
+  done
+done

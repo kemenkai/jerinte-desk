@@ -20,8 +20,11 @@ if [ "$1" = configure ]; then
 		if [ -e /usr/bin/pkill ]; then
 			sed -i "s|pkill|/usr/bin/pkill|g" /usr/lib/systemd/system/rustdesk.service
 		fi
+		# Loads vkms at the next boot, before the desktop, for virtual displays; not now.
+		cp /usr/share/rustdesk/files/systemd/rustdesk-vdisplay.service /usr/lib/systemd/system/rustdesk-vdisplay.service
 		systemctl daemon-reload
 		systemctl enable rustdesk
+		systemctl enable rustdesk-vdisplay || true
 		systemctl start rustdesk
 	fi
 fi

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/install_directory_confirmation.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -69,6 +70,8 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   final RxBool startmenu = true.obs;
   final RxBool desktopicon = true.obs;
   final RxBool printer = false.obs;
+  final bool _hidePrinter =
+      bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) == 'Y';
   final RxBool showProgress = false.obs;
   final RxBool btnEnabled = true.obs;
   final RxBool cancelEnabled = true.obs;
@@ -84,7 +87,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
     final installOptions = jsonDecode(bind.installInstallOptions());
     startmenu.value = installOptions['STARTMENUSHORTCUTS'] != '0';
     desktopicon.value = installOptions['DESKTOPSHORTCUTS'] != '0';
-    printer.value = installOptions['PRINTER'] == '1';
+    printer.value = !_hidePrinter && installOptions['PRINTER'] == '1';
   }
 
   Future<void> _loadPrinterStatus() async {
@@ -211,46 +214,49 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                   .marginOnly(bottom: 7),
               Option(desktopicon, label: 'Create desktop icon')
                   .marginOnly(bottom: 7),
-              Option(printer, label: 'Install {$appName} Printer'),
-              Container(
-                  padding: EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: isDarkTheme
-                        ? Color.fromARGB(135, 87, 87, 90)
-                        : Colors.grey[100],
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.grey),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(Icons.info_outline_rounded, size: 32)
-                          .marginOnly(right: 16),
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(translate('agreement_tip'))
-                              .marginOnly(bottom: em),
-                          InkWell(
-                            hoverColor: Colors.transparent,
-                            onTap: () => launchUrlString(
-                                'https://rustdesk.com/privacy.html'),
-                            child: Tooltip(
-                              message: 'https://rustdesk.com/privacy.html',
-                              child: Row(children: [
-                                Icon(Icons.launch_outlined, size: 16)
-                                    .marginOnly(right: 5),
-                                Text(
-                                  translate('End-user license agreement'),
-                                  style: const TextStyle(
-                                      decoration: TextDecoration.underline),
-                                )
-                              ]),
+              if (!_hidePrinter)
+                Option(printer, label: 'Install {$appName} Printer'),
+              // The agreement links to rustdesk.com, which a custom client does not send its users to.
+              if (!bind.isCustomClient())
+                  Container(
+                    padding: EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: isDarkTheme
+                          ? Color.fromARGB(135, 87, 87, 90)
+                          : Colors.grey[100],
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.info_outline_rounded, size: 32)
+                            .marginOnly(right: 16),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(translate('agreement_tip'))
+                                .marginOnly(bottom: em),
+                            InkWell(
+                              hoverColor: Colors.transparent,
+                              onTap: () => launchUrlString(
+                                  'https://rustdesk.com/privacy.html'),
+                              child: Tooltip(
+                                message: 'https://rustdesk.com/privacy.html',
+                                child: Row(children: [
+                                  Icon(Icons.launch_outlined, size: 16)
+                                      .marginOnly(right: 5),
+                                  Text(
+                                    translate('End-user license agreement'),
+                                    style: const TextStyle(
+                                        decoration: TextDecoration.underline),
+                                  )
+                                ]),
+                              ),
                             ),
-                          ),
-                        ],
-                      )
-                    ],
-                  )).marginSymmetric(vertical: 2 * em),
+                          ],
+                        )
+                      ],
+                    )).marginSymmetric(vertical: 2 * em),
               Row(
                 children: [
                   Expanded(
@@ -272,7 +278,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                   Obx(
                     () => ElevatedButton.icon(
                       icon: Icon(Icons.done_rounded, size: 16),
-                      label: Text(translate('Accept and Install')),
+                      label: Text(translate(bind.isCustomClient()
+                          ? 'Install'
+                          : 'Accept and Install')),
                       onPressed: btnEnabled.value ? install : null,
                       style: buttonStyle,
                     ),

@@ -753,6 +753,8 @@ def build_flutter_deb(version, features):
     system2(
         'cp ../res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
     system2(
+        'cp ../res/rustdesk-vdisplay.service tmpdeb/usr/share/rustdesk/files/systemd/')
+    system2(
         'cp ../res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
     system2(
         'cp ../res/scalable.svg tmpdeb/usr/share/icons/hicolor/scalable/apps/rustdesk.svg')
@@ -860,6 +862,8 @@ def build_deb_from_folder(version, binary_folder, want_drm=False):
         f'cp -r ../{binary_folder}/* tmpdeb/usr/share/rustdesk/')
     system2(
         'cp ../res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
+    system2(
+        'cp ../res/rustdesk-vdisplay.service tmpdeb/usr/share/rustdesk/files/systemd/')
     system2(
         'cp ../res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
     system2(
@@ -1156,6 +1160,8 @@ def main():
                 system2('mkdir -p tmpdeb/usr/share/icons/hicolor/scalable/apps/')
                 system2(
                     'cp res/rustdesk.service tmpdeb/usr/share/rustdesk/files/systemd/')
+                system2(
+                    'cp res/rustdesk-vdisplay.service tmpdeb/usr/share/rustdesk/files/systemd/')
                 system2(
                     'cp res/128x128@2x.png tmpdeb/usr/share/icons/hicolor/256x256/apps/rustdesk.png')
                 system2(

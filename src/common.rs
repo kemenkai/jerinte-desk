@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };
@@ -692,46 +692,59 @@ impl Drop for CheckTestNatType {
     }
 }
 
+// Asked again while a test runs, as when the entry in use changes: run once more when done,
+// for the way to the servers as it is by then.
+static TEST_NAT_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn test_nat_type() {
     test_ipv6_sync();
     use std::sync::atomic::{AtomicBool, Ordering};
     std::thread::spawn(move || {
         static IS_RUNNING: AtomicBool = AtomicBool::new(false);
         if IS_RUNNING.load(Ordering::SeqCst) {
+            TEST_NAT_AGAIN.store(true, Ordering::SeqCst);
             return;
         }
         IS_RUNNING.store(true, Ordering::SeqCst);
-
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::ipc::get_socks_ws();
-        let is_direct = Config::get_socks().is_none() && !config::use_ws();
-        if !is_direct {
-            Config::set_nat_type(NatType::SYMMETRIC as _);
-            IS_RUNNING.store(false, Ordering::SeqCst);
-            return;
-        }
-
-        let mut i = 0;
         loop {
-            match test_nat_type_() {
-                Ok(true) => break,
-                Err(err) => {
-                    log::error!("test nat: {}", err);
-                }
-                _ => {}
-            }
-            if Config::get_nat_type() != 0 {
+            TEST_NAT_AGAIN.store(false, Ordering::SeqCst);
+            test_nat_type_until_known();
+            if !TEST_NAT_AGAIN.load(Ordering::SeqCst) {
                 break;
             }
-            i = i * 2 + 1;
-            if i > 300 {
-                i = 300;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(i));
         }
-
         IS_RUNNING.store(false, Ordering::SeqCst);
     });
+}
+
+fn test_nat_type_until_known() {
+    use std::sync::atomic::Ordering;
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    crate::ipc::get_socks_ws();
+    let is_direct = Config::get_socks().is_none() && !config::use_ws();
+    if !is_direct {
+        Config::set_nat_type(NatType::SYMMETRIC as _);
+        return;
+    }
+
+    let mut i = 0;
+    loop {
+        match test_nat_type_() {
+            Ok(true) => break,
+            Err(err) => {
+                log::error!("test nat: {}", err);
+            }
+            _ => {}
+        }
+        if Config::get_nat_type() != 0 || TEST_NAT_AGAIN.load(Ordering::SeqCst) {
+            break;
+        }
+        i = i * 2 + 1;
+        if i > 300 {
+            i = 300;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(i));
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1213,9 +1226,36 @@ pub fn get_app_name() -> String {
     hbb_common::config::APP_NAME.read().unwrap().clone()
 }
 
-#[inline]
-pub fn is_rustdesk() -> bool {
-    hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
+/// The name users see. A custom client sets it with `app-display-name` while its app name, which
+/// also names its config, IPC, service, install folder and files, stays `RustDesk` so that it
+/// upgrades a stock install in place.
+pub fn get_app_display_name() -> String {
+    let name = hbb_common::config::HARD_SETTINGS
+        .read()
+        .unwrap()
+        .get("app-display-name")
+        .cloned()
+        .unwrap_or_default();
+    if is_valid_app_display_name(&name) {
+        name
+    } else {
+        get_app_name()
+    }
+}
+
+/// It ends up in elevated install scripts as file names and quoted values, and names a Start Menu
+/// folder, so names Windows reserves are refused too: "Startup", whose shortcuts run at sign-in,
+/// and device names such as CON or COM1.
+fn is_valid_app_display_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let reserved = matches!(lower.as_str(), "startup" | "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && lower.as_bytes()[3].is_ascii_digit());
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !reserved
 }
 
 #[inline]
@@ -1282,6 +1322,11 @@ fn get_api_server_(api: String, custom: String) -> String {
     }
     let s0 = get_custom_rendezvous_server(custom);
     if !s0.is_empty() {
+        if hbb_common::websocket::is_ws_endpoint(&s0) {
+            if let Some(origin) = ws_url_http_origin(&s0) {
+                return origin;
+            }
+        }
         let s = crate::increase_port(&s0, -2);
         if s == s0 {
             let s = if hbb_common::is_ipv6_str(&s) && !s.starts_with('[') {
@@ -1310,6 +1355,41 @@ pub fn is_public(url: &str) -> bool {
     host == "rustdesk.com" || host.ends_with(".rustdesk.com")
 }
 
+/// `host:port` of a ws(s):// server URL, with the scheme's default port when it names none.
+pub fn ws_url_host_port(url: &str) -> Result<String, String> {
+    const INVALID: &str = "Invalid WebSocket URL";
+    // Connecting parses the URL as an http::Uri, which is stricter than url's WHATWG parser: that
+    // one reads `wss:///x/id` as host `x` and `\` as `/`. Accept only what both read the same way.
+    let authority = url.split_once("://").map_or("", |(_, rest)| rest);
+    if authority.is_empty()
+        || authority.starts_with('/')
+        || !url.is_ascii()
+        || url.contains(|c: char| c == '\\' || c == '#' || c.is_whitespace())
+    {
+        return Err(INVALID.to_owned());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
+    match (parsed.host_str(), parsed.port_or_known_default()) {
+        (Some(host), Some(port)) => Ok(format!("{host}:{port}")),
+        _ => Err(INVALID.to_owned()),
+    }
+}
+
+/// The http(s) origin of a ws(s):// server URL: `wss://h:4443/p/id` gives `https://h:4443`.
+fn ws_url_http_origin(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = match parsed.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return None,
+    };
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
 pub fn get_tcp_punch_enabled() -> bool {
     config::option2bool(
         keys::OPTION_ENABLE_TCP_PUNCH,
@@ -1336,6 +1416,86 @@ pub fn get_webrtc_enabled() -> bool {
         keys::OPTION_ENABLE_WEBRTC,
         &get_local_option(keys::OPTION_ENABLE_WEBRTC),
     )
+}
+
+/// `allow-ws-lan-direct`: under WebSocket, connect over the LAN when the server finds both ends
+/// on one intranet. Off, ws relays every classic path as it always has, leaving WebRTC as the
+/// only direct one. On, it adds that LAN path and nothing else: the classic punches stay off
+/// (with a single ws port they cannot work), and the server only takes a request down it when
+/// both ends declared they can (see `ws_forces_relay` and `ws_lan_direct_declared`). The price is
+/// that such a request negotiates no WebRTC: if the LAN fails it relays.
+pub fn ws_lan_direct_allowed() -> bool {
+    config::option2bool(
+        keys::OPTION_ALLOW_WS_LAN_DIRECT,
+        &Config::get_option(keys::OPTION_ALLOW_WS_LAN_DIRECT),
+    )
+}
+
+/// Whether ws forces relay on a same-intranet request this device answers: unless
+/// `allow-ws-lan-direct` is on. Not the local `force_relay`, which stays on under ws either way.
+pub fn ws_forces_relay() -> bool {
+    use_ws() && !ws_lan_direct_allowed()
+}
+
+/// Whether this host can take part in a same-intranet connection over ws: the option on, and a
+/// LAN address that another machine can reach on the route of the ws connection, `via` being
+/// either end of it. Its `local_addr()` is this host's end (the server's before hbb_common
+/// 423fb71, and the end towards a proxy always): towards that end the route gives it back, the
+/// address the connection went out from; towards the far end, the one a new connection would.
+/// Not behind a TUN proxy or VPN holding the default route: its address leads nowhere, and the
+/// WebRTC this would give up gathers the real interfaces' addresses.
+pub fn ws_lan_direct_usable(via: SocketAddr) -> bool {
+    use_ws() && ws_lan_direct_allowed() && lan_ipv4_towards(via).is_some()
+}
+
+/// Whether this device, registered over ws, declares to the server that it answers a
+/// same-intranet request with a LAN address it listens on. Only when it really will: not behind
+/// a proxy, which would relay it, nor with TCP listening disabled.
+pub fn ws_lan_direct_declared(via: SocketAddr) -> bool {
+    ws_lan_direct_usable(via) && !Config::is_proxy() && !config::is_disable_tcp_listen()
+}
+
+/// The `RegisterPk` field carrying `ws_lan_direct_declared`. Private to our server, which reads it
+/// under the same number (hbbs `REGISTER_PK_WS_LAN_DIRECT`); well above upstream's field numbers,
+/// so any other server skips it as unknown.
+pub const REGISTER_PK_WS_LAN_DIRECT: u32 = 1001;
+
+/// This host's address the OS would send from towards `target`. A UDP socket's connect only
+/// picks the route; nothing is sent.
+pub fn local_ip_towards(target: SocketAddr) -> Option<IpAddr> {
+    let any: SocketAddr = if target.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(target).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// This host's LAN address towards `target`: the IPv4 address the OS would send from, when it is
+/// a private one on an interface with a hardware address. A TUN proxy or VPN that holds the route
+/// fails the second test whatever its own address (Clash's 198.18.0.1 is not even private,
+/// FlClash's 172.19.0.1 is): a layer-3 interface has no MAC, and no other machine reaches it.
+pub fn lan_ipv4_towards(target: SocketAddr) -> Option<Ipv4Addr> {
+    let IpAddr::V4(ip) = local_ip_towards(target)? else {
+        return None;
+    };
+    (ip.is_private() && on_hardware_interface(ip)).then_some(ip)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn on_hardware_interface(ip: Ipv4Addr) -> bool {
+    default_net::get_interfaces().iter().any(|i| {
+        i.ipv4.iter().any(|n| n.addr == ip)
+            && i.mac_addr.as_ref().map_or(false, |m| m.octets() != [0; 6])
+    })
+}
+
+#[cfg(target_os = "ios")]
+fn on_hardware_interface(_ip: Ipv4Addr) -> bool {
+    false
 }
 
 pub fn get_local_option(key: &str) -> String {
@@ -1370,14 +1530,22 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
 #[inline]
 fn should_use_raw_tcp_for_api(url: &str) -> bool {
     get_builtin_option(keys::OPTION_USE_RAW_TCP_FOR_API) == "Y"
-        && !use_ws()
+        && api_tunnel_possible()
         && is_tcp_proxy_api_target(url)
 }
 
 /// Check if we can attempt raw TCP proxy fallback for this target URL.
 #[inline]
 fn can_fallback_to_raw_tcp(url: &str) -> bool {
-    !use_ws() && is_tcp_proxy_api_target(url)
+    api_tunnel_possible() && is_tcp_proxy_api_target(url)
+}
+
+/// Whether the ID server may tunnel the API: not over WebSocket, and not with `server-entries`
+/// set, whose entries lead to our own ID server, one that does not tunnel it. Without that, an
+/// entry's native ports would add a doomed connection to every failed API call.
+#[inline]
+fn api_tunnel_possible() -> bool {
+    !use_ws() && Config::get_server_entries().is_empty()
 }
 
 #[inline]
@@ -2492,7 +2660,22 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+/// Settings compiled into a custom build (see res/custom/README.md); empty in the stock tree.
+/// build.rs copies them from res/custom-client.json, which git does not track.
+const BAKED_CUSTOM_CLIENT: &str = include_str!(concat!(env!("OUT_DIR"), "/custom-client.json"));
+
+/// A build with compiled-in settings ignores `custom.txt`, the server settings Windows reads
+/// from the exe name, and `id@server` targets, so its servers stay the ones it was built with.
+#[inline]
+pub fn is_baked_custom_client() -> bool {
+    !BAKED_CUSTOM_CLIENT.trim().is_empty()
+}
+
 pub fn load_custom_client() {
+    if is_baked_custom_client() {
+        apply_custom_client(BAKED_CUSTOM_CLIENT.as_bytes());
+        return;
+    }
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2591,6 +2774,9 @@ pub fn get_dst_align_rgba() -> usize {
 }
 
 pub fn read_custom_client(config: &str) {
+    if is_baked_custom_client() {
+        return;
+    }
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
         return;
@@ -2604,8 +2790,12 @@ pub fn read_custom_client(config: &str) {
         log::error!("Failed to dec custom client config");
         return;
     };
+    apply_custom_client(&data);
+}
+
+fn apply_custom_client(data: &[u8]) {
     let Ok(mut data) =
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
+        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(data)
     else {
         log::error!("Failed to parse custom client config");
         return;
@@ -2693,7 +2883,7 @@ pub fn get_builtin_option(key: &str) -> String {
 
 #[inline]
 pub fn is_custom_client() -> bool {
-    get_app_name() != "RustDesk"
+    is_baked_custom_client() || get_app_name() != "RustDesk"
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {
@@ -3618,5 +3808,44 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+
+    #[test]
+    fn test_api_server_derived_from_websocket_url() {
+        let derived = |s: &str| get_api_server_(String::new(), s.to_owned());
+        assert_eq!(
+            derived("wss://rd.example.com:4443/p1/id"),
+            "https://rd.example.com:4443"
+        );
+        assert_eq!(
+            derived("ws://rd.example.com/ws/id"),
+            "http://rd.example.com"
+        );
+    }
+
+    #[test]
+    fn test_is_valid_app_display_name() {
+        for name in ["jerinteDesk", "A-1", "Console", "COM10", "Startups"] {
+            assert!(is_valid_app_display_name(name), "{name}");
+        }
+        let too_long = "x".repeat(65);
+        for name in [
+            "", "Startup", "STARTUP", "con", "Nul", "COM1", "lpt9", "a b", "a&b", "a\"b", "%x%",
+            too_long.as_str(),
+        ] {
+            assert!(!is_valid_app_display_name(name), "{name}");
+        }
+    }
+
+    // Whatever this machine's routes, a LAN address is a private one: loopback is none, and a
+    // public route yields a private address or nothing. Towards this host's own end of a
+    // connection it is that end's address, as towards the far end (`ws_lan_direct_usable`).
+    #[test]
+    fn test_lan_ipv4_towards_only_names_private_addresses() {
+        assert_eq!(lan_ipv4_towards("127.0.0.1:9".parse().unwrap()), None);
+        if let Some(ip) = lan_ipv4_towards("192.0.2.1:9".parse().unwrap()) {
+            assert!(ip.is_private(), "{ip}");
+            assert_eq!(lan_ipv4_towards((ip, 54321).into()), Some(ip));
+        }
     }
 }

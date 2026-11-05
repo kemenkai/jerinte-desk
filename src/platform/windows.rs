@@ -708,7 +708,8 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                 // https://github.com/rustdesk/rustdesk/discussions/10039
                 let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
                 if count == 0 {
-                    h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+                    close_server(h_process).await;
+                    h_process = launch_server(session_id, false).await.unwrap_or(NULL);
                 }
             }
         }
@@ -745,8 +746,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                         );
                                         session_id = usid;
                                         stored_usid = Some(session_id);
+                                        close_server(h_process).await;
                                         h_process =
-                                            launch_server(session_id, true).await.unwrap_or(NULL);
+                                            launch_server(session_id, false).await.unwrap_or(NULL);
                                     }
                                 }
                             }
@@ -809,6 +811,30 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     })?;
 
     Ok(())
+}
+
+/// How long the service waits for a `--server` it closed to end before it starts another.
+const SERVER_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+// Closes the `--server` running and waits, `SERVER_EXIT_WAIT` at most, for it to end: it may take a
+// moment to give back what it holds (src/vdisplay), and another started meanwhile would race it
+// for the same virtual displays and the same IPC pipe.
+async fn close_server(h_process: HANDLE) {
+    send_close_async("").await.ok();
+    if h_process.is_null() {
+        return;
+    }
+    let start = Instant::now();
+    loop {
+        let mut exit_code: DWORD = 0;
+        let running = unsafe { GetExitCodeProcess(h_process, &mut exit_code) } == TRUE
+            && exit_code == STILL_ACTIVE;
+        if !running || start.elapsed() > SERVER_EXIT_WAIT {
+            break;
+        }
+        sleep(0.1).await;
+    }
+    unsafe { CloseHandle(h_process) };
 }
 
 async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDLE> {
@@ -1492,16 +1518,61 @@ pub fn check_update_broker_process() -> ResultType<()> {
     Ok(())
 }
 
+/// The names shortcuts and the Start Menu folder are created under (the display name, first) and
+/// removed under: also the app name, which stock RustDesk and earlier builds named them after.
+fn shortcut_names() -> Vec<String> {
+    let display_name = crate::get_app_display_name();
+    let app_name = crate::get_app_name();
+    if display_name == app_name {
+        vec![app_name]
+    } else {
+        vec![display_name, app_name]
+    }
+}
+
+fn start_menu_folder(name: &str) -> String {
+    format!("%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{name}")
+}
+
+const STARTUP_FOLDER: &str = "%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+
+fn remove_tray_shortcut_cmds() -> String {
+    shortcut_names()
+        .iter()
+        .map(|name| {
+            format!(
+                "if exist \"{STARTUP_FOLDER}\\{name} Tray.lnk\" del /f /q \"{STARTUP_FOLDER}\\{name} Tray.lnk\"\n"
+            )
+        })
+        .collect()
+}
+
+fn remove_shortcuts_cmds() -> String {
+    let mut cmds = remove_tray_shortcut_cmds();
+    for name in shortcut_names() {
+        // Only the two shortcuts install_me puts in the folder, which goes once it is empty: a
+        // configurable name may match a folder that holds other programs' shortcuts.
+        let start_menu = start_menu_folder(&name);
+        for lnk in [format!("{name}.lnk"), format!("Uninstall {name}.lnk")] {
+            cmds += &format!(
+                "if exist \"{start_menu}\\{lnk}\" del /f /q \"{start_menu}\\{lnk}\"\n"
+            );
+        }
+        cmds += &format!("if exist \"{start_menu}\" rd \"{start_menu}\"\n");
+        cmds += &format!(
+            "if exist \"%PUBLIC%\\Desktop\\{name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{name}.lnk\"\n"
+        );
+    }
+    cmds
+}
+
 fn get_install_info_with_subkey(subkey: String) -> (String, String, String, String) {
     let mut path = get_reg_of(&subkey, "InstallLocation");
     if path.is_empty() {
         path = get_default_install_path();
     }
     path = path.trim_end_matches('\\').to_owned();
-    let start_menu = format!(
-        "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{}",
-        crate::get_app_name()
-    );
+    let start_menu = start_menu_folder(&crate::get_app_display_name());
     let exe = format!("{}\\{}.exe", path, crate::get_app_name());
     (subkey, path, start_menu, exe)
 }
@@ -1653,7 +1724,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     if versions.len() > 2 {
         version_build = versions[2];
     }
-    let app_name = crate::get_app_name();
+    let display_name = crate::get_app_display_name();
 
     let current_exe = std::env::current_exe()?;
     let cur_exe = current_exe
@@ -1678,14 +1749,14 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     let tmp_path = "%RUSTDESK_OUTPUT_DIR%".to_owned();
     let (mk_shortcut_commands, mk_shortcut_file) = staged_shortcut_commands(
         shortcut_bytes(&exe, None, shortcut_icon_location.as_deref())?,
-        &format!("{app_name}.lnk"),
+        &format!("{display_name}.lnk"),
     )?;
     let (uninstall_shortcut_commands, uninstall_shortcut_file) = staged_shortcut_commands(
         shortcut_bytes(&exe, Some("--uninstall"), Some("msiexec.exe"))?,
-        &format!("Uninstall {app_name}.lnk"),
+        &format!("Uninstall {display_name}.lnk"),
     )?;
     let (tray_shortcut_commands, tray_shortcut_file) =
-        staged_tray_shortcut_commands(&app_name, &exe, shortcut_icon_location.as_deref())?;
+        staged_tray_shortcut_commands(&display_name, &exe, shortcut_icon_location.as_deref())?;
     let mut reg_value_desktop_shortcuts = "0".to_owned();
     let mut reg_value_start_menu_shortcuts = "0".to_owned();
     let mut reg_value_printer = "0".to_owned();
@@ -1693,8 +1764,7 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
     if options.contains("desktopicon") {
         shortcuts = format!(
             "copy /Y \"{}\\{}.lnk\" \"%PUBLIC%\\Desktop\\\"",
-            tmp_path,
-            crate::get_app_name()
+            tmp_path, display_name
         );
         reg_value_desktop_shortcuts = "1".to_owned();
     }
@@ -1702,13 +1772,17 @@ pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> Res
         shortcuts = format!(
             "{shortcuts}
 md \"{start_menu}\"
-copy /Y \"{tmp_path}\\{app_name}.lnk\" \"{start_menu}\\\"
-copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
+copy /Y \"{tmp_path}\\{display_name}.lnk\" \"{start_menu}\\\"
+copy /Y \"{tmp_path}\\Uninstall {display_name}.lnk\" \"{start_menu}\\\"
      "
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
-    let install_printer = options.contains("printer") && is_win_10_or_greater();
+    // A client that hides the remote printer settings never installs it, whatever the path:
+    // the install page, a silent install, or the options a previous install left.
+    let install_printer = options.contains("printer")
+        && is_win_10_or_greater()
+        && crate::get_builtin_option("hide-remote-printer-settings") != "Y";
     if install_printer {
         reg_value_printer = "1".to_owned();
     }
@@ -1726,9 +1800,9 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
     // Note: without if exist, the bat may exit in advance on some Windows7 https://github.com/rustdesk/rustdesk/issues/895
     let dels = format!(
         "
-if exist \"{tmp_path}\\{app_name}.lnk\" del /f /q \"{tmp_path}\\{app_name}.lnk\"
-if exist \"{tmp_path}\\Uninstall {app_name}.lnk\" del /f /q \"{tmp_path}\\Uninstall {app_name}.lnk\"
-if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} Tray.lnk\"
+if exist \"{tmp_path}\\{display_name}.lnk\" del /f /q \"{tmp_path}\\{display_name}.lnk\"
+if exist \"{tmp_path}\\Uninstall {display_name}.lnk\" del /f /q \"{tmp_path}\\Uninstall {display_name}.lnk\"
+if exist \"{tmp_path}\\{display_name} Tray.lnk\" del /f /q \"{tmp_path}\\{display_name} Tray.lnk\"
         "
     );
     let src_exe = cur_exe.clone();
@@ -1745,7 +1819,7 @@ if exist \"{tmp_path}\\{app_name} Tray.lnk\" del /f /q \"{tmp_path}\\{app_name} 
     } else {
         format!("
 {tray_shortcut_commands}
-copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+copy /Y \"{tmp_path}\\{display_name} Tray.lnk\" \"{STARTUP_FOLDER}\\\"
 ")
     };
 
@@ -1781,12 +1855,12 @@ md \"{path}\"
 {copy_exe}
 reg add {subkey} /f
 reg add {subkey} /f /v DisplayIcon /t REG_SZ /d \"{display_icon}\"
-reg add {subkey} /f /v DisplayName /t REG_SZ /d \"{app_name}\"
+reg add {subkey} /f /v DisplayName /t REG_SZ /d \"{display_name}\"
 reg add {subkey} /f /v DisplayVersion /t REG_SZ /d \"{version}\"
 reg add {subkey} /f /v Version /t REG_SZ /d \"{version}\"
 reg add {subkey} /f /v BuildDate /t REG_SZ /d \"{build_date}\"
 reg add {subkey} /f /v InstallLocation /t REG_SZ /d \"{path}\"
-reg add {subkey} /f /v Publisher /t REG_SZ /d \"{app_name}\"
+reg add {subkey} /f /v Publisher /t REG_SZ /d \"{display_name}\"
 reg add {subkey} /f /v VersionMajor /t REG_DWORD /d {version_major}
 reg add {subkey} /f /v VersionMinor /t REG_DWORD /d {version_minor}
 reg add {subkey} /f /v VersionBuild /t REG_DWORD /d {version_build}
@@ -1797,7 +1871,7 @@ reg add {subkey} /f /v WindowsInstaller /t REG_DWORD /d 0
 {uninstall_shortcut_commands}
 {tray_shortcuts}
 {shortcuts}
-copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
+copy /Y \"{tmp_path}\\Uninstall {display_name}.lnk\" \"{path}\\\"
 {dels}
 {import_config}
 {after_install}
@@ -1874,7 +1948,7 @@ fn get_before_uninstall(kill_self: bool) -> ResultType<String> {
 /// is included in the generated uninstall script. If `uninstall_printer` is `false`, the printer
 /// related command is omitted from the script.
 fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String> {
-    let (subkey, path, start_menu, _) = get_install_info();
+    let (subkey, path, _, _) = get_install_info();
     let installer_state = get_windows_installer_state(&subkey)?;
     if let Some(product_code) = get_msi_product_code(&subkey, installer_state)? {
         return Ok(build_msi_uninstall_command(&product_code));
@@ -1901,13 +1975,11 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> ResultType<String>
     reg delete {subkey} /f
     {uninstall_amyuni_idd}
     if exist \"{path}\" rd /s /q \"{path}\"
-    if exist \"{start_menu}\" rd /s /q \"{start_menu}\"
-    if exist \"%PUBLIC%\\Desktop\\{app_name}.lnk\" del /f /q \"%PUBLIC%\\Desktop\\{app_name}.lnk\"
-    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
+    {remove_shortcuts}
     ",
         before_uninstall=get_before_uninstall(kill_self)?,
         uninstall_amyuni_idd=get_uninstall_amyuni_idd(),
-        app_name = crate::get_app_name(),
+        remove_shortcuts = remove_shortcuts_cmds(),
     ))
 }
 
@@ -2161,6 +2233,9 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
 }
 
 pub fn get_license_from_exe_name() -> ResultType<CustomServer> {
+    if crate::common::is_baked_custom_client() {
+        bail!("Server settings are compiled into this build");
+    }
     let mut exe = std::env::current_exe()?.to_str().unwrap_or("").to_owned();
     // if defined portable appname entry, replace original executable name with it.
     if let Ok(portable_exe) = std::env::var(PORTABLE_APPNAME_RUNTIME_ENV_KEY) {
@@ -3373,12 +3448,13 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
         "
     chcp 65001
     {remove_service}
-    if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
+    {remove_tray_shortcut}
     taskkill /F /IM {broker_exe}
     taskkill /F /IM {app_name}.exe{filter}
     ",
         app_name = crate::get_app_name(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
+        remove_tray_shortcut = remove_tray_shortcut_cmds(),
     );
     if let Err(err) = run_cmds(cmds, false, "uninstall") {
         Config::set_option("stop-service".into(), "".into());
@@ -3391,6 +3467,7 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
 
 fn get_install_service_commands(path: &str, exe: &str) -> ResultType<InstallCommands> {
     let app_name = crate::get_app_name();
+    let display_name = crate::get_app_display_name();
     for value in [path, exe] {
         validate_install_value(value)?;
     }
@@ -3405,17 +3482,19 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<InstallComm
         validate_install_value(icon)?;
     }
     let (tray_shortcut_commands, tray_shortcut_file) =
-        staged_tray_shortcut_commands(&app_name, exe, shortcut_icon_location.as_deref())?;
+        staged_tray_shortcut_commands(&display_name, exe, shortcut_icon_location.as_deref())?;
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let script = format!(
         "
 chcp 65001
 taskkill /F /IM {app_name}.exe{filter}
 {tray_shortcut_commands}
-copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
+{remove_tray_shortcut}
+copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{display_name} Tray.lnk\" \"{STARTUP_FOLDER}\\\"
 {import_config}
 {create_service}
     ",
+        remove_tray_shortcut = remove_tray_shortcut_cmds(),
         import_config = get_import_config(exe),
         create_service = service_control_command("create-service-with-rollback", exe, false)?,
     );
@@ -4043,9 +4122,18 @@ fn service_control_command(operation: &str, exe: &str, installed_now: bool) -> R
     } else {
         String::new()
     };
+    // The runner names the service "<app name> Service"; a custom client's display name goes on
+    // once the service is there, as the legacy `sc create` gave it. Only a name that passed
+    // is_valid_app_display_name differs from the app name, so it is safe in the script.
+    let display_name = crate::get_app_display_name();
+    let rename = if is_create && display_name != app_name {
+        format!("\r\nsc config {app_name} DisplayName= \"{display_name} Service\" > nul")
+    } else {
+        String::new()
+    };
     Ok(format!(
         "start \"\" /b /wait \"{exe}\" --service-control {operation} \"{app_name}\"{executable_argument}\r\n\
-         if not \"%errorlevel%\"==\"0\" exit /b %errorlevel%"
+         if not \"%errorlevel%\"==\"0\" exit /b %errorlevel%{rename}"
     ))
 }
 
@@ -4062,12 +4150,13 @@ fn get_import_config(exe: &str) -> String {
     format!("
 sc stop {app_name}
 sc delete {app_name}
-sc create {app_name} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
+sc create {app_name} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{display_name} Service\"
 sc start {app_name}
 sc stop {app_name}
 sc delete {app_name}
 ",
     app_name = crate::get_app_name(),
+    display_name = crate::get_app_display_name(),
 )
 }
 
@@ -4077,16 +4166,15 @@ fn get_create_service(exe: &str) -> String {
     }
     let stop = Config::get_option("stop-service") == "Y";
     if stop {
-        format!("
-if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
-", app_name = crate::get_app_name())
+        format!("\n{}", remove_tray_shortcut_cmds())
     } else {
         let exe = escape_nested_cmd_ampersands(exe);
         format!("
-sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{display_name} Service\"
 sc start {app_name}
 ",
-    app_name = crate::get_app_name())
+    app_name = crate::get_app_name(),
+    display_name = crate::get_app_display_name())
     }
 }
 
@@ -4186,7 +4274,7 @@ pub fn message_box(text: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
-    let caption = "RustDesk Output"
+    let caption = format!("{} Output", crate::get_app_display_name())
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();

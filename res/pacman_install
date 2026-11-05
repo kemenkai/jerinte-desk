@@ -6,10 +6,12 @@
 post_install() {
 	# do something here
 	cp /usr/share/rustdesk/files/rustdesk.service /etc/systemd/system/rustdesk.service
+	cp /usr/share/rustdesk/files/rustdesk-vdisplay.service /etc/systemd/system/rustdesk-vdisplay.service
 	cp /usr/share/rustdesk/files/rustdesk.desktop /usr/share/applications/
 	cp /usr/share/rustdesk/files/rustdesk-link.desktop /usr/share/applications/
 	systemctl daemon-reload
 	systemctl enable rustdesk
+	systemctl enable rustdesk-vdisplay || true
 	systemctl start rustdesk
 	update-desktop-database
 }
@@ -24,10 +26,12 @@ pre_upgrade() {
 # arg 2:  the old package version
 post_upgrade() {
 	cp /usr/share/rustdesk/files/rustdesk.service /etc/systemd/system/rustdesk.service
+	cp /usr/share/rustdesk/files/rustdesk-vdisplay.service /etc/systemd/system/rustdesk-vdisplay.service
 	cp /usr/share/rustdesk/files/rustdesk.desktop /usr/share/applications/
 	cp /usr/share/rustdesk/files/rustdesk-link.desktop /usr/share/applications/
 	systemctl daemon-reload
 	systemctl enable rustdesk
+	systemctl enable rustdesk-vdisplay || true
 	systemctl start rustdesk
 	update-desktop-database
 }
@@ -37,6 +41,8 @@ pre_remove() {
 	systemctl stop rustdesk || true
 	systemctl disable rustdesk || true
 	rm /etc/systemd/system/rustdesk.service || true
+	systemctl disable rustdesk-vdisplay || true
+	rm /etc/systemd/system/rustdesk-vdisplay.service || true
 }
 
 # arg 1:  the old package version

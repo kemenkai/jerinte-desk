@@ -25,14 +25,6 @@ jobs:
               flutter-version: "3.22.3",
               artifact-name: "bridge-artifact",
             }
-          # Dedicated bridge for the Windows arm64 build (Flutter 3.44); runs in parallel.
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-22.04,
-              extra-build-args: "",
-              flutter-version: "3.44.8",
-              artifact-name: "bridge-artifact-flutter-3.44",
-            }
     steps:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -103,10 +95,14 @@ jobs:
           ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
           cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Private builds: the account's artifact storage quota is used up, so the bridge reaches the
+      # build jobs through the Actions cache (its own 10 GB per repo) instead of an artifact.
+      - name: Save bridge to cache
+        uses: actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
-          name: ${{ matrix.job.artifact-name }}
+          key: ${{ matrix.job.artifact-name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Saved on Linux; without this the Windows build cannot restore it.
+          enableCrossOsArchive: true
           path: |
             ./src/bridge_generated.rs
             ./src/bridge_generated.io.rs

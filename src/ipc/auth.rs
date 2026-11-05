@@ -239,7 +239,7 @@ pub(crate) fn peer_uid_from_fd(fd: RawFd) -> Option<u32> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[inline]
-fn peer_pid_from_fd(fd: RawFd) -> Option<u32> {
+pub(crate) fn peer_pid_from_fd(fd: RawFd) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         return peer_cred_from_fd(fd).and_then(|cred| (cred.pid > 0).then_some(cred.pid as u32));

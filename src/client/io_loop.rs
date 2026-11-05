@@ -18,6 +18,10 @@ const KCP_CLOSE_REASON_FLUSH_DELAY: Duration = Duration::from_millis(30);
 // Deadline for the parting close-reason send once the peer is presumed gone; KCP waits for send
 // capacity with no deadline of its own.
 const KCP_CLOSE_REASON_GONE_DEADLINE: Duration = Duration::from_millis(500);
+// How long the last messages may take to reach the peer before the stream is dropped, where
+// sending only queues them (WebRTC, `Stream::linger`/`flush`): without the wait the close reason
+// is lost and the peer takes the close for a dropped connection, waiting out its reconnect grace.
+const CLOSE_FLUSH_LIMIT: Duration = Duration::from_secs(1);
 // Grace after ICE reports Disconnected, which it does ~5s after it stops hearing from the peer,
 // for ~8s in total. Disconnected is transient by design, so this waits out a Wi-Fi roam or a
 // sleep/wake rather than acting on the first hint.
@@ -102,6 +106,8 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    /// The controlled side sent its close reason: it is closing, this side only answers.
+    closed_by_peer: bool,
     cursor_dedupe: CursorDedupe,
     trusted_device: crate::trusted_devices::client::Session,
 }
@@ -113,6 +119,8 @@ struct ParsedPeerInfo {
     idd_impl: String,
     support_view_camera: bool,
     support_terminal: bool,
+    // Offers the cross-platform virtual displays (src/vdisplay).
+    virtual_displays: bool,
 }
 
 impl ParsedPeerInfo {
@@ -156,6 +164,7 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            closed_by_peer: false,
             cursor_dedupe: Default::default(),
             trusted_device: Default::default(),
         }
@@ -195,6 +204,7 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        let connect_started = std::time::Instant::now();
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -237,6 +247,25 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
+                // 阶段 1 连接路径遥测:记下实际走的传输/服务器/是否直连/建连耗时,供首个 RTT 合并打印。
+                let connect_ms = connect_started.elapsed().as_millis() as u64;
+                log::info!(
+                    "[CONN-PATH] id={} transport={} direct={} secured={} server={} connect_ms={}",
+                    self.handler.get_id(),
+                    stream_type,
+                    direct,
+                    is_secured,
+                    rendezvous_server,
+                    connect_ms
+                );
+                self.handler.lc.write().unwrap().conn_path = Some(client::ConnPathInfo {
+                    transport: stream_type.to_owned(),
+                    server: rendezvous_server.clone(),
+                    direct,
+                    secured: is_secured,
+                    connect_ms,
+                    rtt_logged: false,
+                });
                 if !is_secured
                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
@@ -244,6 +273,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.send_close_reason(&mut peer, "").await;
                     if kcp.is_some() {
                         tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
+                    } else {
+                        peer.linger(CLOSE_FLUSH_LIMIT).await;
                     }
                     self.handle_disconnected(round);
                     return;
@@ -441,6 +472,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     // KCP does not send messages immediately, so wait to ensure the last message is sent.
                     // 1ms works in my test, but 30ms is more reliable.
                     tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
+                } else if !peer_gone {
+                    // Closing, the peer is waited for to read the close reason (it closes on it);
+                    // answering its close, ours goes as soon as what was sent is in.
+                    if self.sent_close_reason && !self.closed_by_peer {
+                        peer.linger(CLOSE_FLUSH_LIMIT).await;
+                    } else {
+                        peer.flush(CLOSE_FLUSH_LIMIT).await;
+                    }
                 }
             }
             Err(err) => {
@@ -1480,7 +1519,8 @@ impl<T: InvokeUiSession> Remote<T> {
         if self.handler.is_view_camera() {
             return;
         }
-        if !self.peer_info.is_support_virtual_display() {
+        // Such a peer gets this session's own slots back instead, see below.
+        if self.peer_info.virtual_displays || !self.peer_info.is_support_virtual_display() {
             return;
         }
         let lc = self.handler.lc.read().unwrap();
@@ -1497,6 +1537,25 @@ impl<T: InvokeUiSession> Remote<T> {
                 msg_out.set_misc(misc);
                 allow_err!(peer.send(&msg_out).await);
             }
+        }
+    }
+
+    // After a reconnection, takes back the virtual displays this session held (src/vdisplay).
+    async fn send_virtual_displays_again(&self, peer: &mut Stream) {
+        if !self.peer_info.virtual_displays || !self.handler.is_default() {
+            return;
+        }
+        let again = self.handler.virtual_displays.lock().unwrap().ask_again();
+        for (slot, spec) in again {
+            log::info!(
+                "Asking the peer again for virtual display slot {} ({}x{}@{}, mode {})",
+                slot,
+                spec.width,
+                spec.height,
+                spec.scale,
+                spec.mode
+            );
+            allow_err!(peer.send(&crate::vdisplay::toggle_msg(slot, true, spec)).await);
         }
     }
 
@@ -1769,6 +1828,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 return false;
                             }
                         }
+                        // Before the UI hears of the peer, which may ask for new displays.
+                        self.send_virtual_displays_again(peer).await;
                         self.handler.handle_peer_info(pi);
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
@@ -2324,6 +2385,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.set_permission("block_input", p.enabled);
                             }
                             Ok(Permission::PrivacyMode) => {
+                                self.handler.lc.write().unwrap().privacy_mode_permission =
+                                    p.enabled;
                                 self.handler.set_permission("privacy_mode", p.enabled);
                             }
                             _ => {}
@@ -2355,6 +2418,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::CloseReason(c)) => {
                         self.sent_close_reason = true; // The controlled end will close, no need to send close reason
+                        self.closed_by_peer = true;
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
                     }
@@ -2474,6 +2538,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(misc::Union::FollowCurrentDisplay(d_idx)) => {
                         self.handler.set_current_display(d_idx);
                     }
+                    Some(misc::Union::VirtualDisplayResult(r)) => {
+                        self.handler.handle_virtual_display_result(r);
+                    }
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
@@ -2534,8 +2601,12 @@ impl<T: InvokeUiSession> Remote<T> {
                         log::warn!("Message box ignore link {} for security", &link);
                         link = "".to_string();
                     }
-                    self.handler
-                        .msgbox(&msgbox.msgtype, &msgbox.title, &msgbox.text, &link);
+                    self.handler.msgbox(
+                        &peer_msgtype(&msgbox.msgtype),
+                        &msgbox.title,
+                        &msgbox.text,
+                        &link,
+                    );
                 }
                 Some(message::Union::VoiceCallRequest(request)) => {
                     if request.is_connect {
@@ -2619,6 +2690,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 .map(|v| v.as_bool())
                 .flatten()
                 .unwrap_or(false);
+            self.peer_info.virtual_displays = platform_additions.contains_key("vdm_caps");
         }
     }
 
@@ -2995,6 +3067,27 @@ impl<T: InvokeUiSession> Remote<T> {
                     .set_cursor_id(self.cursor_dedupe.rejected(peer_id, id).to_string());
             }
         }
+    }
+}
+
+// The type of a message box from the peer, short of `sticky`: a dialog staying until answered is
+// for what this side has to say only.
+fn peer_msgtype(msgtype: &str) -> String {
+    msgtype
+        .split('-')
+        .filter(|part| *part != "sticky")
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+#[cfg(test)]
+mod peer_msgtype_tests {
+    #[test]
+    fn a_peer_cannot_make_its_message_box_stay() {
+        assert_eq!(super::peer_msgtype("nook-nocancel-sticky"), "nook-nocancel");
+        assert_eq!(super::peer_msgtype("sticky-custom"), "custom");
+        assert_eq!(super::peer_msgtype("custom-nocancel"), "custom-nocancel");
+        assert_eq!(super::peer_msgtype("error"), "error");
     }
 }
 
