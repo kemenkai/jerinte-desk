@@ -68,6 +68,9 @@ def pieces(value):
         return
     if not isinstance(value, str):
         return
+    # The whole text first, a JSON list (server-entries) included: a log line showing it entire
+    # would otherwise be masked only where each entry's parts appear.
+    yield value
     if value.startswith("["):
         try:
             for entry in json.loads(value):
@@ -75,7 +78,6 @@ def pieces(value):
             return
         except ValueError:
             pass
-    yield value
     rest = value.split("://", 1)[-1]
     hostport, _, path = rest.partition("/")
     yield hostport
