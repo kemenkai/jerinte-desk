@@ -204,6 +204,9 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          # Any attempt of this run: re-running only the failed jobs does not re-run the bridge,
+          # so the attempt that saved it is an earlier one.
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           # The bridge is saved on Linux: a Windows runner only sees it across OSes.
           enableCrossOsArchive: true
@@ -942,6 +945,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -1137,6 +1141,7 @@ jobs:
           # arm64 builds with Flutter 3.44, whose *.freezed.dart must match the freezed it
           # resolves there: bridge.yml saves that one under bridge-artifact-flutter-3.44.
           key: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -1699,6 +1704,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -1940,6 +1946,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -2131,6 +2138,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -2182,6 +2190,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
@@ -2521,6 +2530,7 @@ jobs:
         uses: actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c # v3
         with:
           key: bridge-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bridge-artifact-${{ github.run_id }}-
           fail-on-cache-miss: true
           path: |
             ./src/bridge_generated.rs
