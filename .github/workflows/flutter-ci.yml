@@ -21,6 +21,13 @@ on:
         description: "Custom client under res/custom (e.g. jerinte); empty for the plain build"
         required: false
         default: ""
+      upload-artifact:
+        # flutter-build.yml runs the Dart tests (flutter test) only when nothing is published;
+        # with a plain build (variant empty) this is a test run that uses no secrets.
+        description: "Publish the packages; uncheck (with variant empty) to run the Dart tests instead"
+        type: boolean
+        required: false
+        default: true
 
 jobs:
   check-inputs:
@@ -63,7 +70,7 @@ jobs:
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
-      upload-artifact: true
+      upload-artifact: ${{ inputs.upload-artifact }}
       upload-tag: "${{ inputs.variant || 'private' }}-${{ github.run_number }}"
       targets: ${{ inputs.targets }}
       variant: ${{ inputs.variant }}
