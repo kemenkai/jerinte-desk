@@ -21,6 +21,47 @@ const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
 
 const wchar_t* getWindowClassName();
 
+// Without librustdesk.dll the app can do nothing, and a double-click used to end in
+// silence: an antivirus that quarantined the DLL, or an install that left it empty,
+// looked like an app that does not react. Only a plain launch gets this dialog --
+// the service, tray and connection-manager processes run with arguments, some in
+// session 0, where a message box would wait forever with nobody to click it.
+static void ShowCoreLoadFailure(DWORD error)
+{
+  wchar_t path[MAX_PATH] = {0};
+  GetModuleFileNameW(nullptr, path, MAX_PATH);
+  std::wstring app(path);
+  app = app.substr(app.find_last_of(L"\\/") + 1);
+  app = app.substr(0, app.find_last_of(L'.'));
+  if (app.empty()) {
+    app = L"RustDesk";
+  }
+  const std::wstring code = std::to_wstring(error);
+  // Chinese first, then English. The Chinese text is written as \u escapes: this
+  // file is compiled without /utf-8 and with /WX, so any non-ASCII byte in it would
+  // fail the build with C4819. It reads: "{app} cannot start: the program file
+  // librustdesk.dll is missing or cannot be loaded (error code {code}). Antivirus
+  // software may have blocked or quarantined it. Trust {app}'s installation folder
+  // in the antivirus, then right-click the installer, choose 'Run as administrator'
+  // and install again."
+  std::wstring message =
+      app + L" \u65e0\u6cd5\u542f\u52a8\uff1a\u7a0b\u5e8f\u6587\u4ef6 librustdesk.dll "
+            L"\u7f3a\u5931\u6216\u65e0\u6cd5\u52a0\u8f7d\uff08\u9519\u8bef\u7801 " +
+      code + L"\uff09\u3002\n"
+             L"\u5b83\u53ef\u80fd\u88ab\u6740\u6bd2\u8f6f\u4ef6\u62e6\u622a\u6216\u9694\u79bb"
+             L"\u4e86\u3002\u8bf7\u5728\u6740\u6bd2\u8f6f\u4ef6\u91cc\u628a " +
+      app + L" \u7684\u5b89\u88c5\u76ee\u5f55\u52a0\u5165\u4fe1\u4efb\uff0c\u7136\u540e"
+            L"\u53f3\u952e\u5b89\u88c5\u5305\uff0c\u9009\u62e9\u300c\u4ee5\u7ba1\u7406\u5458"
+            L"\u8eab\u4efd\u8fd0\u884c\u300d\u91cd\u65b0\u5b89\u88c5\u3002\n\n" +
+      app + L" cannot start: its program file librustdesk.dll is missing or cannot be loaded "
+            L"(error " + code + L").\n"
+            L"Antivirus software may have blocked or quarantined it. Allow " + app +
+      L"'s installation folder in your antivirus, then right-click the installer, choose "
+      L"\"Run as administrator\" and install again.";
+  MessageBoxW(nullptr, message.c_str(), app.c_str(),
+              MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
@@ -30,7 +71,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   HINSTANCE hInstance = LoadLibraryA("librustdesk.dll");
   if (!hInstance)
   {
-    std::cout << "Failed to load librustdesk.dll." << std::endl;
+    const DWORD error = GetLastError();
+    std::cout << "Failed to load librustdesk.dll, error " << error << "." << std::endl;
+    std::wstring args = command_line ? command_line : L"";
+    if (args.find_first_not_of(L" \t") == std::wstring::npos) {
+      ShowCoreLoadFailure(error);
+    }
     return EXIT_FAILURE;
   }
   FUNC_RUSTDESK_CORE_MAIN rustdesk_core_main =

@@ -154,23 +154,36 @@ fn remove_dropped_package_files(dir: &Path, current: &[String]) -> Vec<String> {
     remove_dropped_package_files_with(dir, current, |path| std::fs::remove_file(path))
 }
 
+/// Why the payload could not be unpacked; the app is not started then.
+#[derive(Debug)]
+enum SetupError {
+    NoDataDir,
+    Extract(bin_reader::ExtractError),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupError::NoDataDir => write!(f, "the local application data folder was not found"),
+            SetupError::Extract(e) => write!(f, "{}", e),
+        }
+    }
+}
+
 fn setup(
     reader: BinaryReader,
     dir: Option<PathBuf>,
     clear: bool,
     _args: &Vec<String>,
     _ui: &mut bool,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, SetupError> {
     let dir = if let Some(dir) = dir {
         dir
     } else {
         // home dir
-        if let Some(dir) = dirs::data_local_dir() {
-            dir.join(app_dir_name(&reader.exe))
-        } else {
-            eprintln!("not found data local dir");
-            return None;
-        }
+        dirs::data_local_dir()
+            .map(|dir| dir.join(app_dir_name(&reader.exe)))
+            .ok_or(SetupError::NoDataDir)?
     };
 
     let mut ts = 0;
@@ -185,14 +198,46 @@ fn setup(
     let mut metadata_paths = reader.package_paths.clone();
     metadata_paths.extend(remove_dropped_package_files(&dir, &reader.package_paths));
     for file in reader.files.iter() {
-        file.write_to_file(&dir);
+        if let Err(e) = file.write_to_file(&dir) {
+            // meta.toml is what lets the next run trust this directory and skip the
+            // wipe; without it the next run starts over from an empty directory.
+            std::fs::remove_file(dir.join(APP_METADATA_CONFIG)).ok();
+            return Err(SetupError::Extract(e));
+        }
     }
     write_meta(&dir, ts, &metadata_paths);
     #[cfg(windows)]
     win::copy_runtime_broker(&dir);
     #[cfg(linux)]
     reader.configure_permission(&dir);
-    Some(dir.join(&reader.exe))
+    Ok(dir.join(&reader.exe))
+}
+
+/// The display name for messages: the executable the payload launches, without
+/// its extension, e.g. "jerinteDesk".
+fn app_display_name(exe: &str) -> String {
+    Path::new(&exe.replace('\\', "/"))
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.trim().to_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "RustDesk".to_owned())
+}
+
+fn setup_failure_message(app: &str, error: &SetupError) -> String {
+    format!(
+        "{app} 解压失败，没有启动。\n\
+         {error}\n\n\
+         请依次尝试：\n\
+         1. 退出正在运行的 {app}（包括屏幕右下角托盘里的图标），再运行一次本文件；\n\
+         2. 右键本文件，选择「以管理员身份运行」；\n\
+         3. 检查杀毒软件是否拦截或隔离了 {app} 的文件，加入信任后再试。\n\n\
+         {app} could not be unpacked and was not started.\n\
+         {error}\n\n\
+         Quit any running {app} (including its tray icon) and run this file again. If it \
+         still fails, right-click it and choose \"Run as administrator\", or check whether \
+         antivirus software blocked {app}'s files."
+    )
 }
 
 fn use_null_stdio() -> bool {
@@ -298,21 +343,38 @@ fn main() -> Result<(), String> {
 
     let mut ui = false;
     let reader = BinaryReader::new()?;
-    if let Some(exe) = setup(
+    let app = app_display_name(&reader.exe);
+    // Only a double-click gets a dialog: --silent-install and the other command
+    // lines run unattended, where a message box would wait for a click forever.
+    let interactive = args.is_empty();
+    match setup(
         reader,
         None,
         click_setup || args.contains(&"--silent-install".to_owned()),
         &args,
         &mut ui,
     ) {
-        if click_setup {
-            args = vec!["--install".to_owned()];
-        } else if quick_support {
-            args = vec!["--quick_support".to_owned()];
+        Ok(exe) => {
+            if click_setup {
+                args = vec!["--install".to_owned()];
+            } else if quick_support {
+                args = vec!["--quick_support".to_owned()];
+            }
+            execute(exe, args, ui);
+            Ok(())
         }
-        execute(exe, args, ui);
+        Err(e) => {
+            let message = setup_failure_message(&app, &e);
+            eprintln!("{}", message);
+            #[cfg(windows)]
+            if interactive {
+                win::show_error(&app, &message);
+            }
+            #[cfg(not(windows))]
+            let _ = interactive;
+            Err(e.to_string())
+        }
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -370,6 +432,23 @@ mod win {
         let _allow_err = std::fs::copy(src, &format!("{}\\{}", dir.to_string_lossy(), tgt));
     }
 
+    /// A blocking error dialog, in front of the setup animation.
+    pub(super) fn show_error(title: &str, message: &str) {
+        use winapi::um::winuser::{
+            MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (title, message) = (wide(title), wide(message));
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+
     /// Check if the executable is a Quick Support version.
     /// Note: This function must be kept in sync with `src/core_main.rs`.
     #[inline]
@@ -382,6 +461,72 @@ mod win {
 #[cfg(test)]
 mod meta_tests {
     use super::*;
+    use bin_reader::tests::{packed, scratch_dir};
+
+    fn reader(files: Vec<bin_reader::BinaryData>) -> BinaryReader {
+        BinaryReader {
+            files,
+            exe: "./jerinteDesk.exe".to_owned(),
+            package_paths: Vec::new(),
+        }
+    }
+
+    // A non-empty argument list keeps the Windows setup animation out of the test.
+    fn args() -> Vec<String> {
+        vec!["--test".to_owned()]
+    }
+
+    #[test]
+    fn a_complete_extraction_is_recorded_and_launched() {
+        let dir = scratch_dir("setup-ok");
+        let mut ui = false;
+        let exe = setup(
+            reader(vec![packed("./jerinteDesk.exe", b"exe"), packed("./librustdesk.dll", b"core")]),
+            Some(dir.clone()),
+            false,
+            &args(),
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(exe, dir.join("./jerinteDesk.exe"));
+        assert!(dir.join(APP_METADATA_CONFIG).is_file());
+    }
+
+    #[test]
+    fn a_failed_extraction_is_not_launched_and_not_trusted_next_time() {
+        let dir = scratch_dir("setup-fail");
+        // A previous run's record, which would let the next run skip the wipe.
+        std::fs::write(dir.join(APP_METADATA_CONFIG), "timestamp = 1\n").unwrap();
+        let mut broken = packed("./librustdesk.dll", b"core");
+        broken.raw = b"not brotli";
+        let mut ui = false;
+        let err = setup(
+            reader(vec![packed("./jerinteDesk.exe", b"exe"), broken]),
+            Some(dir.clone()),
+            false,
+            &args(),
+            &mut ui,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SetupError::Extract(_)));
+        assert!(!dir.join(APP_METADATA_CONFIG).exists());
+    }
+
+    #[test]
+    fn the_failure_message_names_the_app_the_file_and_what_to_do() {
+        let err = SetupError::Extract(bin_reader::ExtractError {
+            path: PathBuf::from(r"C:\Users\u\AppData\Local\jerintedesk\librustdesk.dll"),
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        });
+        let app = app_display_name("./jerinteDesk.exe");
+        assert_eq!(app, "jerinteDesk");
+        let message = setup_failure_message(&app, &err);
+        assert!(message.contains("jerinteDesk 解压失败"));
+        assert!(message.contains("librustdesk.dll"));
+        assert!(message.contains("以管理员身份运行"));
+        assert!(message.contains("Run as administrator"));
+        assert_eq!(app_display_name(""), "RustDesk");
+    }
 
     #[test]
     fn resolve_within_rejects_paths_that_escape() {

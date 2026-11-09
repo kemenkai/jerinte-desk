@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fs::{self},
     io::{Cursor, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 // The generic payload, shared by every customer and compiled in once per release.
@@ -200,37 +200,92 @@ fn read_resource(name: &str) -> Option<&'static [u8]> {
     }
 }
 
+/// A file of the payload that could not be put in place, and why.
+#[derive(Debug)]
+pub(crate) struct ExtractError {
+    pub path: PathBuf,
+    pub error: std::io::Error,
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
 impl BinaryData {
-    fn decompress(&self) -> Vec<u8> {
+    fn decompress(&self) -> std::io::Result<Vec<u8>> {
         let cursor = Cursor::new(self.raw);
         let mut decoder = brotli::Decompressor::new(cursor, BUF_SIZE);
         let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf).ok();
-        buf
+        decoder.read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
-    pub fn write_to_file(&self, prefix: &Path) {
+    fn md5_record(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.md5_code)
+    }
+
+    /// Puts this file under `prefix`, unless an identical copy is already there.
+    ///
+    /// Every failure is returned rather than ignored: an extraction that silently
+    /// left a file empty or half-written used to be launched anyway, and a 0-byte
+    /// librustdesk.dll then only surfaced as Windows' "bad image" error, or as an app
+    /// that does nothing on double-click, with no hint at the cause. The content is
+    /// checked against the recorded md5 before anything is written (a damaged
+    /// download), and written to a temporary file that replaces the old one only when
+    /// complete, so a write that fails half-way -- a file in use, an antivirus
+    /// blocking it, a full disk -- leaves the previous file as it was.
+    pub fn write_to_file(&self, prefix: &Path) -> Result<(), ExtractError> {
         let p = prefix.join(&self.path);
+        let fail = |error: std::io::Error| ExtractError {
+            path: p.clone(),
+            error,
+        };
         if let Some(parent) = p.parent() {
-            if !parent.exists() {
-                let _ = fs::create_dir_all(parent);
-            }
+            fs::create_dir_all(parent).map_err(fail)?;
         }
         if p.exists() {
             // check md5
-            let f = fs::read(p.clone()).unwrap_or_default();
+            let f = fs::read(&p).unwrap_or_default();
             let digest = format!("{:x}", md5::compute(&f));
-            let md5_record = String::from_utf8_lossy(self.md5_code);
+            let md5_record = self.md5_record();
             if digest == md5_record {
                 // same, skip this file
                 println!("skip {}", &self.path);
-                return;
+                return Ok(());
             } else {
                 println!("writing {}", p.display());
                 println!("{} -> {}", md5_record, digest)
             }
         }
-        let _ = fs::write(p, self.decompress());
+        let content = self.decompress().map_err(fail)?;
+        let digest = format!("{:x}", md5::compute(&content));
+        if digest != self.md5_record() {
+            return Err(fail(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the packaged copy is damaged (md5 {} instead of {})",
+                    digest,
+                    self.md5_record()
+                ),
+            )));
+        }
+        let mut tmp = p.clone().into_os_string();
+        tmp.push(".part");
+        let tmp = PathBuf::from(tmp);
+        if let Err(error) = fs::write(&tmp, &content) {
+            fs::remove_file(&tmp).ok();
+            return Err(fail(error));
+        }
+        // On Windows this is MoveFileExW(MOVEFILE_REPLACE_EXISTING): it fails, and
+        // leaves the old file, when that one is in use -- a DLL a running instance has
+        // loaded, say.
+        if let Err(error) = fs::rename(&tmp, &p) {
+            fs::remove_file(&tmp).ok();
+            return Err(fail(error));
+        }
+        Ok(())
     }
 }
 
@@ -253,7 +308,7 @@ impl BinaryReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Builds a blob in the same layout generate.py writes, so these tests pin the
@@ -277,6 +332,93 @@ mod tests {
         files
             .iter()
             .find(|file| normalize_path(&file.path) == normalize_path(path))
+    }
+
+    /// A payload entry the way generate.py makes one: brotli data, md5 of the original.
+    pub(crate) fn packed(path: &str, content: &[u8]) -> BinaryData {
+        let mut raw = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut raw, BUF_SIZE, 5, 22);
+            std::io::Write::write_all(&mut w, content).unwrap();
+        }
+        let md5 = format!("{:x}", md5::compute(content));
+        BinaryData {
+            md5_code: Box::leak(md5.into_bytes().into_boxed_slice()),
+            raw: Box::leak(raw.into_boxed_slice()),
+            path: path.to_owned(),
+        }
+    }
+
+    pub(crate) fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("portable-test-{}-{}", std::process::id(), name));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect()
+    }
+
+    #[test]
+    fn writes_a_new_file_completely() {
+        let dir = scratch_dir("new");
+        packed("./data/app.dll", b"core").write_to_file(&dir).unwrap();
+        assert_eq!(fs::read(dir.join("data/app.dll")).unwrap(), b"core");
+        assert!(leftovers(&dir.join("data")).is_empty());
+    }
+
+    #[test]
+    fn replaces_an_empty_file_and_skips_an_identical_one() {
+        let dir = scratch_dir("replace");
+        // What a failed extraction used to leave behind.
+        fs::write(dir.join("librustdesk.dll"), b"").unwrap();
+        let file = packed("./librustdesk.dll", b"core");
+        file.write_to_file(&dir).unwrap();
+        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"core");
+        file.write_to_file(&dir).unwrap();
+        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"core");
+        assert!(leftovers(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_damaged_payload_is_an_error_and_keeps_the_old_file() {
+        let dir = scratch_dir("damaged");
+        fs::write(dir.join("librustdesk.dll"), b"old").unwrap();
+        let mut file = packed("./librustdesk.dll", b"core");
+        file.raw = b"\xff\xff not brotli at all";
+        let err = file.write_to_file(&dir).unwrap_err();
+        assert!(err.path.ends_with("librustdesk.dll"));
+        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"old");
+        assert!(leftovers(&dir).is_empty());
+    }
+
+    #[test]
+    fn content_that_does_not_match_its_md5_is_not_written() {
+        let dir = scratch_dir("md5");
+        let mut file = packed("./librustdesk.dll", b"core");
+        file.md5_code = packed("x", b"something else").md5_code;
+        let err = file.write_to_file(&dir).unwrap_err();
+        assert_eq!(err.error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!dir.join("librustdesk.dll").exists());
+        assert!(leftovers(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_replaced_is_an_error_without_leftovers() {
+        let dir = scratch_dir("blocked");
+        // A directory where the file should go: the rename onto it fails, as it does
+        // on Windows for a DLL a running instance has loaded.
+        fs::create_dir_all(dir.join("librustdesk.dll").join("inside")).unwrap();
+        let err = packed("./librustdesk.dll", b"core").write_to_file(&dir).unwrap_err();
+        assert!(err.to_string().contains("librustdesk.dll"));
+        assert!(dir.join("librustdesk.dll").join("inside").is_dir());
+        assert!(leftovers(&dir).is_empty());
     }
 
     #[test]
