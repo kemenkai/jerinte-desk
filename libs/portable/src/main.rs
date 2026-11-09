@@ -38,7 +38,11 @@ fn app_dir_name(exe: &str) -> String {
 }
 
 fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
-    let Ok(app_metadata) = std::str::from_utf8(APP_METADATA) else {
+    is_timestamp_matches_with(APP_METADATA, dir, ts)
+}
+
+fn is_timestamp_matches_with(app_metadata: &[u8], dir: &Path, ts: &mut u64) -> bool {
+    let Ok(app_metadata) = std::str::from_utf8(app_metadata) else {
         return true;
     };
     for line in app_metadata.lines() {
@@ -154,27 +158,54 @@ fn remove_dropped_package_files(dir: &Path, current: &[String]) -> Vec<String> {
     remove_dropped_package_files_with(dir, current, |path| std::fs::remove_file(path))
 }
 
+/// Why the payload could not be unpacked; the app is not started then.
+#[derive(Debug)]
+enum SetupError {
+    /// This file itself is damaged, e.g. a download that stopped early.
+    Payload(String),
+    NoDataDir,
+    Extract(bin_reader::ExtractError),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupError::Payload(e) => write!(f, "this file is damaged ({}); download it again", e),
+            SetupError::NoDataDir => write!(f, "the local application data folder was not found"),
+            SetupError::Extract(e) => write!(f, "{}", e),
+        }
+    }
+}
+
 fn setup(
+    reader: BinaryReader,
+    dir: Option<PathBuf>,
+    clear: bool,
+    args: &Vec<String>,
+    ui: &mut bool,
+) -> Result<PathBuf, SetupError> {
+    setup_with(APP_METADATA, reader, dir, clear, args, ui)
+}
+
+fn setup_with(
+    app_metadata: &[u8],
     reader: BinaryReader,
     dir: Option<PathBuf>,
     clear: bool,
     _args: &Vec<String>,
     _ui: &mut bool,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, SetupError> {
     let dir = if let Some(dir) = dir {
         dir
     } else {
         // home dir
-        if let Some(dir) = dirs::data_local_dir() {
-            dir.join(app_dir_name(&reader.exe))
-        } else {
-            eprintln!("not found data local dir");
-            return None;
-        }
+        dirs::data_local_dir()
+            .map(|dir| dir.join(app_dir_name(&reader.exe)))
+            .ok_or(SetupError::NoDataDir)?
     };
 
     let mut ts = 0;
-    if clear || !is_timestamp_matches(&dir, &mut ts) {
+    if clear || !is_timestamp_matches_with(app_metadata, &dir, &mut ts) {
         #[cfg(windows)]
         if _args.is_empty() {
             *_ui = true;
@@ -182,17 +213,62 @@ fn setup(
         }
         std::fs::remove_dir_all(&dir).ok();
     }
+    bin_reader::remove_partial_files(&dir);
     let mut metadata_paths = reader.package_paths.clone();
     metadata_paths.extend(remove_dropped_package_files(&dir, &reader.package_paths));
     for file in reader.files.iter() {
-        file.write_to_file(&dir);
+        if let Err(e) = file.write_to_file(&dir) {
+            // A matching timestamp is what lets the next run trust this directory and
+            // skip the wipe; recorded as 0 it never matches, so the next run starts
+            // over from an empty directory. The file records stay, for the cleanup of
+            // dropped package files.
+            write_meta(&dir, 0, &metadata_paths);
+            return Err(SetupError::Extract(e));
+        }
     }
     write_meta(&dir, ts, &metadata_paths);
-    #[cfg(windows)]
+    // Not in tests: it runs taskkill on the privacy-mode helper.
+    #[cfg(all(windows, not(test)))]
     win::copy_runtime_broker(&dir);
     #[cfg(linux)]
     reader.configure_permission(&dir);
-    Some(dir.join(&reader.exe))
+    Ok(dir.join(&reader.exe))
+}
+
+/// The display name for messages: the executable the payload launches, without
+/// its extension, e.g. "jerinteDesk".
+fn app_display_name(exe: &str) -> String {
+    Path::new(&exe.replace('\\', "/"))
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.trim().to_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "RustDesk".to_owned())
+}
+
+/// The name to show when the payload cannot be read: this file's own name.
+fn current_exe_display_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|n| app_display_name(&n))
+        .unwrap_or_else(|| app_display_name(""))
+}
+
+fn setup_failure_message(app: &str, error: &SetupError) -> String {
+    format!(
+        "{app} 解压失败，没有启动。\n\
+         {error}\n\n\
+         请依次尝试：\n\
+         1. 退出正在运行的 {app}（包括屏幕右下角托盘里的图标），再运行一次本文件；\n\
+         2. 右键本文件，选择「以管理员身份运行」；\n\
+         3. 检查杀毒软件是否拦截或隔离了 {app} 的文件，加入信任后再试。\n\n\
+         {app} could not be unpacked and was not started.\n\
+         {error}\n\n\
+         Quit any running {app} (including its tray icon) and run this file again. If it \
+         still fails, right-click it and choose \"Run as administrator\", or check whether \
+         antivirus software blocked {app}'s files."
+    )
 }
 
 fn use_null_stdio() -> bool {
@@ -297,22 +373,60 @@ fn main() -> Result<(), String> {
     }
 
     let mut ui = false;
-    let reader = BinaryReader::new()?;
-    if let Some(exe) = setup(
-        reader,
-        None,
-        click_setup || args.contains(&"--silent-install".to_owned()),
-        &args,
-        &mut ui,
-    ) {
-        if click_setup {
-            args = vec!["--install".to_owned()];
-        } else if quick_support {
-            args = vec!["--quick_support".to_owned()];
+    // Only a double-click gets a dialog: --silent-install and the other command
+    // lines run unattended, where a message box would wait for a click forever.
+    // That includes --update, which the service starts in the user's session: when
+    // it fails the installed version is left as it was and keeps working, and the
+    // next update check tries again, so it fails quietly.
+    let interactive = args.is_empty();
+    let outcome = match BinaryReader::new() {
+        Err(e) => {
+            #[cfg(windows)]
+            let app = win::own_product_name().unwrap_or_else(current_exe_display_name);
+            #[cfg(not(windows))]
+            let app = current_exe_display_name();
+            Err((app, SetupError::Payload(e)))
         }
-        execute(exe, args, ui);
+        Ok(reader) => {
+            // The product name in this file's version resource is what users know
+            // the app as ("jerinteDesk"); the executable may keep RustDesk's name.
+            #[cfg(windows)]
+            let app = win::own_product_name().unwrap_or_else(|| app_display_name(&reader.exe));
+            #[cfg(not(windows))]
+            let app = app_display_name(&reader.exe);
+            setup(
+                reader,
+                None,
+                click_setup || args.contains(&"--silent-install".to_owned()),
+                &args,
+                &mut ui,
+            )
+            .map_err(|e| (app, e))
+        }
+    };
+    match outcome {
+        Ok(exe) => {
+            if click_setup {
+                args = vec!["--install".to_owned()];
+            } else if quick_support {
+                args = vec!["--quick_support".to_owned()];
+            }
+            execute(exe, args, ui);
+            Ok(())
+        }
+        Err((app, e)) => {
+            let message = setup_failure_message(&app, &e);
+            eprintln!("{}", message);
+            #[cfg(windows)]
+            if interactive {
+                ui::close();
+                win::show_error(&app, &message);
+            }
+            #[cfg(not(windows))]
+            let _ = interactive;
+            Err(e.to_string())
+        }
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -370,6 +484,69 @@ mod win {
         let _allow_err = std::fs::copy(src, &format!("{}\\{}", dir.to_string_lossy(), tgt));
     }
 
+    /// ProductName from this executable's version resource, e.g. "jerinteDesk".
+    pub(super) fn own_product_name() -> Option<String> {
+        use winapi::um::winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+        let path = std::env::current_exe().ok()?;
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let path = wide(&path.to_string_lossy());
+        unsafe {
+            let size = GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut());
+            if size == 0 {
+                return None;
+            }
+            let mut data = vec![0u8; size as usize];
+            if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr() as _) == 0 {
+                return None;
+            }
+            // The first language/code page pair names the string table to read.
+            let mut translation: winapi::shared::minwindef::LPVOID = std::ptr::null_mut();
+            let mut len = 0u32;
+            let key = wide("\\VarFileInfo\\Translation");
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut translation, &mut len) == 0
+                || len < 4
+                || translation.is_null()
+            {
+                return None;
+            }
+            let translation = translation as *const u16;
+            let (language, code_page) = (*translation, *translation.add(1));
+            let key = wide(&format!(
+                "\\StringFileInfo\\{:04x}{:04x}\\ProductName",
+                language, code_page
+            ));
+            let mut value: winapi::shared::minwindef::LPVOID = std::ptr::null_mut();
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut value, &mut len) == 0
+                || len == 0
+                || value.is_null()
+            {
+                return None;
+            }
+            // len counts UTF-16 units here, including the terminating null.
+            let name =
+                String::from_utf16_lossy(std::slice::from_raw_parts(value as *const u16, len as usize));
+            let name = name.trim_end_matches('\0').trim().to_owned();
+            (!name.is_empty()).then_some(name)
+        }
+    }
+
+    /// A blocking error dialog, in front of the setup animation.
+    pub(super) fn show_error(title: &str, message: &str) {
+        use winapi::um::winuser::{
+            MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (title, message) = (wide(title), wide(message));
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+
     /// Check if the executable is a Quick Support version.
     /// Note: This function must be kept in sync with `src/core_main.rs`.
     #[inline]
@@ -382,6 +559,82 @@ mod win {
 #[cfg(test)]
 mod meta_tests {
     use super::*;
+    use bin_reader::tests::{packed, scratch_dir};
+
+    fn reader(files: Vec<bin_reader::BinaryData>) -> BinaryReader {
+        BinaryReader {
+            files,
+            exe: "./jerinteDesk.exe".to_owned(),
+            package_paths: Vec::new(),
+        }
+    }
+
+    // A non-empty argument list keeps the Windows setup animation out of the test.
+    fn args() -> Vec<String> {
+        vec!["--test".to_owned()]
+    }
+
+    // What a release build embeds: the packer's build time.
+    const PACKER: &[u8] = b"timestamp = 42\n";
+
+    fn trusted_next_time(dir: &Path) -> bool {
+        is_timestamp_matches_with(PACKER, dir, &mut 0)
+    }
+
+    #[test]
+    fn a_complete_extraction_is_recorded_and_launched() {
+        let dir = scratch_dir("setup-ok");
+        let mut ui = false;
+        let exe = setup_with(
+            PACKER,
+            reader(vec![packed("./jerinteDesk.exe", b"exe"), packed("./librustdesk.dll", b"core")]),
+            Some(dir.clone()),
+            false,
+            &args(),
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(exe, dir.join("./jerinteDesk.exe"));
+        assert!(trusted_next_time(&dir));
+    }
+
+    #[test]
+    fn a_failed_extraction_is_not_launched_and_not_trusted_next_time() {
+        let dir = scratch_dir("setup-fail");
+        // A previous complete run of this very packer, so this run does not wipe the
+        // directory and gets to the files.
+        std::fs::write(dir.join(APP_METADATA_CONFIG), "timestamp = 42\n").unwrap();
+        assert!(trusted_next_time(&dir));
+        let mut broken = packed("./librustdesk.dll", b"core");
+        broken.raw = b"not brotli";
+        let mut ui = false;
+        let mut reader = reader(vec![packed("./jerinteDesk.exe", b"exe"), broken]);
+        reader.package_paths = vec!["./brand.png".to_owned()];
+        let err = setup_with(PACKER, reader, Some(dir.clone()), false, &args(), &mut ui)
+            .unwrap_err();
+        assert!(matches!(err, SetupError::Extract(_)));
+        // The next run wipes the directory and starts over...
+        assert!(!trusted_next_time(&dir));
+        // ...and the package's file records are kept, for the cleanup of files a later
+        // package drops (deleting meta.toml would have lost them).
+        assert_eq!(previous_package_files(&dir), vec!["./brand.png".to_owned()]);
+    }
+
+    #[test]
+    fn the_failure_message_names_the_app_the_file_and_what_to_do() {
+        let err = SetupError::Extract(bin_reader::ExtractError {
+            path: PathBuf::from(r"C:\Users\u\AppData\Local\jerintedesk\librustdesk.dll"),
+            error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        });
+        let app = app_display_name("./jerinteDesk.exe");
+        assert_eq!(app, "jerinteDesk");
+        let message = setup_failure_message(&app, &err);
+        assert!(message.contains("jerinteDesk 解压失败"));
+        assert!(message.contains("librustdesk.dll"));
+        assert!(message.contains("以管理员身份运行"));
+        assert!(message.contains("Run as administrator"));
+        assert_eq!(app_display_name(""), "RustDesk");
+    }
 
     #[test]
     fn resolve_within_rejects_paths_that_escape() {

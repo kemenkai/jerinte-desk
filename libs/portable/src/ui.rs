@@ -1,6 +1,11 @@
 use native_windows_gui as nwg;
 use nwg::NativeUi;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+// The animation runs on its own thread; close() ends it from the main thread.
+static UI_THREAD: AtomicU32 = AtomicU32::new(0);
+static CLOSED: AtomicBool = AtomicBool::new(false);
 
 const GIF_DATA: &[u8] = include_bytes!("./res/spin.gif");
 const LABEL_DATA: &[u8] = include_bytes!("./res/label.png");
@@ -215,12 +220,38 @@ mod basic_app_ui {
 }
 
 fn ui() -> Result<(), nwg::NwgError> {
+    UI_THREAD.store(
+        unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() },
+        Ordering::SeqCst,
+    );
+    if CLOSED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     nwg::init()?;
     let app = BasicApp::build_ui(Default::default())?;
+    // close() may have run while the window was being built, before this thread had
+    // a message queue to post to; returning drops, and so destroys, the window.
+    if CLOSED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     app.load_gif()?;
     app.start_timer();
     nwg::dispatch_thread_events();
     Ok(())
+}
+
+/// Ends the setup animation, before an error dialog that it would otherwise sit
+/// behind spinning, or take the keyboard focus from.
+pub fn close() {
+    CLOSED.store(true, Ordering::SeqCst);
+    let thread = UI_THREAD.load(Ordering::SeqCst);
+    if thread != 0 {
+        // dispatch_thread_events returns on WM_QUIT. Fails harmlessly when the
+        // thread has no message queue yet; the CLOSED check above covers that.
+        unsafe {
+            winapi::um::winuser::PostThreadMessageW(thread, winapi::um::winuser::WM_QUIT, 0, 0);
+        }
+    }
 }
 
 pub fn setup() {
