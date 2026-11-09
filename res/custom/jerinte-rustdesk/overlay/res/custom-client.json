@@ -1,0 +1,5 @@
+{
+  "extends": "jerinte",
+  "inherit-overlay": false,
+  "app-display-name": "RustDesk"
+}

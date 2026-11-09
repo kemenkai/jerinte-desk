@@ -10,19 +10,29 @@ if [[ ! "$variant" =~ ^[a-z0-9-]+$ || ! -d "res/custom/$variant/overlay" ]]; the
   exit 1
 fi
 # A variant may extend another one ("extends" in its custom-client.json): the base overlay goes
-# first, so the variant only carries what it changes.
-base="$(python3 -c '
+# first, so the variant only carries what it changes. With "inherit-overlay": false it takes the
+# base's settings only and none of its files, e.g. to keep RustDesk's own icons and logo: an
+# overlay can replace a file but not remove one the base adds.
+# A command substitution, not a process substitution: set -e stops on a bad config only here.
+parsed="$(python3 -c '
 import json, sys
-base = json.load(open(sys.argv[1], encoding="utf-8")).get("extends", "")
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+base, inherit = config.get("extends", ""), config.get("inherit-overlay", True)
 if not isinstance(base, str):
     sys.exit("res/custom-client.json: extends must name a variant")
-print(base)' "res/custom/$variant/overlay/res/custom-client.json")"
+if not isinstance(inherit, bool):
+    sys.exit("res/custom-client.json: inherit-overlay must be true or false")
+print(base or "-", "yes" if inherit else "no")' "res/custom/$variant/overlay/res/custom-client.json")"
+read -r base inherit <<< "$parsed"
+[[ "$base" == "-" ]] && base=""
 if [[ -n "$base" ]]; then
   if [[ ! "$base" =~ ^[a-z0-9-]+$ || "$base" == "$variant" || ! -d "res/custom/$base/overlay" ]]; then
     echo "::error::Unknown base variant $base"
     exit 1
   fi
-  cp -R "res/custom/$base/overlay/." .
+  if [[ "$inherit" == "yes" ]]; then
+    cp -R "res/custom/$base/overlay/." .
+  fi
 fi
 cp -R "res/custom/$variant/overlay/." .
 CUSTOM_BASE="$base" CUSTOM_VARIANT="$variant" python3 - <<'EOF'
@@ -85,7 +95,7 @@ if base:
     if "extends" in base_data:
         sys.exit(f"res/custom/{base}: a base variant cannot extend another one")
     base_data = merge(base_data, secrets.get(base, {}))
-    data = merge(base_data, {k: v for k, v in data.items() if k != "extends"})
+    data = merge(base_data, {k: v for k, v in data.items() if k not in ("extends", "inherit-overlay")})
 
 
 def unset(value, path=""):

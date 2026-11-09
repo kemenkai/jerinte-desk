@@ -13,7 +13,11 @@ res/custom/
       ...generated images...
   <variant extending another>/
     overlay/res/custom-client.json   "extends" plus the settings it changes; images come from the base
+                                     unless it sets "inherit-overlay": false
 ```
+
+Variants: `jerinte` (staff), `jerinte-customer` (customers' machines: incoming only), and
+`jerinte-rustdesk` (staff with RustDesk's name and look).
 
 ## Building
 
@@ -69,6 +73,10 @@ the one `custom.txt` carries once decoded:
   ports there and one outside through the public entry. A machine outside probes the intranet
   entry too, so it connects to whatever holds that address on its own network; only our ID
   server's signed key exchange counts as an answer, so that machine cannot take the entry over.
+- `inherit-overlay` (with `extends`, default `true`): `false` takes the base's settings and none of
+  its files. `jerinte-rustdesk` uses it to be `jerinte` in all but the look: RustDesk's own name,
+  icons and home page (no logo), since an overlay can replace a base's file but not remove one the
+  base adds (`flutter/assets/logo_*.png`). Its settings come from `jerinte`, secrets included.
 - `server-entries` (an override): several ways to the same servers as a JSON list of
   `{"name", "id", "relay"}`, in order of preference. The service registers through the first that
   answers, else the quickest (`src/server_entries.rs`), and they take the place of
