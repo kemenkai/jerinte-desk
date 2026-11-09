@@ -25,6 +25,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # libs/portable is a member of the root workspace, which cargo loads whole;
+          # libs/scrap and others depend on the hbb_common submodule.
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           # what flutter-build.yml builds the Windows packer with
