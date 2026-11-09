@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <vector>
 
 #include "win32_desktop.h"
 #include "flutter_window.h"
@@ -21,6 +22,44 @@ const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
 
 const wchar_t* getWindowClassName();
 
+#pragma comment(lib, "version.lib")
+
+// ProductName from this executable's version resource ("jerinteDesk" for our builds,
+// whose executable keeps RustDesk's name), or "" when it has none.
+static std::wstring OwnProductName()
+{
+  wchar_t path[MAX_PATH] = {0};
+  if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+    return L"";
+  }
+  const DWORD size = GetFileVersionInfoSizeW(path, nullptr);
+  if (size == 0) {
+    return L"";
+  }
+  std::vector<BYTE> data(size);
+  if (!GetFileVersionInfoW(path, 0, size, data.data())) {
+    return L"";
+  }
+  // The first language/code page pair names the string table to read.
+  WORD* translation = nullptr;
+  UINT bytes = 0;
+  if (!VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation",
+                      reinterpret_cast<LPVOID*>(&translation), &bytes) ||
+      bytes < 2 * sizeof(WORD)) {
+    return L"";
+  }
+  wchar_t key[64] = {0};
+  swprintf_s(key, L"\\StringFileInfo\\%04x%04x\\ProductName",
+             static_cast<unsigned int>(translation[0]), static_cast<unsigned int>(translation[1]));
+  wchar_t* value = nullptr;
+  UINT length = 0;
+  if (!VerQueryValueW(data.data(), key, reinterpret_cast<LPVOID*>(&value), &length) ||
+      length == 0 || value == nullptr) {
+    return L"";
+  }
+  return std::wstring(value);
+}
+
 // Without librustdesk.dll the app can do nothing, and a double-click used to end in
 // silence: an antivirus that quarantined the DLL, or an install that left it empty,
 // looked like an app that does not react. Only launches with someone in front of
@@ -29,11 +68,14 @@ const wchar_t* getWindowClassName();
 // box would wait forever with nobody to click it.
 static void ShowCoreLoadFailure(DWORD error)
 {
-  wchar_t path[MAX_PATH] = {0};
-  GetModuleFileNameW(nullptr, path, MAX_PATH);
-  std::wstring app(path);
-  app = app.substr(app.find_last_of(L"\\/") + 1);
-  app = app.substr(0, app.find_last_of(L'.'));
+  std::wstring app = OwnProductName();
+  if (app.empty()) {
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    app = path;
+    app = app.substr(app.find_last_of(L"\\/") + 1);
+    app = app.substr(0, app.find_last_of(L'.'));
+  }
   if (app.empty()) {
     app = L"RustDesk";
   }

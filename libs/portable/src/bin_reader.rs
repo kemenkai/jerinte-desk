@@ -239,7 +239,10 @@ impl BinaryData {
     /// file that cannot be removed after a failure is swept by the next run
     /// (`remove_partial_files`).
     pub fn write_to_file(&self, prefix: &Path) -> Result<(), ExtractError> {
-        let p = prefix.join(&self.path);
+        // Payload paths start with "./", which joined as is shows up in the error
+        // message as a stray ".\\" component.
+        let relative = self.path.trim_start_matches("./").trim_start_matches(".\\");
+        let p = prefix.join(relative);
         let fail = |error: std::io::Error| ExtractError {
             path: p.clone(),
             error,
@@ -458,7 +461,7 @@ pub(crate) mod tests {
         fs::write(dir.join("librustdesk.dll"), b"old").unwrap();
         // Something in the way of the temporary file: the write fails before the old
         // file is touched (writing in place would have truncated it).
-        let tmp = partial_path(&dir.join("./librustdesk.dll"), std::process::id());
+        let tmp = partial_path(&dir.join("librustdesk.dll"), std::process::id());
         fs::create_dir_all(&tmp).unwrap();
         packed("./librustdesk.dll", b"core").write_to_file(&dir).unwrap_err();
         assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"old");

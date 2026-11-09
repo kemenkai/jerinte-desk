@@ -380,8 +380,19 @@ fn main() -> Result<(), String> {
     // next update check tries again, so it fails quietly.
     let interactive = args.is_empty();
     let outcome = match BinaryReader::new() {
-        Err(e) => Err((current_exe_display_name(), SetupError::Payload(e))),
+        Err(e) => {
+            #[cfg(windows)]
+            let app = win::own_product_name().unwrap_or_else(current_exe_display_name);
+            #[cfg(not(windows))]
+            let app = current_exe_display_name();
+            Err((app, SetupError::Payload(e)))
+        }
         Ok(reader) => {
+            // The product name in this file's version resource is what users know
+            // the app as ("jerinteDesk"); the executable may keep RustDesk's name.
+            #[cfg(windows)]
+            let app = win::own_product_name().unwrap_or_else(|| app_display_name(&reader.exe));
+            #[cfg(not(windows))]
             let app = app_display_name(&reader.exe);
             setup(
                 reader,
@@ -471,6 +482,48 @@ mod win {
             .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
             .output();
         let _allow_err = std::fs::copy(src, &format!("{}\\{}", dir.to_string_lossy(), tgt));
+    }
+
+    /// ProductName from this executable's version resource, e.g. "jerinteDesk".
+    pub(super) fn own_product_name() -> Option<String> {
+        use winapi::um::winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+        let path = std::env::current_exe().ok()?;
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let path = wide(&path.to_string_lossy());
+        unsafe {
+            let size = GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut());
+            if size == 0 {
+                return None;
+            }
+            let mut data = vec![0u8; size as usize];
+            if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr() as _) == 0 {
+                return None;
+            }
+            // The first language/code page pair names the string table to read.
+            let mut translation: *mut u16 = std::ptr::null_mut();
+            let mut len = 0u32;
+            let key = wide("\\VarFileInfo\\Translation");
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut translation as *mut _ as _, &mut len) == 0
+                || len < 4
+            {
+                return None;
+            }
+            let (language, code_page) = (*translation, *translation.add(1));
+            let key = wide(&format!(
+                "\\StringFileInfo\\{:04x}{:04x}\\ProductName",
+                language, code_page
+            ));
+            let mut value: *mut u16 = std::ptr::null_mut();
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut value as *mut _ as _, &mut len) == 0
+                || len == 0
+                || value.is_null()
+            {
+                return None;
+            }
+            let name = String::from_utf16_lossy(std::slice::from_raw_parts(value, len as usize));
+            let name = name.trim_end_matches('\0').trim().to_owned();
+            (!name.is_empty()).then_some(name)
+        }
     }
 
     /// A blocking error dialog, in front of the setup animation.
