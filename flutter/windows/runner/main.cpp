@@ -23,9 +23,10 @@ const wchar_t* getWindowClassName();
 
 // Without librustdesk.dll the app can do nothing, and a double-click used to end in
 // silence: an antivirus that quarantined the DLL, or an install that left it empty,
-// looked like an app that does not react. Only a plain launch gets this dialog --
-// the service, tray and connection-manager processes run with arguments, some in
-// session 0, where a message box would wait forever with nobody to click it.
+// looked like an app that does not react. Only launches with someone in front of
+// them get this dialog (see IsInteractiveLaunch); the service, tray and
+// connection-manager processes run unattended, some in session 0, where a message
+// box would wait forever with nobody to click it.
 static void ShowCoreLoadFailure(DWORD error)
 {
   wchar_t path[MAX_PATH] = {0};
@@ -62,6 +63,22 @@ static void ShowCoreLoadFailure(DWORD error)
               MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
 }
 
+// A double-click on the app (no arguments), on the installer (the packer starts the
+// app with --install) or on a quick-support build (--quick_support), or a link
+// opened from a browser (scheme://...).
+static bool IsInteractiveLaunch(const wchar_t* command_line)
+{
+  std::wstring args = command_line ? command_line : L"";
+  const size_t start = args.find_first_not_of(L" \t\"");
+  if (start == std::wstring::npos) {
+    return true;
+  }
+  const size_t end = args.find_first_of(L" \t\"", start);
+  const std::wstring first = args.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+  return first == L"--install" || first == L"--quick_support" ||
+         first.find(L"://") != std::wstring::npos;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
@@ -73,8 +90,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   {
     const DWORD error = GetLastError();
     std::cout << "Failed to load librustdesk.dll, error " << error << "." << std::endl;
-    std::wstring args = command_line ? command_line : L"";
-    if (args.find_first_not_of(L" \t") == std::wstring::npos) {
+    if (IsInteractiveLaunch(command_line)) {
       ShowCoreLoadFailure(error);
     }
     return EXIT_FAILURE;

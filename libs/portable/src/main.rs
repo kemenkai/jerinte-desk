@@ -38,7 +38,11 @@ fn app_dir_name(exe: &str) -> String {
 }
 
 fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
-    let Ok(app_metadata) = std::str::from_utf8(APP_METADATA) else {
+    is_timestamp_matches_with(APP_METADATA, dir, ts)
+}
+
+fn is_timestamp_matches_with(app_metadata: &[u8], dir: &Path, ts: &mut u64) -> bool {
+    let Ok(app_metadata) = std::str::from_utf8(app_metadata) else {
         return true;
     };
     for line in app_metadata.lines() {
@@ -157,6 +161,8 @@ fn remove_dropped_package_files(dir: &Path, current: &[String]) -> Vec<String> {
 /// Why the payload could not be unpacked; the app is not started then.
 #[derive(Debug)]
 enum SetupError {
+    /// This file itself is damaged, e.g. a download that stopped early.
+    Payload(String),
     NoDataDir,
     Extract(bin_reader::ExtractError),
 }
@@ -164,6 +170,7 @@ enum SetupError {
 impl std::fmt::Display for SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SetupError::Payload(e) => write!(f, "this file is damaged ({}); download it again", e),
             SetupError::NoDataDir => write!(f, "the local application data folder was not found"),
             SetupError::Extract(e) => write!(f, "{}", e),
         }
@@ -171,6 +178,17 @@ impl std::fmt::Display for SetupError {
 }
 
 fn setup(
+    reader: BinaryReader,
+    dir: Option<PathBuf>,
+    clear: bool,
+    args: &Vec<String>,
+    ui: &mut bool,
+) -> Result<PathBuf, SetupError> {
+    setup_with(APP_METADATA, reader, dir, clear, args, ui)
+}
+
+fn setup_with(
+    app_metadata: &[u8],
     reader: BinaryReader,
     dir: Option<PathBuf>,
     clear: bool,
@@ -187,7 +205,7 @@ fn setup(
     };
 
     let mut ts = 0;
-    if clear || !is_timestamp_matches(&dir, &mut ts) {
+    if clear || !is_timestamp_matches_with(app_metadata, &dir, &mut ts) {
         #[cfg(windows)]
         if _args.is_empty() {
             *_ui = true;
@@ -195,18 +213,22 @@ fn setup(
         }
         std::fs::remove_dir_all(&dir).ok();
     }
+    bin_reader::remove_partial_files(&dir);
     let mut metadata_paths = reader.package_paths.clone();
     metadata_paths.extend(remove_dropped_package_files(&dir, &reader.package_paths));
     for file in reader.files.iter() {
         if let Err(e) = file.write_to_file(&dir) {
-            // meta.toml is what lets the next run trust this directory and skip the
-            // wipe; without it the next run starts over from an empty directory.
-            std::fs::remove_file(dir.join(APP_METADATA_CONFIG)).ok();
+            // A matching timestamp is what lets the next run trust this directory and
+            // skip the wipe; recorded as 0 it never matches, so the next run starts
+            // over from an empty directory. The file records stay, for the cleanup of
+            // dropped package files.
+            write_meta(&dir, 0, &metadata_paths);
             return Err(SetupError::Extract(e));
         }
     }
     write_meta(&dir, ts, &metadata_paths);
-    #[cfg(windows)]
+    // Not in tests: it runs taskkill on the privacy-mode helper.
+    #[cfg(all(windows, not(test)))]
     win::copy_runtime_broker(&dir);
     #[cfg(linux)]
     reader.configure_permission(&dir);
@@ -222,6 +244,15 @@ fn app_display_name(exe: &str) -> String {
         .map(|stem| stem.trim().to_owned())
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "RustDesk".to_owned())
+}
+
+/// The name to show when the payload cannot be read: this file's own name.
+fn current_exe_display_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|n| app_display_name(&n))
+        .unwrap_or_else(|| app_display_name(""))
 }
 
 fn setup_failure_message(app: &str, error: &SetupError) -> String {
@@ -342,18 +373,27 @@ fn main() -> Result<(), String> {
     }
 
     let mut ui = false;
-    let reader = BinaryReader::new()?;
-    let app = app_display_name(&reader.exe);
     // Only a double-click gets a dialog: --silent-install and the other command
     // lines run unattended, where a message box would wait for a click forever.
+    // That includes --update, which the service starts in the user's session: when
+    // it fails the installed version is left as it was and keeps working, and the
+    // next update check tries again, so it fails quietly.
     let interactive = args.is_empty();
-    match setup(
-        reader,
-        None,
-        click_setup || args.contains(&"--silent-install".to_owned()),
-        &args,
-        &mut ui,
-    ) {
+    let outcome = match BinaryReader::new() {
+        Err(e) => Err((current_exe_display_name(), SetupError::Payload(e))),
+        Ok(reader) => {
+            let app = app_display_name(&reader.exe);
+            setup(
+                reader,
+                None,
+                click_setup || args.contains(&"--silent-install".to_owned()),
+                &args,
+                &mut ui,
+            )
+            .map_err(|e| (app, e))
+        }
+    };
+    match outcome {
         Ok(exe) => {
             if click_setup {
                 args = vec!["--install".to_owned()];
@@ -363,11 +403,12 @@ fn main() -> Result<(), String> {
             execute(exe, args, ui);
             Ok(())
         }
-        Err(e) => {
+        Err((app, e)) => {
             let message = setup_failure_message(&app, &e);
             eprintln!("{}", message);
             #[cfg(windows)]
             if interactive {
+                ui::close();
                 win::show_error(&app, &message);
             }
             #[cfg(not(windows))]
@@ -476,11 +517,19 @@ mod meta_tests {
         vec!["--test".to_owned()]
     }
 
+    // What a release build embeds: the packer's build time.
+    const PACKER: &[u8] = b"timestamp = 42\n";
+
+    fn trusted_next_time(dir: &Path) -> bool {
+        is_timestamp_matches_with(PACKER, dir, &mut 0)
+    }
+
     #[test]
     fn a_complete_extraction_is_recorded_and_launched() {
         let dir = scratch_dir("setup-ok");
         let mut ui = false;
-        let exe = setup(
+        let exe = setup_with(
+            PACKER,
             reader(vec![packed("./jerinteDesk.exe", b"exe"), packed("./librustdesk.dll", b"core")]),
             Some(dir.clone()),
             false,
@@ -489,27 +538,29 @@ mod meta_tests {
         )
         .unwrap();
         assert_eq!(exe, dir.join("./jerinteDesk.exe"));
-        assert!(dir.join(APP_METADATA_CONFIG).is_file());
+        assert!(trusted_next_time(&dir));
     }
 
     #[test]
     fn a_failed_extraction_is_not_launched_and_not_trusted_next_time() {
         let dir = scratch_dir("setup-fail");
-        // A previous run's record, which would let the next run skip the wipe.
-        std::fs::write(dir.join(APP_METADATA_CONFIG), "timestamp = 1\n").unwrap();
+        // A previous complete run of this very packer, so this run does not wipe the
+        // directory and gets to the files.
+        std::fs::write(dir.join(APP_METADATA_CONFIG), "timestamp = 42\n").unwrap();
+        assert!(trusted_next_time(&dir));
         let mut broken = packed("./librustdesk.dll", b"core");
         broken.raw = b"not brotli";
         let mut ui = false;
-        let err = setup(
-            reader(vec![packed("./jerinteDesk.exe", b"exe"), broken]),
-            Some(dir.clone()),
-            false,
-            &args(),
-            &mut ui,
-        )
-        .unwrap_err();
+        let mut reader = reader(vec![packed("./jerinteDesk.exe", b"exe"), broken]);
+        reader.package_paths = vec!["./brand.png".to_owned()];
+        let err = setup_with(PACKER, reader, Some(dir.clone()), false, &args(), &mut ui)
+            .unwrap_err();
         assert!(matches!(err, SetupError::Extract(_)));
-        assert!(!dir.join(APP_METADATA_CONFIG).exists());
+        // The next run wipes the directory and starts over...
+        assert!(!trusted_next_time(&dir));
+        // ...and the package's file records are kept, for the cleanup of files a later
+        // package drops (deleting meta.toml would have lost them).
+        assert_eq!(previous_package_files(&dir), vec!["./brand.png".to_owned()]);
     }
 
     #[test]

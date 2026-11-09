@@ -235,7 +235,9 @@ impl BinaryData {
     /// checked against the recorded md5 before anything is written (a damaged
     /// download), and written to a temporary file that replaces the old one only when
     /// complete, so a write that fails half-way -- a file in use, an antivirus
-    /// blocking it, a full disk -- leaves the previous file as it was.
+    /// blocking it, a full disk -- leaves the previous file as it was. A temporary
+    /// file that cannot be removed after a failure is swept by the next run
+    /// (`remove_partial_files`).
     pub fn write_to_file(&self, prefix: &Path) -> Result<(), ExtractError> {
         let p = prefix.join(&self.path);
         let fail = |error: std::io::Error| ExtractError {
@@ -271,21 +273,77 @@ impl BinaryData {
                 ),
             )));
         }
-        let mut tmp = p.clone().into_os_string();
-        tmp.push(".part");
-        let tmp = PathBuf::from(tmp);
+        // Named after this process, so that two packers started at once (a double
+        // double-click) never write into each other's temporary file.
+        let tmp = partial_path(&p, std::process::id());
         if let Err(error) = fs::write(&tmp, &content) {
             fs::remove_file(&tmp).ok();
             return Err(fail(error));
         }
         // On Windows this is MoveFileExW(MOVEFILE_REPLACE_EXISTING): it fails, and
-        // leaves the old file, when that one is in use -- a DLL a running instance has
-        // loaded, say.
-        if let Err(error) = fs::rename(&tmp, &p) {
+        // leaves the old file, while the old one is open -- for good when a running
+        // instance has loaded the DLL, for a moment when an antivirus scans the file
+        // just written. Writing in place, the old code got through the latter; so the
+        // transient errors are retried for about two seconds before giving up.
+        if let Err(error) = retry_transient(|| fs::rename(&tmp, &p)) {
             fs::remove_file(&tmp).ok();
             return Err(fail(error));
         }
         Ok(())
+    }
+}
+
+const PARTIAL_SUFFIX: &str = ".part";
+
+fn partial_path(target: &Path, pid: u32) -> PathBuf {
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(format!(".{}{}", pid, PARTIAL_SUFFIX));
+    PathBuf::from(tmp)
+}
+
+/// Sharing and lock violations, and the access denial a file still open for
+/// deletion or under a scan gives: what an antivirus or indexer holding a file for
+/// a moment looks like (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION,
+/// ERROR_LOCK_VIOLATION).
+fn is_transient(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+fn retry_transient<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    // 10 + 20 + 40 + ... capped at 400 ms: about two seconds in all.
+    let mut delay = std::time::Duration::from_millis(10);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match op() {
+            Err(error) if is_transient(&error) && waited < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(delay);
+                waited += delay;
+                delay = (delay * 2).min(std::time::Duration::from_millis(400));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Removes the temporary files a previous run could not clean up, e.g. when it was
+/// killed between writing one and putting it in place.
+pub(crate) fn remove_partial_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => remove_partial_files(&path),
+            Ok(t) if t.is_file() => {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(PARTIAL_SUFFIX) {
+                    fs::remove_file(&path).ok();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -374,16 +432,76 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replaces_an_empty_file_and_skips_an_identical_one() {
+    fn replaces_an_empty_file() {
         let dir = scratch_dir("replace");
         // What a failed extraction used to leave behind.
         fs::write(dir.join("librustdesk.dll"), b"").unwrap();
-        let file = packed("./librustdesk.dll", b"core");
-        file.write_to_file(&dir).unwrap();
-        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"core");
-        file.write_to_file(&dir).unwrap();
+        packed("./librustdesk.dll", b"core").write_to_file(&dir).unwrap();
         assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"core");
         assert!(leftovers(&dir).is_empty());
+    }
+
+    #[test]
+    fn an_identical_file_is_skipped_without_unpacking() {
+        let dir = scratch_dir("skip");
+        fs::write(dir.join("librustdesk.dll"), b"core").unwrap();
+        // Undecodable data: only a skip can succeed.
+        let mut file = packed("./librustdesk.dll", b"core");
+        file.raw = b"not brotli";
+        file.write_to_file(&dir).unwrap();
+        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"core");
+    }
+
+    #[test]
+    fn a_write_that_fails_keeps_the_old_file() {
+        let dir = scratch_dir("halfway");
+        fs::write(dir.join("librustdesk.dll"), b"old").unwrap();
+        // Something in the way of the temporary file: the write fails before the old
+        // file is touched (writing in place would have truncated it).
+        let tmp = partial_path(&dir.join("./librustdesk.dll"), std::process::id());
+        fs::create_dir_all(&tmp).unwrap();
+        packed("./librustdesk.dll", b"core").write_to_file(&dir).unwrap_err();
+        assert_eq!(fs::read(dir.join("librustdesk.dll")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn leftover_partial_files_are_swept() {
+        let dir = scratch_dir("sweep");
+        fs::create_dir_all(dir.join("data")).unwrap();
+        fs::write(dir.join("data").join("app.dll.4242.part"), b"x").unwrap();
+        fs::write(dir.join("librustdesk.dll.7.part"), b"x").unwrap();
+        fs::write(dir.join("librustdesk.dll"), b"core").unwrap();
+        remove_partial_files(&dir);
+        assert!(!dir.join("data").join("app.dll.4242.part").exists());
+        assert!(!dir.join("librustdesk.dll.7.part").exists());
+        assert!(dir.join("librustdesk.dll").exists());
+    }
+
+    #[test]
+    fn only_windows_sharing_errors_are_retried() {
+        let mut calls = 0;
+        let result = retry_transient(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        });
+        if cfg!(windows) {
+            assert!(result.is_ok());
+            assert_eq!(calls, 3);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_transient(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
