@@ -500,27 +500,31 @@ mod win {
                 return None;
             }
             // The first language/code page pair names the string table to read.
-            let mut translation: *mut u16 = std::ptr::null_mut();
+            let mut translation: winapi::shared::minwindef::LPVOID = std::ptr::null_mut();
             let mut len = 0u32;
             let key = wide("\\VarFileInfo\\Translation");
-            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut translation as *mut _ as _, &mut len) == 0
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut translation, &mut len) == 0
                 || len < 4
+                || translation.is_null()
             {
                 return None;
             }
+            let translation = translation as *const u16;
             let (language, code_page) = (*translation, *translation.add(1));
             let key = wide(&format!(
                 "\\StringFileInfo\\{:04x}{:04x}\\ProductName",
                 language, code_page
             ));
-            let mut value: *mut u16 = std::ptr::null_mut();
-            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut value as *mut _ as _, &mut len) == 0
+            let mut value: winapi::shared::minwindef::LPVOID = std::ptr::null_mut();
+            if VerQueryValueW(data.as_ptr() as _, key.as_ptr(), &mut value, &mut len) == 0
                 || len == 0
                 || value.is_null()
             {
                 return None;
             }
-            let name = String::from_utf16_lossy(std::slice::from_raw_parts(value, len as usize));
+            // len counts UTF-16 units here, including the terminating null.
+            let name =
+                String::from_utf16_lossy(std::slice::from_raw_parts(value as *const u16, len as usize));
             let name = name.trim_end_matches('\0').trim().to_owned();
             (!name.is_empty()).then_some(name)
         }
