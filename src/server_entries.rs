@@ -539,17 +539,23 @@ fn probe_timeout(id: &str) -> Duration {
     }
 }
 
+/// The brackets around an IPv6 address. A function, not a char array: the toolchain of the 32-bit
+/// Windows 7 build cannot trim with an array pattern from both ends.
+fn is_bracket(c: char) -> bool {
+    c == '[' || c == ']'
+}
+
 /// The host and port of an ID server given as `host:port` or as a WebSocket URL.
 fn host_port(id: &str) -> Option<(String, u16)> {
     if hbb_common::websocket::is_ws_endpoint(id) {
         let url = url::Url::parse(id).ok()?;
-        let host = url.host_str()?.trim_matches(['[', ']']).to_owned();
+        let host = url.host_str()?.trim_matches(is_bracket).to_owned();
         return Some((host, url.port_or_known_default()?));
     }
     let (host, port) =
         socket_client::split_host_port(socket_client::check_port(id, RENDEZVOUS_PORT))?;
     Some((
-        host.trim_matches(['[', ']']).to_owned(),
+        host.trim_matches(is_bracket).to_owned(),
         u16::try_from(port).ok()?,
     ))
 }
