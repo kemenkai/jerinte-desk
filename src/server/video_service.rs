@@ -72,6 +72,10 @@ const DXGI_RECOVERY_LIMIT: usize = 3;
 const DXGI_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const DXGI_RECOVERY_FRAME_GRACE: Duration = Duration::from_secs(2);
+/// The attempt a restart after a change of our virtual displays counts as: none, counted ones
+/// starting at 1.
+#[cfg(windows)]
+const LAYOUT_CHANGE: usize = 0;
 
 #[cfg(windows)]
 struct DxgiRecoveryState {
@@ -108,6 +112,13 @@ impl DxgiRecoveryState {
         self.attempts += 1;
         self.restart_pending = true;
         Some(self.attempts)
+    }
+
+    /// A restart for an access lost through a change of our virtual displays: not counted
+    /// (`LAYOUT_CHANGE`), the replacement capturer still given time for its first frame.
+    fn restart_after_layout_change(&mut self) -> usize {
+        self.restart_pending = true;
+        LAYOUT_CHANGE
     }
 
     fn take_restart_pending(&mut self) -> bool {
@@ -629,6 +640,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     #[cfg(windows)]
     let dxgi_recovery_state = vs.dxgi_recovery_state.clone();
     let sp = vs.sp;
+    // Not while one of our virtual displays is being plugged in, resized or removed: a capturer
+    // made on a layout half changed loses its access again as the change goes on. Bounded, as the
+    // settling is (`crate::vdisplay::layout_settling`).
+    #[cfg(windows)]
+    while vs.source.is_monitor() && crate::vdisplay::layout_settling() && sp.ok() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Read before the capturer is made: a change of ours starting any later shows in it.
+    #[cfg(windows)]
+    let made_at_layout = crate::vdisplay::layout_generation();
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
     #[cfg(windows)]
     // ACCESS_LOST marks the next successful capturer creation as a recovery. This timestamp is
@@ -967,7 +988,14 @@ fn run(vs: VideoService) -> ResultType<()> {
                 #[cfg(windows)]
                 // The display-change check can restart capture before error handling below.
                 let recovery_attempt = if !c.is_gdi() && err.kind() == ConnectionReset {
-                    dxgi_recovery_state.lock().unwrap().next_attempt()
+                    let mut state = dxgi_recovery_state.lock().unwrap();
+                    if crate::vdisplay::layout_generation() != made_at_layout {
+                        // The layout changed by our doing since this capturer was made: the access
+                        // lost comes of that, not of the capture.
+                        Some(state.restart_after_layout_change())
+                    } else {
+                        state.next_attempt()
+                    }
                 } else {
                     None
                 };
@@ -981,9 +1009,15 @@ fn run(vs: VideoService) -> ResultType<()> {
                 if !c.is_gdi() {
                     if err.kind() == ConnectionReset {
                         if let Some(attempt) = recovery_attempt {
-                            log::debug!(
-                                "dxgi access lost, restart capture: attempt {attempt}, error: {err:?}"
-                            );
+                            if attempt == LAYOUT_CHANGE {
+                                log::debug!(
+                                    "dxgi access lost through a change of our virtual displays, restart capture, not counted: {err:?}"
+                                );
+                            } else {
+                                log::debug!(
+                                    "dxgi access lost, restart capture: attempt {attempt}, error: {err:?}"
+                                );
+                            }
                             bail!("SWITCH");
                         }
                         log::warn!(

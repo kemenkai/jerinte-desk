@@ -295,6 +295,16 @@ fn shown_again(name: &str) -> bool {
     Layout::now().map_or(false, |l| plan::others_shown(&l.views(), name))
 }
 
+/// Runs `change`, a change of the layout `maintain` makes by itself, outside the calls the manager
+/// marks: the layout's generation moves on around it all the same, so capture errors that come of
+/// it do not use up DXGI's recovery budget (`crate::vdisplay::layout_generation`).
+fn changing_layout<T>(change: impl FnOnce() -> T) -> T {
+    crate::vdisplay::layout_changed();
+    let result = change();
+    crate::vdisplay::layout_changed();
+    result
+}
+
 /// Whether there is a display to show but ours: one with a monitor, not of the amyuni driver.
 fn others_there() -> bool {
     display::outputs()
@@ -453,7 +463,7 @@ impl Amyuni {
                 log::warn!("The person at this device took the desktop back");
                 self.why = None;
                 // Ctrl+P stays pressed should this fail: given back at the next look.
-                if let Err(e) = self.give_back(name) {
+                if let Err(e) = changing_layout(|| self.give_back(name)) {
                     log::error!("{}", e);
                 }
             }
@@ -462,20 +472,20 @@ impl Amyuni {
                 if let Err(e) = hold_input() {
                     log::error!("Failed to hold local input, giving the desktop back: {}", e);
                     self.why = Some(INPUT_LOST.to_owned());
-                    if let Err(e) = self.give_back(name) {
+                    if let Err(e) = changing_layout(|| self.give_back(name)) {
                         log::error!("{}", e);
                     }
                 }
             }
             Look::Moved => {
                 log::warn!("The desktop taken over was laid out anew; taking it over again");
-                let retake = self.retake(name);
+                let retake = changing_layout(|| self.retake(name));
                 let slipped = self.taken.as_mut().map_or(false, |t| t.slips.after(retake));
                 if slipped {
                     log::error!("The desktop could not be kept taken over; its display goes");
                     // Word for its session should the display stay, given back.
                     self.why = Some(NOT_KEPT.to_owned());
-                    match self.plug_out(name) {
+                    match changing_layout(|| self.plug_out(name)) {
                         Ok(()) => return vec![name.to_owned()],
                         Err(e) => log::error!("{}", e),
                     }

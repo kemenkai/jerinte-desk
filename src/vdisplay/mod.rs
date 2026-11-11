@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
@@ -113,6 +113,8 @@ static PUBLISHED: RwLock<Published> = RwLock::new(Published {
     changing: None,
     waiting: Vec::new(),
 });
+// See `layout_generation`.
+static LAYOUT_GENERATION: AtomicU64 = AtomicU64::new(0);
 // The nested-session displays, for input routing. Read on the input path for every event, so it
 // is kept apart from `PUBLISHED` and read without blocking the manager.
 static NESTED: RwLock<Vec<NestedTarget>> = RwLock::new(Vec::new());
@@ -328,6 +330,20 @@ pub fn resize(owner: Owner, name: &str, width: i32, height: i32) -> bool {
 /// came. Plugging a display in or out then never renumbers a physical display.
 pub fn stable_order<T>(displays: Vec<T>, name: impl Fn(&T) -> String) -> Vec<T> {
     stable_order_by(&PUBLISHED.read().unwrap().names, displays, name)
+}
+
+/// How many times the desktop's layout started or finished changing by our doing (plugging,
+/// resizing, removing displays, taking the desktop over or giving it back). A capture made at
+/// another count than the present one was made before or during a change of ours, so the errors
+/// it gets may come of that change, not of the capture.
+pub fn layout_generation() -> u64 {
+    LAYOUT_GENERATION.load(Ordering::SeqCst)
+}
+
+/// The desktop's layout is about to change, or has just changed, by our doing: called before and
+/// after each such change.
+pub(crate) fn layout_changed() {
+    LAYOUT_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// True while the backend is plugging displays in or out, resizing or clearing them. The display
@@ -608,8 +624,19 @@ fn answer(
 }
 
 // Marks the display list as changing around every backend call that changes displays; the
-// manager's thread ends the change by publishing what came of it.
+// manager's thread ends the change by publishing what came of it. The layout's generation moves
+// on as each such call starts and again as it ends (`layout_generation`).
 struct Settling(Box<dyn Backend>);
+
+impl Settling {
+    fn changing<T>(&mut self, call: impl FnOnce(&mut dyn Backend) -> T) -> T {
+        set_changing();
+        layout_changed();
+        let result = call(self.0.as_mut());
+        layout_changed();
+        result
+    }
+}
 
 impl Backend for Settling {
     fn caps(&self) -> Caps {
@@ -617,13 +644,11 @@ impl Backend for Settling {
     }
 
     fn plug_in(&mut self, spec: &Spec, announce: &mut dyn FnMut(&str)) -> ResultType<String> {
-        set_changing();
-        self.0.plug_in(spec, announce)
+        self.changing(|backend| backend.plug_in(spec, announce))
     }
 
     fn set_mode(&mut self, name: &str, spec: &Spec) -> ResultType<()> {
-        set_changing();
-        self.0.set_mode(name, spec)
+        self.changing(|backend| backend.set_mode(name, spec))
     }
 
     fn usage(&self, name: &str) -> Option<Mode> {
@@ -635,17 +660,16 @@ impl Backend for Settling {
     }
 
     fn plug_out(&mut self, name: &str) -> ResultType<()> {
-        set_changing();
-        self.0.plug_out(name)
+        self.changing(|backend| backend.plug_out(name))
     }
 
     fn reset_all(&mut self) -> ResultType<()> {
-        set_changing();
-        self.0.reset_all()
+        self.changing(|backend| backend.reset_all())
     }
 
     // Not marked as changing: mostly it changes nothing, and what it puts back was already
-    // wrong in the list.
+    // wrong in the list. A backend that does change the layout here moves its generation on
+    // itself (`layout_changed`).
     fn maintain(&mut self) -> Vec<String> {
         self.0.maintain()
     }
@@ -783,6 +807,81 @@ mod tests {
         assert_eq!(held(3, Some(Mode::Shared), "DP-2".to_owned(), "").used, 1);
         assert_eq!(held(3, None, "DP-2".to_owned(), "").used, 0);
         assert_eq!(result(2, Some("DP-1".to_owned()), "").used, 0);
+    }
+
+    // Notes, at each call, the layout's generation and whether the display list was changing.
+    struct Watching(std::sync::Arc<std::sync::Mutex<Vec<(u64, bool)>>>);
+
+    impl Watching {
+        fn note(&self) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((layout_generation(), layout_settling()));
+        }
+    }
+
+    impl Backend for Watching {
+        fn caps(&self) -> Caps {
+            Stuck(Mode::Shared).caps()
+        }
+        fn plug_in(&mut self, _: &Spec, _: &mut dyn FnMut(&str)) -> ResultType<String> {
+            self.note();
+            Ok("V-1".to_owned())
+        }
+        fn set_mode(&mut self, _: &str, _: &Spec) -> ResultType<()> {
+            self.note();
+            Ok(())
+        }
+        fn plug_out(&mut self, _: &str) -> ResultType<()> {
+            self.note();
+            hbb_common::bail!("Busy")
+        }
+        fn reset_all(&mut self) -> ResultType<()> {
+            self.note();
+            Ok(())
+        }
+        fn maintain(&mut self) -> Vec<String> {
+            self.note();
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn the_layout_generation_moves_on_before_and_after_each_change() {
+        // Only this test changes the generation: the manager's tests call their backends directly.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut settling = Settling(Box::new(Watching(seen.clone())));
+        let spec = Spec {
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            mode: Mode::Shared,
+        };
+        let start = layout_generation();
+        settling.plug_in(&spec, &mut |_| {}).unwrap();
+        settling.set_mode("V-1", &spec).unwrap();
+        // A call that fails moved the layout on as well: it may have changed it half way.
+        assert!(settling.plug_out("V-1").is_err());
+        settling.reset_all().unwrap();
+        let end = layout_generation();
+        // Not a change of the layout as such: looking after the displays moves nothing on.
+        settling.maintain();
+        PUBLISHED.write().unwrap().changing = None;
+        let seen = seen.lock().unwrap().clone();
+        // Each change sees the list changing, and a generation one past the last: a capture made
+        // before it tells its errors during the change, and one made during it those after.
+        assert_eq!(
+            seen[..4],
+            [
+                (start + 1, true),
+                (start + 3, true),
+                (start + 5, true),
+                (start + 7, true)
+            ]
+        );
+        assert_eq!(end, start + 8);
+        assert_eq!(seen[4].0, end);
     }
 
     // Takes a desktop over and then fails, so taken over it stays; removes nothing.

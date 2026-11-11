@@ -999,6 +999,19 @@ pub async fn update_get_sync_displays_on_login() -> ResultType<(Vec<DisplayInfo>
     let displays = display_service::try_get_displays_add_amyuni_headless();
     let displays = displays?;
     let primary_display_idx = get_primary_2(&displays);
+    // One of our virtual displays being plugged in, resized or removed: the list as it was before,
+    // whole, rather than one missing a display for the moment. The display service holds the
+    // change back meanwhile and sends the new list to every session, this one too, once it is over.
+    if crate::vdisplay::layout_settling() {
+        let synced = SYNC_DISPLAYS.lock().unwrap().displays.clone();
+        if !synced.is_empty() {
+            let primary = displays.get(primary_display_idx).map(|d| d.name());
+            let primary_display_idx = primary
+                .and_then(|name| synced.iter().position(|d| d.name == name))
+                .unwrap_or(0);
+            return Ok((synced, primary_display_idx));
+        }
+    }
     let sync_displays = update_sync_displays(&displays);
     let primary_display_idx =
         normalize_primary_display_idx(primary_display_idx, sync_displays.len());
