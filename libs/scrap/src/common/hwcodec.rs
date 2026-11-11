@@ -40,6 +40,9 @@ crate::generate_call_macro!(call_yuv, false);
 lazy_static::lazy_static! {
     static ref CONFIG: std::sync::Arc<std::sync::Mutex<Option<HwCodecConfig>>> = Default::default();
     static ref CONFIG_SET_BY_IPC: std::sync::Arc<std::sync::Mutex<bool>> = Default::default();
+    // The configuration as found, before an encoder or decoder that failed cleared part of it
+    // (`HwCodecConfig::clear`), for `HwCodecConfig::restore`.
+    static ref FOUND: std::sync::Arc<std::sync::Mutex<Option<HwCodecConfig>>> = Default::default();
 }
 
 #[derive(Debug, Clone)]
@@ -522,7 +525,7 @@ struct HwCodecConfig2 {
 impl HwCodecConfig {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn set(config: String) {
-        let config = serde_json::from_str(&config).unwrap_or_default();
+        let config: HwCodecConfig = serde_json::from_str(&config).unwrap_or_default();
         log::info!("set hwcodec config");
         log::debug!("{config:?}");
         #[cfg(any(windows, target_os = "macos"))]
@@ -532,7 +535,12 @@ impl HwCodecConfig {
             },
             "_hwcodec",
         );
-        *CONFIG.lock().unwrap() = Some(config);
+        {
+            // Both under the order `restore` takes them in: FOUND, then CONFIG.
+            let mut found = FOUND.lock().unwrap();
+            *found = Some(config.clone());
+            *CONFIG.lock().unwrap() = Some(config);
+        }
         *CONFIG_SET_BY_IPC.lock().unwrap() = true;
     }
 
@@ -614,7 +622,14 @@ impl HwCodecConfig {
                     let new_signature = hwcodec::common::get_gpu_signature();
                     if c.signature == new_signature {
                         log::debug!("load cached hwcodec config: {c:?}");
-                        *CONFIG.lock().unwrap() = Some(c.clone());
+                        let mut found = FOUND.lock().unwrap();
+                        let mut config = CONFIG.lock().unwrap();
+                        // Probing may have ended meanwhile (`set`): its result is newer.
+                        if let Some(set) = config.as_ref() {
+                            return set.clone();
+                        }
+                        *found = Some(c.clone());
+                        *config = Some(c.clone());
                         c
                     } else {
                         log::info!(
@@ -641,7 +656,13 @@ impl HwCodecConfig {
     pub fn get_set_value() -> Option<HwCodecConfig> {
         let set = CONFIG_SET_BY_IPC.lock().unwrap().clone();
         if set {
-            CONFIG.lock().unwrap().clone()
+            // What probing found, for the other processes: what this process's own codecs cleared
+            // since (`clear`) is about this process alone.
+            FOUND
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| CONFIG.lock().unwrap().clone())
         } else {
             None
         }
@@ -678,6 +699,64 @@ impl HwCodecConfig {
         }
         crate::codec::Encoder::update(crate::codec::EncodingUpdate::Check);
     }
+
+    /// Puts back the configuration as found, should an encoder that failed have cleared part of it
+    /// (`clear`), which before took a restart of the process: on a controlled side every later
+    /// session went without H264 and H265. For when no session encodes: the failure may have come
+    /// of what that session did (a virtual display of ours plugged in or resized, a resolution
+    /// changed), and the next session gets the hardware codecs again. Not again once a restored
+    /// configuration was cleared before any hardware encoder worked with it (`worked`): hardware
+    /// that fails each time is left alone, as before, short of a restart. Decoders are cleared in
+    /// the process that decodes, the UI of an installed client, which this is not called in.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn restore() {
+        {
+            // FOUND, then CONFIG, as `set` and loading the cache take them: a configuration set
+            // meanwhile is never taken for one cleared, nor put back over.
+            let found = FOUND.lock().unwrap();
+            let Some(found) = found.as_ref() else {
+                return;
+            };
+            let mut config = CONFIG.lock().unwrap();
+            if !config.as_ref().map_or(false, |c| cleared(c, found)) {
+                return;
+            }
+            if RESTORED_UNPROVEN.load(std::sync::atomic::Ordering::SeqCst) {
+                log::info!("not restoring the hwcodec config: cleared again before it ever worked");
+                return;
+            }
+            *config = Some(found.clone());
+            RESTORED_UNPROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        log::info!("restore the hwcodec config, cleared by a codec that failed");
+        crate::codec::Encoder::update(crate::codec::EncodingUpdate::Check);
+    }
+
+    /// A hardware encoder produced a frame: a configuration restored (`restore`) works, and may be
+    /// restored again should a later failure clear it.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn worked() {
+        RESTORED_UNPROVEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// Set as `HwCodecConfig::restore` puts the configuration back, until a hardware encoder works with
+// it (`HwCodecConfig::worked`).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+static RESTORED_UNPROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Whether `config` lacks a list `found` has: `HwCodecConfig::clear` empties whole lists.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn cleared(config: &HwCodecConfig, found: &HwCodecConfig) -> bool {
+    #[allow(unused_mut)]
+    let mut cleared = config.ram_encode.len() < found.ram_encode.len()
+        || config.ram_decode.len() < found.ram_decode.len();
+    #[cfg(feature = "vram")]
+    {
+        cleared |= config.vram_encode.len() < found.vram_encode.len()
+            || config.vram_decode.len() < found.vram_decode.len();
+    }
+    cleared
 }
 
 pub fn check_available_hwcodec() -> String {
@@ -763,4 +842,78 @@ pub fn start_check_process() {
     ONCE.call_once(|| {
         std::thread::spawn(f);
     });
+}
+
+// Not where the tests of `tests` run (Windows with VRAM): they set CONFIG too, in parallel.
+#[cfg(all(
+    test,
+    not(any(target_os = "android", target_os = "ios")),
+    not(all(windows, feature = "vram"))
+))]
+mod restore_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn h264() -> CodecInfo {
+        CodecInfo {
+            name: "h264_test".to_owned(),
+            mc_name: None,
+            format: hwcodec::common::DataFormat::H264,
+            hwdevice: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+            priority: 0,
+        }
+    }
+
+    fn lens() -> (usize, usize) {
+        let c = HwCodecConfig::get();
+        (c.ram_encode.len(), c.ram_decode.len())
+    }
+
+    #[test]
+    fn codecs_a_failure_cleared_come_back_unless_they_never_worked() {
+        // One at a time: holding CONFIG while taking FOUND is the order `restore` never takes.
+        let saved_found = FOUND.lock().unwrap().clone();
+        let saved_config = CONFIG.lock().unwrap().clone();
+        let saved_unproven = RESTORED_UNPROVEN.load(Ordering::SeqCst);
+        RESTORED_UNPROVEN.store(false, Ordering::SeqCst);
+        let found = HwCodecConfig {
+            signature: 1,
+            ram_encode: vec![h264()],
+            ram_decode: vec![h264()],
+            ..Default::default()
+        };
+        *FOUND.lock().unwrap() = Some(found.clone());
+        *CONFIG.lock().unwrap() = Some(found);
+        // Nothing cleared, nothing to do.
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (1, 1));
+        // An encoder that failed took the encoders; restored, they are back, the decoders untouched.
+        HwCodecConfig::clear(false, true);
+        assert_eq!(lens(), (0, 1));
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (1, 1));
+        // Cleared again before any hardware encoder worked with them: hardware that fails each
+        // time, left alone.
+        HwCodecConfig::clear(false, true);
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (0, 1));
+        // Once an encoder worked, a later failure is put right again.
+        HwCodecConfig::worked();
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (1, 1));
+        // In a process that decodes too (a portable client), a decoder's list likewise.
+        HwCodecConfig::worked();
+        HwCodecConfig::clear(false, false);
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (1, 1));
+        // Nothing found, as before any probing: what there is stays.
+        *FOUND.lock().unwrap() = None;
+        HwCodecConfig::worked();
+        HwCodecConfig::clear(false, true);
+        HwCodecConfig::restore();
+        assert_eq!(lens(), (0, 1));
+        *FOUND.lock().unwrap() = saved_found;
+        *CONFIG.lock().unwrap() = saved_config;
+        RESTORED_UNPROVEN.store(saved_unproven, Ordering::SeqCst);
+    }
 }

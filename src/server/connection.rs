@@ -6999,6 +6999,12 @@ mod raii {
     use super::*;
     pub struct ConnectionID(i32);
 
+    // Whether a connection of this type has video encoded for it: remote control, or a camera.
+    #[cfg(all(feature = "hwcodec", not(any(target_os = "android", target_os = "ios"))))]
+    fn encodes(conn_type: AuthConnType) -> bool {
+        conn_type == AuthConnType::Remote || conn_type == AuthConnType::ViewCamera
+    }
+
     impl ConnectionID {
         pub fn new(id: i32) -> Self {
             ALIVE_CONNS.lock().unwrap().push(id);
@@ -7041,6 +7047,14 @@ mod raii {
             let printer = conn_type == crate::server::AuthConnType::Remote
                 && crate::is_support_remote_print(&lr.version)
                 && lr.my_platform == hbb_common::whoami::Platform::Windows.to_string();
+            // The first session to encode since none did, before its login reply tells what this
+            // side encodes: hardware codecs a failure cleared as the last session ended, too late
+            // for that one to put them back, come back now (`HwCodecConfig::restore`).
+            #[cfg(all(feature = "hwcodec", not(any(target_os = "android", target_os = "ios"))))]
+            if encodes(conn_type) && !AUTHED_CONNS.lock().unwrap().iter().any(|c| encodes(c.conn_type))
+            {
+                scrap::hwcodec::HwCodecConfig::restore();
+            }
             AUTHED_CONNS.lock().unwrap().push(AuthedConn {
                 conn_id,
                 conn_type,
@@ -7211,6 +7225,12 @@ mod raii {
                     wayland::try_close_portal_session();
                     super::mutter::last_connection_ended();
                 }
+            }
+            // Nobody left encoding: hardware codecs a failure cleared come back for the next
+            // session, as they did only on a restart before (`HwCodecConfig::restore`).
+            #[cfg(all(feature = "hwcodec", not(any(target_os = "android", target_os = "ios"))))]
+            if !AUTHED_CONNS.lock().unwrap().iter().any(|c| encodes(c.conn_type)) {
+                scrap::hwcodec::HwCodecConfig::restore();
             }
             Self::check_wake_lock();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

@@ -1385,6 +1385,11 @@ fn handle_one_frame(
         Ok(mut vf) => {
             *encode_fail_counter = 0;
             *encoder_warmed_up = true;
+            // The hardware codecs work, should they have been put back after a failure.
+            #[cfg(all(feature = "hwcodec", not(any(target_os = "android", target_os = "ios"))))]
+            if encoder.is_hardware() {
+                scrap::hwcodec::HwCodecConfig::worked();
+            }
             vf.display = display as _;
             let mut msg = Message::new();
             msg.set_video_frame(vf);

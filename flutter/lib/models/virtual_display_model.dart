@@ -282,8 +282,8 @@ class VirtualDisplayModel {
     }
   }
 
-  /// After every login, in every window. Once per session, unless turned off for this peer: a
-  /// virtual display the size of the monitor this window is on.
+  /// After every login, in every window. Once per session, where turned on for this peer
+  /// (`kOptionAutoVirtualDisplay`): a virtual display the size of the monitor this window is on.
   Future<void> onPeerInfo(bool isCache) async {
     refresh();
     if (!available) return;
