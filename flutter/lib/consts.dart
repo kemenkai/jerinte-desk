@@ -32,8 +32,10 @@ const String kPlatformAdditionsSupportedPrivacyModeImpl =
 // The peer's cross-platform virtual displays (src/vdisplay): what it can make.
 const String kPlatformAdditionsVirtualDisplayCaps = "vdm_caps";
 
-// Per peer: don't ask for a virtual display the size of this monitor on connecting ("Y").
-const String kOptionDisableAutoVirtualDisplay = "disable-auto-virtual-display";
+// Per peer: ask for a virtual display the size of this monitor on connecting ("Y"). Off unless
+// set: a display made at every connection is in the way where none is needed. Replaces
+// "disable-auto-virtual-display", whose "Y" meant off, as an unset value now does.
+const String kOptionAutoVirtualDisplay = "auto-virtual-display";
 // Per peer: ask a peer without HiDPI displays for all the pixels of a HiDPI monitor ("Y").
 const String kOptionVirtualDisplayPixels = "virtual-display-pixels";
 // Per peer: how a virtual display asked for is used — "" / "shared" (an extra screen, the

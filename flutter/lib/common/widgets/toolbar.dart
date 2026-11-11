@@ -1503,14 +1503,14 @@ List<Widget> _virtualDisplayPerMonitorMenu(
   }
   children.add(Divider());
   children.add(CkbMenuButton(
-    value: !bind.sessionGetToggleOptionSync(
-        sessionId: sessionId, arg: kOptionDisableAutoVirtualDisplay),
+    value: bind.sessionGetToggleOptionSync(
+        sessionId: sessionId, arg: kOptionAutoVirtualDisplay),
     onChanged: (bool? value) {
       if (value == null) return;
       bind.sessionPeerOption(
           sessionId: sessionId,
-          name: kOptionDisableAutoVirtualDisplay,
-          value: value ? '' : 'Y');
+          name: kOptionAutoVirtualDisplay,
+          value: value ? 'Y' : '');
       clickCallBack?.call();
     },
     child: Text(translate('Add one for my monitor on connecting')),

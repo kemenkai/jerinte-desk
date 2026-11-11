@@ -300,8 +300,9 @@ class VirtualDisplayModel {
     }
     if (!bind.sessionTakeAutoVirtualDisplay(sessionId: ffi.sessionId)) return;
     if (ffi.ffiModel.viewOnly || !ffi.ffiModel.keyboard) return;
-    if (bind.sessionGetToggleOptionSync(
-        sessionId: ffi.sessionId, arg: kOptionDisableAutoVirtualDisplay)) {
+    // Only for a peer the user asked it for.
+    if (!bind.sessionGetToggleOptionSync(
+        sessionId: ffi.sessionId, arg: kOptionAutoVirtualDisplay)) {
       return;
     }
     // The user maps the peer's own displays onto these monitors instead.
