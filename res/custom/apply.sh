@@ -24,7 +24,7 @@ if not isinstance(base, str) or (base and not re.fullmatch(r"[a-z0-9-]+", base))
     sys.exit("res/custom-client.json: extends must name a variant")
 if not isinstance(inherit, bool):
     sys.exit("res/custom-client.json: inherit-overlay must be true or false")
-if not inherit and not base:
+if "inherit-overlay" in config and not base:
     sys.exit("res/custom-client.json: inherit-overlay applies only with extends")
 print(base or "-", "yes" if inherit else "no")' "res/custom/$variant/overlay/res/custom-client.json")"
 read -r base inherit <<< "$parsed"
@@ -93,7 +93,10 @@ def pieces(value):
 # On GitHub Actions the log of a public repository is public: mask every secret value and its
 # parts (the repository masks only the secret's whole text) before anything can print them.
 if os.environ.get("GITHUB_ACTIONS") == "true":
-    for piece in sorted({p for p in pieces(secrets) if len(p) >= 4}):
+    # One line per mask: the runner reads a workflow command to the end of its line, so the rest
+    # of a value with a line break in it would be printed as it is.
+    lines = {line for p in pieces(secrets) for line in p.splitlines()}
+    for piece in sorted(line for line in lines if len(line) >= 4):
         print(f"::add-mask::{piece}")
 data = merge(json.load(open("res/custom-client.json", encoding="utf-8")), secrets.get(variant, {}))
 if base:
@@ -101,7 +104,10 @@ if base:
     if "extends" in base_data:
         sys.exit(f"res/custom/{base}: a base variant cannot extend another one")
     base_data = merge(base_data, secrets.get(base, {}))
-    data = merge(base_data, {k: v for k, v in data.items() if k not in ("extends", "inherit-overlay")})
+    data = merge(base_data, data)
+# How the variant was put together, not settings: none of it goes into the client.
+for key in ("extends", "inherit-overlay"):
+    data.pop(key, None)
 
 
 def unset(value, path=""):
