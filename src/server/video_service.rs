@@ -326,6 +326,16 @@ pub fn new(source: VideoSource, idx: usize) -> GenericService {
         #[cfg(windows)]
         dxgi_recovery_state: Arc::new(Mutex::new(DxgiRecoveryState::new())),
     };
+    #[cfg(all(windows, feature = "vram"))]
+    {
+        let name = vs.sp.name();
+        vs.sp.set_on_unwatched(move || {
+            forget_vram_marks(&name, (source, idx));
+            // Not on the unsubscribing thread, which holds the server's lock: working the encodings
+            // out anew enumerates the displays.
+            std::thread::spawn(|| Encoder::update(scrap::codec::EncodingUpdate::Check));
+        });
+    }
     GenericService::run(&vs, run);
     vs.sp
 }
@@ -650,6 +660,10 @@ fn run(vs: VideoService) -> ResultType<()> {
     // Read before the capturer is made: a change of ours starting any later shows in it.
     #[cfg(windows)]
     let made_at_layout = crate::vdisplay::layout_generation();
+    // A mark this capture leaves as it ends, nobody watching any more, would not be cleared by the
+    // unsubscribe that already happened (`forget_vram_marks`).
+    #[cfg(all(windows, feature = "vram"))]
+    let _unwatched = ForgetVramMarksIfUnwatched(sp.clone(), (vs.source, display_idx));
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
     #[cfg(windows)]
     // ACCESS_LOST marks the next successful capturer creation as a recovery. This timestamp is
@@ -1064,6 +1078,39 @@ fn run(vs: VideoService) -> ResultType<()> {
     }
 
     Ok(())
+}
+
+/// Forgets what video service `name` asked of VRAM encoding while it was watched: its capture
+/// falling back to GDI (`set_fallback_gdi`) and its not using VRAM (`set_not_use`). Either keeps
+/// every display of the machine off VRAM encoding (`VRamEncoder::available`), H264 and H265 then
+/// going from what it offers unless a RAM hardware encoder stands in. Both were dropped only by
+/// that service capturing again; one nobody watches any more, such as a virtual display removed
+/// at the end of its session, kept them until the service restarted. Watched again, the service
+/// starts on DXGI and sets them anew where it has to. The caller works the encodings out anew.
+#[cfg(all(windows, feature = "vram"))]
+fn forget_vram_marks(name: &str, screenshot_key: (VideoSource, usize)) {
+    VRamEncoder::set_fallback_gdi(name.to_owned(), false);
+    VRamEncoder::set_not_use(name.to_owned(), false);
+    // A screenshot still waiting for a pixel frame turns VRAM off for itself again when the display
+    // is next captured, rather than giving up as one that already did.
+    if let Some(screenshot) = SCREENSHOTS.lock().unwrap().get_mut(&screenshot_key) {
+        screenshot.restore_vram = false;
+    }
+}
+
+/// Forgets the VRAM marks of a capture that ends with nobody watching: the last unsubscribe may
+/// have come before the capture set a mark on its way out. `Raii`, dropped right after, works the
+/// encodings out anew.
+#[cfg(all(windows, feature = "vram"))]
+struct ForgetVramMarksIfUnwatched(GenericService, (VideoSource, usize));
+
+#[cfg(all(windows, feature = "vram"))]
+impl Drop for ForgetVramMarksIfUnwatched {
+    fn drop(&mut self) {
+        if !self.0.ok() {
+            forget_vram_marks(&self.0.name(), self.1);
+        }
+    }
 }
 
 struct Raii {

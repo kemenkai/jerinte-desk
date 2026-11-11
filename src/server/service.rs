@@ -31,6 +31,8 @@ pub struct ServiceInner<T: Subscriber + From<ConnInner>> {
     active: bool,
     need_snapshot: bool,
     options: HashMap<String, String>,
+    // Called as the last subscriber goes (`set_on_unwatched`).
+    on_unwatched: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub trait Reset {
@@ -117,9 +119,21 @@ impl<T: Subscriber + From<ConnInner>> Service for ServiceTmpl<T> {
     }
 
     fn on_unsubscribe(&self, id: i32) {
-        let mut lock = self.0.write().unwrap();
-        if let None = lock.subscribes.remove(&id) {
-            lock.new_subscribes.remove(&id);
+        let unwatched = {
+            let mut lock = self.0.write().unwrap();
+            let removed =
+                lock.subscribes.remove(&id).is_some() || lock.new_subscribes.remove(&id).is_some();
+            // Only for one that was subscribed: a connection that ends unsubscribes from every
+            // service, watched or not.
+            if removed && !lock.has_subscribes() {
+                lock.on_unwatched.clone()
+            } else {
+                None
+            }
+        };
+        // Outside the lock: the callback may well look at the service again.
+        if let Some(unwatched) = unwatched {
+            unwatched();
         }
     }
 
@@ -166,6 +180,12 @@ impl<T: Subscriber + From<ConnInner>> ServiceTmpl<T> {
             need_snapshot,
             ..Default::default()
         })))
+    }
+
+    /// `callback` runs whenever the service loses its last subscriber, on the thread that
+    /// unsubscribed it: for state that holds only while somebody is subscribed.
+    pub fn set_on_unwatched(&self, callback: impl Fn() + Send + Sync + 'static) {
+        self.0.write().unwrap().on_unwatched = Some(Arc::new(callback));
     }
 
     #[inline]
@@ -354,5 +374,36 @@ impl<T: Subscriber + From<ConnInner>> ServiceSwap<T> {
 impl<T: Subscriber + From<ConnInner>> Drop for ServiceSwap<T> {
     fn drop(&mut self) {
         (self.0).0.write().unwrap().swap_new_subscribes();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_service_is_told_when_its_last_subscriber_goes() {
+        for need_snapshot in [false, true] {
+            let sp = GenericService::new("test".to_owned(), need_snapshot);
+            let told = Arc::new(AtomicUsize::new(0));
+            let t = told.clone();
+            sp.set_on_unwatched(move || {
+                t.fetch_add(1, Ordering::SeqCst);
+            });
+            sp.on_subscribe(ConnInner::new(1, None, None));
+            sp.on_subscribe(ConnInner::new(2, None, None));
+            sp.on_unsubscribe(1);
+            assert_eq!(told.load(Ordering::SeqCst), 0, "one is still subscribed");
+            sp.on_unsubscribe(2);
+            assert_eq!(told.load(Ordering::SeqCst), 1, "the last one went");
+            // A connection that ends unsubscribes from every service, this one among them: no
+            // subscriber went, so nothing to tell.
+            sp.on_unsubscribe(3);
+            assert_eq!(told.load(Ordering::SeqCst), 1);
+            sp.on_subscribe(ConnInner::new(4, None, None));
+            sp.on_unsubscribe(4);
+            assert_eq!(told.load(Ordering::SeqCst), 2, "watched and left again");
+        }
     }
 }
