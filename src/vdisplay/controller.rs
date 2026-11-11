@@ -265,7 +265,8 @@ pub fn spec_for(m: &Monitor, caps: &PeerCaps, pixels: bool) -> VirtualDisplaySpe
 }
 
 /// The virtual display for `view`, by the same rule as for a monitor: one the view shows whole, so
-/// rounded down, never past its edges.
+/// rounded down, never past its edges. That is what is asked for: a peer that picks among sizes
+/// fixed in advance may give one a little larger (Windows, up to a percent on a side).
 pub fn spec_for_view(view: &View, caps: &PeerCaps, pixels: bool) -> VirtualDisplaySpec {
     let down = |v: f64| ((v + 1e-6).floor().max(0.0) as u32) & !1;
     let pixels_wh = (down(view.w * view.scale), down(view.h * view.scale));

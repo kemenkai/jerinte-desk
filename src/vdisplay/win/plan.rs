@@ -41,14 +41,28 @@ pub fn ladder(w: u32, h: u32) -> Vec<(u32, u32)> {
     sizes
 }
 
-/// Of the modes a display has, the largest that fits within `w`×`h`; the smallest when none does.
+/// How much larger than the view a mode may be on a side, in percent. A desktop client shows a
+/// display at its original size unless told otherwise, cropping what is over: a mode a few pixels
+/// larger, as a step of the ladder is when its rounding or the frame of a restored window shifts
+/// the aspect a little, shows far more than the next step down, half the size maybe. A view a
+/// little smaller keeps its mode as well, sparing the display a change.
+const OVER_PERCENT: u64 = 1;
+
+/// Of the modes a display has, the one showing the most of the view `w`×`h`, among those within
+/// it or at most `OVER_PERCENT` larger on each side; the smallest when there is none such.
 pub fn best_fit(modes: &[(u32, u32)], w: u32, h: u32) -> Option<(u32, u32)> {
-    let area = |m: &&(u32, u32)| m.0 as u64 * m.1 as u64;
+    let near = |m: &&(u32, u32)| {
+        m.0 as u64 * 100 <= w as u64 * (100 + OVER_PERCENT)
+            && m.1 as u64 * 100 <= h as u64 * (100 + OVER_PERCENT)
+    };
+    let shown = |m: &(u32, u32)| m.0.min(w) as u64 * m.1.min(h) as u64;
+    let area = |m: &(u32, u32)| m.0 as u64 * m.1 as u64;
     modes
         .iter()
-        .filter(|m| m.0 <= w && m.1 <= h)
-        .max_by_key(area)
-        .or_else(|| modes.iter().min_by_key(area))
+        .filter(near)
+        // Of two showing as much, the one cropped less.
+        .max_by_key(|m| (shown(m), std::cmp::Reverse(area(m))))
+        .or_else(|| modes.iter().min_by_key(|m| area(m)))
         .copied()
 }
 
@@ -262,16 +276,37 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_takes_the_largest_mode_that_fits_the_view() {
+    fn a_resize_takes_the_largest_mode_near_enough_to_the_view() {
         let modes = ladder(2048, 1152);
         assert_eq!(best_fit(&modes, 2048, 1152), Some((2048, 1152)));
-        // A little smaller than the size asked: the next step down.
+        // Smaller than a mode by more than a percent (2.4% narrower): the next step down.
         assert_eq!(best_fit(&modes, 2000, 1150), Some((1844, 1036)));
         // A view of another aspect: the largest that fits both ways.
         assert_eq!(best_fit(&modes, 3000, 1200), Some((2048, 1152)));
         // Nothing fits: the smallest there is.
         assert_eq!(best_fit(&modes, 100, 100), Some((1024, 576)));
         assert_eq!(best_fit(&[], 100, 100), None);
+    }
+
+    #[test]
+    fn a_mode_a_few_pixels_over_the_view_beats_a_much_smaller_one() {
+        // Made for a maximized window, then the window restored: the step for it is 4 pixels
+        // taller than its view (0.6%), the next one down half the size. Seen in the test VM.
+        let modes = ladder(1920, 1052);
+        assert!(modes.contains(&(1286, 704)) && modes.contains(&(960, 526)));
+        assert_eq!(best_fit(&modes, 1288, 700), Some((1286, 704)));
+        // A view a little smaller keeps the mode it has: no change of the display at all.
+        assert_eq!(best_fit(&modes, 1916, 1050), Some((1920, 1052)));
+        // Over by more than a percent: cropped too much, the step down it is.
+        assert_eq!(best_fit(&modes, 1288, 690), Some((960, 526)));
+        // The percent itself: 704 is within 1% of 698 (704.98), not of 697 (703.97).
+        assert_eq!(best_fit(&modes, 1288, 698), Some((1286, 704)));
+        assert_eq!(best_fit(&modes, 1288, 697), Some((960, 526)));
+        // Exactly a percent over still counts.
+        assert_eq!(best_fit(&[(1010, 505), (800, 400)], 1000, 500), Some((1010, 505)));
+        // Of two showing all of the view, the one cropped less, whichever comes first.
+        assert_eq!(best_fit(&[(1004, 503), (1008, 504)], 1000, 500), Some((1004, 503)));
+        assert_eq!(best_fit(&[(1008, 504), (1004, 503)], 1000, 500), Some((1004, 503)));
     }
 
     #[test]
