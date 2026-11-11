@@ -14,14 +14,18 @@ fi
 # base's settings only and none of its files, e.g. to keep RustDesk's own icons and logo: an
 # overlay can replace a file but not remove one the base adds.
 # A command substitution, not a process substitution: set -e stops on a bad config only here.
+# The name is checked here, not only by the shell below: read splits on whitespace, so a value
+# such as "jerinte x" would otherwise pass as jerinte and shift into the second field.
 parsed="$(python3 -c '
-import json, sys
+import json, re, sys
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 base, inherit = config.get("extends", ""), config.get("inherit-overlay", True)
-if not isinstance(base, str):
+if not isinstance(base, str) or (base and not re.fullmatch(r"[a-z0-9-]+", base)):
     sys.exit("res/custom-client.json: extends must name a variant")
 if not isinstance(inherit, bool):
     sys.exit("res/custom-client.json: inherit-overlay must be true or false")
+if not inherit and not base:
+    sys.exit("res/custom-client.json: inherit-overlay applies only with extends")
 print(base or "-", "yes" if inherit else "no")' "res/custom/$variant/overlay/res/custom-client.json")"
 read -r base inherit <<< "$parsed"
 [[ "$base" == "-" ]] && base=""
