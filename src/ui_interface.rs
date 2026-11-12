@@ -1799,7 +1799,44 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{test_if_valid_server, validate_windows_service_video_save_directory};
+    use super::{
+        get_async_http_status, http_request, test_if_valid_server,
+        validate_windows_service_video_save_directory,
+    };
+
+    /// A request Flutter sends through Rust: its key's fragment is not sent, and its result is
+    /// there to read once.
+    #[test]
+    fn a_request_is_sent_without_its_key_and_its_result_read_once() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..read]);
+                let _ = seen.send(line.lines().next().unwrap_or_default().to_owned());
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let key = format!("http://127.0.0.1:{port}/api/x?y=1#request-7");
+        http_request(key.clone(), "get".to_owned(), None, "{}".to_owned());
+        let result = loop {
+            match get_async_http_status(key.clone()) {
+                Some(status) if status == " " => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                status => break status,
+            }
+        };
+        let result: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(result["status_code"], 204);
+        assert_eq!(requests.recv().unwrap(), "GET /api/x?y=1 HTTP/1.1");
+        assert_eq!(get_async_http_status(key), None);
+    }
 
     #[test]
     fn full_websocket_urls_are_valid_servers() {
