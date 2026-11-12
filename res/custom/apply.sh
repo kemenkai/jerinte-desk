@@ -82,6 +82,10 @@ def pieces(value):
             return
         except ValueError:
             pass
+    # name=address pairs (dns-fallback): each name and each address.
+    if re.fullmatch(r"(?:[^\s,=]+=[^\s,=]+[\s,]*)+", value):
+        yield from re.split(r"[\s,=]+", value)
+        return
     rest = value.split("://", 1)[-1]
     hostport, _, path = rest.partition("/")
     yield hostport

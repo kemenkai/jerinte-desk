@@ -85,6 +85,17 @@ the one `custom.txt` carries once decoded:
   ports. Write each `relay` the way the ID server hands it out (its `-r`, or the public relay URL),
   since it rewrites only relays it recognizes for a peer that came in another way. `jerinte` lists
   the intranet's native ports first, then the public WebSocket entry.
+- `dns-fallback` (an override): `name=address` pairs, comma separated, for names the system may
+  not resolve. Our intranet has no route out, so nothing there resolves the public name, and the
+  server behind it answers at a private address. When the system fails to resolve a name listed
+  here (within 3 s), the client resolves it to the address given, and goes on doing so for a
+  minute before asking the system again; once the system resolves it, its answer is used
+  (`libs/hbb_common/src/dns_fallback.rs`). Only the lookup changes: the URL, SNI and the
+  certificate check keep the name, and it applies only to `https://` and `wss://` with the
+  certificate checked, so a host at that address on another network cannot pass for the server.
+  It covers the WebSocket entries and the API; with it set, Flutter sends its API requests
+  through Rust. Not covered: a proxy (it resolves the name), avatars (Flutter loads them itself),
+  and a name that resolves to an address which is then unreachable.
 - other top-level string keys: hard settings such as `disable-settings`.
 
 Every custom client hides the links to rustdesk.com (About page, install page agreement, help

@@ -8,6 +8,7 @@
     "relay-server": "@secret",
     "server-entries": "@secret",
     "api-server": "@secret",
+    "dns-fallback": "@secret",
     "key": "@secret",
     "allow-websocket": "Y",
     "enable-webrtc": "Y",

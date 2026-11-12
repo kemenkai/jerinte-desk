@@ -17,6 +17,7 @@ use std::{
 use hbb_common::{
     anyhow::{anyhow, bail},
     config::{self, Config, ServerEntry, RENDEZVOUS_PORT},
+    dns_fallback::Fallback,
     futures::{stream::FuturesUnordered, FutureExt, StreamExt},
     log,
     protobuf::Message as _,
@@ -391,10 +392,13 @@ async fn resolve(id: &str, known: &mut HashMap<String, SocketAddr>) -> Option<So
     }
     let (host, port) = host_port(id)?;
     // A resolver stuck without a network must not hold the watch up.
-    let addr = timeout(FAR_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
+    // As a connection resolves it, `dns-fallback` included.
+    let lookup = Fallback::from_config();
+    let addr = timeout(FAR_TIMEOUT, lookup.lookup(host.as_str(), port))
         .await
         .ok()?
         .ok()?
+        .into_iter()
         .next()?;
     known.insert(id.to_owned(), addr);
     Some(addr)

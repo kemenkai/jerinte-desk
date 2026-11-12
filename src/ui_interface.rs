@@ -928,7 +928,10 @@ pub fn http_request(url: String, method: String, body: Option<String>, header: S
         .unwrap()
         .insert(url.clone(), " ".to_owned());
     std::thread::spawn(move || {
-        let res = match crate::http_request_sync(url.clone(), method, body, header) {
+        // A fragment is no part of the request: it only tells this one from others for the same
+        // URL (http_service.dart).
+        let target = url.split('#').next().unwrap_or_default().to_owned();
+        let res = match crate::http_request_sync(target, method, body, header) {
             Err(err) => {
                 log::error!("{}", err);
                 err.to_string()
@@ -941,10 +944,14 @@ pub fn http_request(url: String, method: String, body: Option<String>, header: S
 
 #[inline]
 pub fn get_async_http_status(url: String) -> Option<String> {
-    match ASYNC_HTTP_STATUS.lock().unwrap().get(&url) {
-        None => None,
-        Some(_str) => Some(_str.to_string()),
+    let mut statuses = ASYNC_HTTP_STATUS.lock().unwrap();
+    let status = statuses.get(&url)?.clone();
+    // A finished request is read once: Flutter gives each its own key (http_service.dart), which
+    // would otherwise pile up here.
+    if status != " " {
+        statuses.remove(&url);
     }
+    Some(status)
 }
 
 #[inline]

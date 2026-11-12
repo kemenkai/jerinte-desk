@@ -9,6 +9,8 @@ export 'package:http/http.dart' show Response;
 enum HttpMethod { get, post, put, delete }
 
 class HttpService {
+  static int _requests = 0;
+
   Future<http.Response> sendRequest(
     Uri url,
     HttpMethod method, {
@@ -23,9 +25,11 @@ class HttpService {
       final enableFlutterHttpOnRust =
           mainGetLocalBoolOptionSync(kOptionEnableFlutterHttpOnRust);
       // Use flutter http if:
-      // Not `enableFlutterHttpOnRust` and no proxy is set
-      useFlutterHttp =
-          !(enableFlutterHttpOnRust || await bind.mainGetProxyStatus());
+      // Not `enableFlutterHttpOnRust`, no proxy is set, and no `dns-fallback`:
+      // Dart resolves names by itself, Rust as that option has it.
+      useFlutterHttp = !(enableFlutterHttpOnRust ||
+          bind.mainGetOptionSync(key: kOptionDnsFallback).isNotEmpty ||
+          await bind.mainGetProxyStatus());
     }
 
     if (useFlutterHttp) {
@@ -34,13 +38,16 @@ class HttpService {
 
     String headersJson = jsonEncode(headers);
     String methodName = method.toString().split('.').last;
+    // Rust keeps each result under the request's URL. A fragment, which is
+    // never sent, keeps two requests for one URL from taking each other's.
+    final key = url.replace(fragment: 'request-${_requests++}').toString();
     await bind.mainHttpRequest(
-        url: url.toString(),
+        url: key,
         method: methodName.toLowerCase(),
         body: body,
         header: headersJson);
 
-    var resJson = await _pollForResponse(url.toString());
+    var resJson = await _pollForResponse(key);
     return _parseHttpResponse(resJson);
   }
 
