@@ -760,6 +760,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("whitelist_cidr_tip", "支援 CIDR 寫法，例如 192.168.1.0/24"),
         ("Continue", "繼續"),
         ("Browser didn't open? Use the url below to sign in.", "瀏覽器未開啟？請使用下方網址登入。"),
+        ("This computer cannot open the sign-in page. Scan the code with your phone to sign in.", "這台電腦打不開登入頁，請用手機掃碼登入。"),
         ("Lock canvas", "鎖定畫布"),
         ("Sync clipboard between sessions", "在工作階段間同步剪貼簿"),
         ("sync-clipboard-between-sessions-tip", "在一個遠端工作階段中複製的文字或圖片也會傳送到其他已連線工作階段的剪貼簿。"),

@@ -279,6 +279,9 @@ class _WidgetOPState extends State<WidgetOP> {
   String _stateMsg = '';
   String _failedMsg = '';
   String _url = '';
+  // A browser on this machine cannot open `_url`: it is shown as a QR code
+  // for a phone instead (see `AuthResult::url_unresolved`).
+  bool _urlUnresolved = false;
 
   @override
   void dispose() {
@@ -354,6 +357,7 @@ class _WidgetOPState extends State<WidgetOP> {
   void _invalidateAuthAttempt() {
     _authAttempt++;
     _url = '';
+    _urlUnresolved = false;
   }
 
   bool _isCurrentAuthAttempt(int authAttempt) {
@@ -415,6 +419,8 @@ class _WidgetOPState extends State<WidgetOP> {
           ? _waitingAccountAuth
           : backendStateMsg;
       final bool urlLaunched = (resultMap['url_launched'] as bool?) ?? false;
+      final bool urlUnresolved =
+          (resultMap['url_unresolved'] as bool?) ?? false;
       final authBody = resultMap['auth_body'];
       if (authBody != null) {
         _updateTimer?.cancel();
@@ -433,6 +439,7 @@ class _WidgetOPState extends State<WidgetOP> {
         _failedMsg = failedMsg;
         if (newUrl != null) {
           _url = newUrl;
+          _urlUnresolved = urlUnresolved;
         }
         if (failedMsg.isNotEmpty) {
           _invalidateAuthAttempt();
@@ -440,7 +447,10 @@ class _WidgetOPState extends State<WidgetOP> {
           _updateTimer?.cancel();
         }
       });
-      if (newUrl != null && failedMsg.isEmpty && !urlLaunched) {
+      if (newUrl != null &&
+          failedMsg.isEmpty &&
+          !urlLaunched &&
+          !urlUnresolved) {
         unawaited(_launchAuthUrl(newUrl));
       }
     }).catchError(
@@ -518,8 +528,11 @@ class _WidgetOPState extends State<WidgetOP> {
                     child: OidcAuthStatus(
                       message: translate(_stateMsg),
                       browserFallbackPrompt: translate(
-                        "Browser didn't open? Use the url below to sign in.",
+                        _urlUnresolved
+                            ? "This computer cannot open the sign-in page. Scan the code with your phone to sign in."
+                            : "Browser didn't open? Use the url below to sign in.",
                       ),
+                      showQr: _urlUnresolved,
                       authUrl: authUrl,
                       copyLabel: translate('Copy to clipboard'),
                       onCopy: authUrl.isEmpty
