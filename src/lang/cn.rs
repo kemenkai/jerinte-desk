@@ -807,6 +807,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("whitelist_cidr_tip", "支持 CIDR 写法，例如 192.168.1.0/24"),
         ("Continue", "继续"),
         ("Browser didn't open? Use the url below to sign in.", "浏览器未打开？请使用下方网址登录。"),
+        ("This computer cannot open the sign-in page. Scan the code with your phone to sign in.", "这台电脑打不开登录页，请用手机扫码登录。"),
         ("Lock canvas", "锁定画布"),
         ("Sync clipboard between sessions", "在会话间同步剪贴板"),
         ("sync-clipboard-between-sessions-tip", "在一个远程会话中复制的文本或图片也会发送到其他已连接会话的剪贴板。"),
