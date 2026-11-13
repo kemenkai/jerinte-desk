@@ -5,7 +5,9 @@ const _statusFontSize = 12.0;
 const _statusSpacing = 4.0;
 const _messageActionSpacing = 8.0;
 const _desktopActionSize = 28.0;
-const _qrSize = 180.0;
+// As large as shows whole, under the login form, in a main window of the
+// default size: the dialog scrolls, but the code should need no scrolling.
+const _qrSize = 160.0;
 const _touchPlatforms = <TargetPlatform>{
   TargetPlatform.android,
   TargetPlatform.iOS,
