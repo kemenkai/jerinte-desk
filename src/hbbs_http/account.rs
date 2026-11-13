@@ -1,6 +1,6 @@
 use super::HbbHttpResponse;
 use crate::hbbs_http::create_http_client_with_url;
-use hbb_common::{config::LocalConfig, log, ResultType};
+use hbb_common::{config::LocalConfig, dns_fallback::Fallback, log, ResultType};
 use serde_derive::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
@@ -15,7 +15,8 @@ lazy_static::lazy_static! {
 }
 
 const QUERY_INTERVAL_SECS: f32 = 1.0;
-const QUERY_TIMEOUT_SECS: u64 = 60 * 3;
+// Long enough to sign in on a phone, from the QR code: account, password and a captcha.
+const QUERY_TIMEOUT_SECS: u64 = 60 * 5;
 
 const REQUESTING_ACCOUNT_AUTH: &str = "Requesting account auth";
 const WAITING_ACCOUNT_AUTH: &str = "Waiting account auth";
@@ -112,6 +113,7 @@ pub struct OidcSession {
     state_msg: &'static str,
     failed_msg: String,
     code_url: Option<OidcAuthUrl>,
+    url_unresolved: bool,
     auth_body: Option<AuthBody>,
     auth_attempt: u64,
     running: bool,
@@ -123,7 +125,18 @@ pub struct AuthResult {
     pub state_msg: String,
     pub failed_msg: String,
     pub url: Option<String>,
+    /// A browser on this machine cannot open `url` (see `unresolved`): the UI leaves the page to
+    /// another device, by a QR code, instead of opening one here.
+    pub url_unresolved: bool,
     pub auth_body: Option<AuthBody>,
+}
+
+/// Whether the system just failed to resolve `url`'s host, a name `dns-fallback` covers: asking
+/// the API for this URL, a moment ago, looked the API's name up, the same one as our sign-in
+/// page's. The client gets by with the fallback address, a browser does not.
+fn unresolved(url: &Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| Fallback::from_config().unresolved(host))
 }
 
 impl Default for UserStatus {
@@ -139,6 +152,7 @@ impl OidcSession {
             state_msg: REQUESTING_ACCOUNT_AUTH,
             failed_msg: "".to_owned(),
             code_url: None,
+            url_unresolved: false,
             auth_body: None,
             auth_attempt: 0,
             running: false,
@@ -203,6 +217,7 @@ impl OidcSession {
         self.failed_msg = "".to_owned();
         self.running = false;
         self.code_url = None;
+        self.url_unresolved = false;
         self.auth_body = None;
     }
 
@@ -285,6 +300,7 @@ impl OidcSession {
                 return;
             }
             session.set_state(WAITING_ACCOUNT_AUTH, "".to_owned());
+            session.url_unresolved = unresolved(&code_url.url);
             session.code_url = Some(code_url.clone());
         }
 
@@ -386,6 +402,7 @@ impl OidcSession {
             state_msg: self.state_msg.to_string(),
             failed_msg: self.failed_msg.clone(),
             url: self.code_url.as_ref().map(|x| x.url.to_string()),
+            url_unresolved: self.url_unresolved,
             auth_body: self.auth_body.clone(),
         }
     }
