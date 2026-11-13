@@ -1,6 +1,6 @@
 use super::HbbHttpResponse;
 use crate::hbbs_http::create_http_client_with_url;
-use hbb_common::{config::LocalConfig, dns_fallback::Fallback, log, ResultType};
+use hbb_common::{config::LocalConfig, dns_fallback::Fallback, log, tokio, ResultType};
 use serde_derive::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
@@ -131,12 +131,18 @@ pub struct AuthResult {
     pub auth_body: Option<AuthBody>,
 }
 
-/// Whether the system just failed to resolve `url`'s host, a name `dns-fallback` covers: asking
-/// the API for this URL, a moment ago, looked the API's name up, the same one as our sign-in
-/// page's. The client gets by with the fallback address, a browser does not.
-fn unresolved(url: &Url) -> bool {
-    url.host_str()
-        .is_some_and(|host| Fallback::from_config().unresolved(host))
+/// Whether the system cannot resolve `url`'s host, a name `dns-fallback` covers: the client gets
+/// by with the fallback address, a browser on this machine does not. Looks the name up as a
+/// connection would, which costs nothing where one just did (the API's name is mostly this one)
+/// and the lookup's wait once otherwise.
+#[tokio::main(flavor = "current_thread")]
+async fn unresolved(url: &Url) -> bool {
+    let fallback = Fallback::from_config();
+    let Some(host) = url.host_str().filter(|host| fallback.covers(host)) else {
+        return false;
+    };
+    let _ = fallback.lookup(host, 0).await;
+    fallback.unresolved(host)
 }
 
 impl Default for UserStatus {
@@ -294,13 +300,15 @@ impl OidcSession {
             }
         };
 
+        // Before taking the session: the lookup may wait, and the UI reads the session meanwhile.
+        let url_unresolved = unresolved(&code_url.url);
         {
             let mut session = OIDC_SESSION.write().unwrap();
             if !session.is_current_auth_attempt(auth_attempt) {
                 return;
             }
             session.set_state(WAITING_ACCOUNT_AUTH, "".to_owned());
-            session.url_unresolved = unresolved(&code_url.url);
+            session.url_unresolved = url_unresolved;
             session.code_url = Some(code_url.clone());
         }
 
