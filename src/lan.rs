@@ -23,6 +23,33 @@ use std::{
 
 type Message = RendezvousMessage;
 
+/// The local option naming the server the stored LAN peers were found on (its `server_mark`).
+const OPTION_LAN_PEERS_SERVER: &str = "lan-peers-server";
+
+/// Which ID server this client is on, as discovery messages carry it (`misc`): the start of a
+/// hash of the server's key. A client answers a ping only from one on its server, and lists only
+/// those answering as such: one on another server cannot be connected to through ours, and has no
+/// business learning this machine's ID, host and user name. Empty without a key of our own, when
+/// discovery is everyone's, as upstream has it.
+fn server_mark() -> String {
+    server_mark_of(&Config::get_option("key"))
+}
+
+fn server_mark_of(key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    let hash = hbb_common::sodiumoxide::crypto::hash::sha256::hash(
+        format!("lan-discovery:{key}").as_bytes(),
+    );
+    hash.0[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether a discovery message marked `theirs` is from a client on the server marked `ours`.
+fn same_server(ours: &str, theirs: &str) -> bool {
+    ours.is_empty() || ours == theirs
+}
+
 #[cfg(not(target_os = "ios"))]
 pub(super) fn start_listening() -> ResultType<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], get_broadcast_port()));
@@ -40,6 +67,7 @@ pub(super) fn start_listening() -> ResultType<()> {
                                 "enable-lan-discovery",
                                 &Config::get_option("enable-lan-discovery"),
                             )
+                            && same_server(&server_mark(), &p.misc)
                         {
                             let id = Config::get_id();
                             if p.id == id {
@@ -59,6 +87,7 @@ pub(super) fn start_listening() -> ResultType<()> {
                                     hostname,
                                     username: crate::platform::get_active_username(),
                                     platform: whoami::platform().to_string(),
+                                    misc: server_mark(),
                                     ..Default::default()
                                 };
                                 msg_out.set_peer_discovery(peer);
@@ -206,6 +235,7 @@ fn send_query() -> ResultType<Vec<UdpSocket>> {
     let peer = PeerDiscovery {
         cmd: "ping".to_owned(),
         id,
+        misc: server_mark(),
         ..Default::default()
     };
     msg_out.set_peer_discovery(peer);
@@ -231,6 +261,7 @@ fn wait_response(
         Ok(addr) => addr.ip().is_unspecified(),
     };
     let mut mac: Option<String> = None;
+    let server = server_mark();
 
     socket.set_read_timeout(timeout)?;
     loop {
@@ -241,6 +272,9 @@ fn wait_response(
                     Some(rendezvous_message::Union::PeerDiscovery(p)) => {
                         last_recv_time = Instant::now();
                         if p.cmd == "pong" {
+                            if !same_server(&server, &p.misc) {
+                                continue;
+                            }
                             if !crate::common::is_valid_untrusted_peer_id(&p.id) {
                                 log::warn!(
                                     "Ignoring LAN discovery response from {} with invalid peer id",
@@ -311,7 +345,15 @@ fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::Di
 }
 
 async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>) -> ResultType<()> {
-    let mut peers = config::LanPeers::load().peers;
+    // Peers stored before discovery told servers apart, or while on another server, are not
+    // known to be on this one: start over once.
+    let server = server_mark();
+    let mut peers = if config::LocalConfig::get_option(OPTION_LAN_PEERS_SERVER) == server {
+        config::LanPeers::load().peers
+    } else {
+        config::LocalConfig::set_option(OPTION_LAN_PEERS_SERVER.to_owned(), server);
+        Vec::new()
+    };
     peers.iter_mut().for_each(|peer| {
         peer.online = false;
     });
@@ -349,4 +391,34 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
     #[cfg(feature = "flutter")]
     crate::flutter_ffi::main_load_lan_peers();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{same_server, server_mark_of};
+
+    #[test]
+    fn the_mark_tells_servers_apart_without_showing_the_key() {
+        let ours = server_mark_of("key of our server");
+        assert_eq!(ours.len(), 16);
+        assert!(ours.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(ours, server_mark_of("key of our server"));
+        assert_ne!(ours, server_mark_of("key of another server"));
+        assert_eq!(server_mark_of(""), "");
+    }
+
+    #[test]
+    fn only_clients_on_our_server_count_once_we_have_one() {
+        let ours = server_mark_of("key of our server");
+        assert!(same_server(&ours, &ours));
+        // Another server's client, and one that says nothing: stock RustDesk, or an older build.
+        assert!(!same_server(
+            &ours,
+            &server_mark_of("key of another server")
+        ));
+        assert!(!same_server(&ours, ""));
+        // Without a key of our own, discovery is everyone's.
+        assert!(same_server("", ""));
+        assert!(same_server("", &ours));
+    }
 }
