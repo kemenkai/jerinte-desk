@@ -3367,6 +3367,10 @@ mod tests {
             },
         );
 
+        // A direct connection: through a relay, a peer that does not say it measures its path is
+        // asked for 30 at most, and that is not what is looked at here.
+        remote.handler.lc.write().unwrap().direct = Some(true);
+
         for (manual_fps, expected) in [(None, 20), (Some(90), 90), (None, 20)] {
             if let Some(fps) = manual_fps {
                 let lc = &remote.handler.lc;
