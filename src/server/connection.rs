@@ -386,7 +386,13 @@ pub struct Connection {
     block_input: bool,
     privacy_mode: bool,
     control_permissions: Option<ControlPermissions>,
+    relayed: bool, // through the relay, where the stream keeps under the relay's limit
     last_test_delay: Option<Instant>,
+    // What the path delivers, from the probes: the video written to the stream so far, how much
+    // of it was written when the outstanding probe went out, and the last answered probe.
+    video_bytes_sent: u64,
+    probe_video_bytes: u64,
+    answered_probe: Option<AnsweredProbe>,
     network_delay: u32,
     lock_after_session_end: bool,
     show_remote_cursor: bool,
@@ -507,6 +513,34 @@ impl Subscriber for ConnInner {
 }
 
 const TEST_DELAY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A probe that came back: when it went out, how much video the connection had written to the
+/// stream by then, and when the viewer says it arrived, by the viewer's own clock (0 from one
+/// that does not say).
+#[derive(Debug, Clone, Copy)]
+struct AnsweredProbe {
+    sent: Instant,
+    video_bytes: u64,
+    received_at: u64,
+}
+
+impl AnsweredProbe {
+    /// What went between the probe `before` and this one: the bytes of video, the time between
+    /// their going out, and the time between their arriving. The probes travel in order with the
+    /// video, so those bytes arrived in that time. `None` when the viewer does not say when, or
+    /// its times do not go forward.
+    fn delivery_since(&self, before: Option<&AnsweredProbe>) -> Option<(u64, Duration, Duration)> {
+        let before = before?;
+        if before.received_at == 0 || self.received_at <= before.received_at {
+            return None;
+        }
+        Some((
+            self.video_bytes.checked_sub(before.video_bytes)?,
+            self.sent.checked_duration_since(before.sent)?,
+            Duration::from_millis(self.received_at - before.received_at),
+        ))
+    }
+}
 const SEC30: Duration = Duration::from_secs(30);
 const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
@@ -544,6 +578,7 @@ impl Connection {
         let super::ConnectionMeta {
             control_permissions,
             controlled_context,
+            relayed,
         } = meta;
         // Android is not supported yet, so we always set control_permissions to None.
         #[cfg(target_os = "android")]
@@ -610,7 +645,11 @@ impl Connection {
             block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
             privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
             control_permissions,
+            relayed,
             last_test_delay: None,
+            video_bytes_sent: 0,
+            probe_video_bytes: 0,
+            answered_probe: None,
             network_delay: 0,
             lock_after_session_end: false,
             show_remote_cursor: false,
@@ -1102,6 +1141,8 @@ impl Connection {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
+                    // Written: the probes mark how much of it was, each when it goes out.
+                    conn.video_bytes_sent += value.compute_size();
                 },
                 Some((instant, value)) = rx.recv() => {
                     let latency = instant.elapsed().as_millis() as i64;
@@ -1208,10 +1249,19 @@ impl Connection {
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
                     if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
                         conn.last_test_delay = Some(Instant::now());
+                        conn.probe_video_bytes = conn.video_bytes_sent;
                         let mut msg_out = Message::new();
+                        // The stream's state is told to those who watch it, not to a file
+                        // transfer that shares the process.
+                        let watches = conn.is_authed_remote_conn() || conn.view_camera;
+                        let (target_bitrate, qos_state) = {
+                            let qos = video_service::VIDEO_QOS.lock().unwrap();
+                            (qos.bitrate(), if watches { qos.qos_state() } else { 0 })
+                        };
                         msg_out.set_test_delay(TestDelay{
                             last_delay: conn.network_delay,
-                            target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
+                            target_bitrate,
+                            qos_state,
                             ..Default::default()
                         });
                         conn.send(msg_out.into()).await;
@@ -1960,6 +2010,12 @@ impl Connection {
             self.tx_from_authed.clone(),
             self.lr.clone(),
         ));
+        if self.relayed {
+            video_service::VIDEO_QOS
+                .lock()
+                .unwrap()
+                .user_relayed(self.inner.id(), true);
+        }
         self.session_last_recv_time = SESSIONS
             .lock()
             .unwrap()
@@ -2133,6 +2189,7 @@ impl Connection {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
+            measured_qos: true,
             ..Default::default()
         })
         .into();
@@ -3188,10 +3245,23 @@ impl Connection {
                 if let Some(tm) = self.last_test_delay {
                     self.last_test_delay = None;
                     let new_delay = tm.elapsed().as_millis() as u32;
-                    video_service::VIDEO_QOS
-                        .lock()
-                        .unwrap()
-                        .user_network_delay(self.inner.id(), new_delay);
+                    let probe = AnsweredProbe {
+                        sent: tm,
+                        video_bytes: self.probe_video_bytes,
+                        received_at: t.received_at,
+                    };
+                    {
+                        let mut qos = video_service::VIDEO_QOS.lock().unwrap();
+                        // What the path delivered comes first: the delay may call for a cut,
+                        // and the cut is sized by it.
+                        if let Some((bytes, sent, received)) =
+                            probe.delivery_since(self.answered_probe.as_ref())
+                        {
+                            qos.user_delivery(self.inner.id(), bytes, sent, received);
+                        }
+                        qos.user_network_delay(self.inner.id(), new_delay);
+                    }
+                    self.answered_probe = Some(probe);
                     self.network_delay = new_delay;
                 }
             }
@@ -7997,5 +8067,65 @@ mod test {
         // is all three fields, and either of those is someone else's screen to lock.
         assert!(!replaced_by(&conn(3, remote, key(8, "peer")), 2, &mine));
         assert!(!replaced_by(&conn(3, remote, key(7, "other")), 2, &mine));
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn probe(sent: Instant, video_bytes: u64, received_at: u64) -> AnsweredProbe {
+        AnsweredProbe {
+            sent,
+            video_bytes,
+            received_at,
+        }
+    }
+
+    #[test]
+    fn what_went_between_two_probes_is_what_arrived_between_them() {
+        let t0 = Instant::now();
+        let first = probe(t0, 1_000_000, 5_000);
+        // A second later 2.5 MB more were written; the viewer had the probe 2.2 s after the first.
+        let second = probe(t0 + Duration::from_secs(1), 3_500_000, 7_200);
+        assert_eq!(
+            second.delivery_since(Some(&first)),
+            Some((
+                2_500_000,
+                Duration::from_secs(1),
+                Duration::from_millis(2_200)
+            ))
+        );
+        // The first probe of a connection has none before it.
+        assert_eq!(first.delivery_since(None), None);
+    }
+
+    #[test]
+    fn a_viewer_that_does_not_say_when_gives_no_delivery() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        // A viewer from before the field echoes the probe as it came: 0.
+        assert_eq!(
+            probe(later, 10, 0).delivery_since(Some(&probe(t0, 0, 0))),
+            None
+        );
+        // It said when for the one and not for the other.
+        assert_eq!(
+            probe(later, 10, 9).delivery_since(Some(&probe(t0, 0, 0))),
+            None
+        );
+        assert_eq!(
+            probe(later, 10, 0).delivery_since(Some(&probe(t0, 0, 9))),
+            None
+        );
+        // Its clock did not go forward, as after it started over.
+        assert_eq!(
+            probe(later, 10, 9).delivery_since(Some(&probe(t0, 0, 9))),
+            None
+        );
+        assert_eq!(
+            probe(later, 10, 3).delivery_since(Some(&probe(t0, 0, 9))),
+            None
+        );
     }
 }

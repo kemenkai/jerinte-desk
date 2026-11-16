@@ -871,5 +871,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Trust duration (days)", "信任有效期（天）"),
         ("Renew trust", "延长信任有效期"),
         ("install-directory-not-empty-tip", "所选文件夹不为空。安装可能删除现有数据。建议选择其他文件夹。"),
+        ("qos-lowered-tip", "网络带宽不足，画质已自动降低，网络恢复后会自动回升。"),
+        ("qos-restored-tip", "网络已恢复，画质已回到设定值。"),
     ].iter().cloned().collect();
 }

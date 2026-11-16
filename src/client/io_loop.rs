@@ -424,6 +424,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             fps_instant = Instant::now();
                             let mut speed = self.data_count.swap(0, Ordering::Relaxed);
                             speed = speed * 1000 / elapsed as usize;
+                            let bytes_per_sec = speed;
                             let speed = format!("{:.2}kB/s", speed as f32 / 1024 as f32);
 
                             let fps = self.video_threads.iter().map(|(k, v)| {
@@ -433,6 +434,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
+                            self.log_qos(bytes_per_sec, &fps, elapsed as u64, direct);
                             self.fps_control(direct, fps.clone(), &mut peer).await;
                             let chroma = self.chroma.read().unwrap().clone();
                             let chroma = match chroma {
@@ -1594,6 +1596,36 @@ impl<T: InvokeUiSession> Remote<T> {
             },
             None => false,
         }
+    }
+
+    /// Hands the second's measurements to the quality report, and writes its `[CONN-QOS]` line
+    /// when one is due. The frame rate is that of the busiest display.
+    fn log_qos(
+        &self,
+        bytes_per_sec: usize,
+        fps: &HashMap<usize, i32>,
+        elapsed_ms: u64,
+        direct: bool,
+    ) {
+        let fps = fps.values().copied().max().unwrap_or(0);
+        // The id is read before the lock is taken: `get_id` reads the same lock.
+        let id = self.handler.get_id();
+        let mut lc = self.handler.lc.write().unwrap();
+        let Some(fields) =
+            lc.qos_report
+                .on_status(bytes_per_sec, fps, Duration::from_millis(elapsed_ms))
+        else {
+            return;
+        };
+        let transport = lc.conn_path.as_ref().map_or("-", |p| p.transport.as_str());
+        let codec = if self.video_format == CodecFormat::Unknown {
+            "-".to_owned()
+        } else {
+            self.video_format.to_string()
+        };
+        log::info!(
+            "[CONN-QOS] id={id} transport={transport} direct={direct} codec={codec} {fields}"
+        );
     }
 
     // Currently, this function only considers decoding speed and queue length, not network delay.

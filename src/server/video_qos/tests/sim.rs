@@ -201,6 +201,13 @@ pub struct Scenario {
     pub encoder: EncoderModel,
     pub link: Link,
     pub seed: u64,
+    /// Fork: the viewer says when the probes reach it, as one of this version does, so the
+    /// controller learns what the path delivered between them.
+    pub reports: bool,
+    /// Fork: how much the send buffers between the encoder and the path hold, in kbit.  Full,
+    /// they hold the video loop up, as a connection whose send is blocked does.  `None`: without
+    /// limit, as the model always was.
+    pub send_buffer_kbit: Option<f64>,
 }
 
 /// Bitrate at ratio 1.0; balanced quality (0.67) then encodes at about 4 Mbps.
@@ -265,6 +272,18 @@ struct Packet {
     bits: f64,
     enqueued_ms: u32,
     probe_sent_ms: Option<u32>,
+    /// For a probe: the video handed to the path before it, in bits.
+    video_bits_before: f64,
+}
+
+/// A probe's reply on its way back to the controller.
+struct Reply {
+    arrive_ms: u32,
+    delay_ms: u32,
+    sent_ms: u32,
+    video_bits_before: f64,
+    /// When the probe left the path, which is when the viewer has it.
+    reached_ms: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +356,10 @@ pub fn run(sc: &Scenario) -> Report {
 
     let mut qos = super::smoke::session(sc.limit, sc.quality);
     qos.abr_config = sc.abr;
+    if sc.quality.is_custom() {
+        // As when the viewer sets its quality: a target above the presets is climbed to.
+        qos.ratio = qos.ratio_for_target();
+    }
     if sc.abr {
         qos.new_display("sim".to_owned());
         qos.set_support_changing_quality("sim", true);
@@ -347,7 +370,12 @@ pub fn run(sc: &Scenario) -> Report {
     let mut encode_phase = 0.0_f64;
     let mut encoded_this_second = 0_usize;
     let mut probe_sent: Option<u32> = None;
-    let mut replies: Vec<(u32, u32)> = Vec::new(); // (arrive_ms, delay_ms)
+    let mut replies: Vec<Reply> = Vec::new();
+    // What the video loop reports every second, and what the probes mark.
+    let mut video_bits = 0.0_f64;
+    let mut second_bits = 0.0_f64;
+    let mut second_held_ms = 0_u32;
+    let mut answered: Option<(u32, f64, u32)> = None; // (sent_ms, video bits before, reached_ms)
     let restore_ms = sc.link.restore_ms();
 
     let mut fps_samples = Vec::new();
@@ -377,7 +405,15 @@ pub fn run(sc: &Scenario) -> Report {
             Content::Video => fps as f64,
             Content::Office => (fps as f64).min(2.0),
         };
-        encode_phase += produce_rate * TICK_MS as f64 / 1000.0;
+        // Full send buffers hold the video loop up: nothing is encoded meanwhile.
+        if sc
+            .send_buffer_kbit
+            .is_some_and(|kbit| queued_bits > kbit * 1000.0)
+        {
+            second_held_ms += TICK_MS;
+        } else {
+            encode_phase += produce_rate * TICK_MS as f64 / 1000.0;
+        }
         while encode_phase >= 1.0 {
             encode_phase -= 1.0;
             encoded_this_second += 1;
@@ -389,8 +425,11 @@ pub fn run(sc: &Scenario) -> Report {
                 bits,
                 enqueued_ms: now,
                 probe_sent_ms: None,
+                video_bits_before: 0.0,
             });
             queued_bits += bits;
+            video_bits += bits;
+            second_bits += bits;
         }
 
         // Shared path drain: probes are tiny and leave as soon as they reach the head.
@@ -401,7 +440,13 @@ pub fn run(sc: &Scenario) -> Report {
                 if let Some(sent) = head.probe_sent_ms {
                     let round_trip = sc.link.base_rtt_ms + probe_jitter_ms[(sent / 1000) as usize];
                     let arrive = now + round_trip as u32;
-                    replies.push((arrive, arrive - sent));
+                    replies.push(Reply {
+                        arrive_ms: arrive,
+                        delay_ms: arrive - sent,
+                        sent_ms: sent,
+                        video_bits_before: head.video_bits_before,
+                        reached_ms: now,
+                    });
                     queue.pop_front();
                     continue;
                 }
@@ -420,11 +465,27 @@ pub fn run(sc: &Scenario) -> Report {
         }
 
         // Probe replies reach the controller.
-        replies.sort_by_key(|r| r.0);
-        while replies.first().is_some_and(|r| r.0 <= now) {
-            let (_, delay) = replies.remove(0);
+        replies.sort_by_key(|r| r.arrive_ms);
+        while replies.first().is_some_and(|r| r.arrive_ms <= now) {
+            let reply = replies.remove(0);
+            let delay = reply.delay_ms;
             max_delay = max_delay.max(delay);
             probe_sent = None;
+            if sc.reports {
+                // As the connection does: the video written between two probes, the time between
+                // their going out, and the time between their reaching the viewer.
+                if let Some((sent_ms, bits, reached_ms)) = answered {
+                    if reply.reached_ms > reached_ms {
+                        qos.user_delivery(
+                            1,
+                            ((reply.video_bits_before - bits) / 8.0) as u64,
+                            Duration::from_millis((reply.sent_ms - sent_ms) as u64),
+                            Duration::from_millis((reply.reached_ms - reached_ms) as u64),
+                        );
+                    }
+                }
+                answered = Some((reply.sent_ms, reply.video_bits_before, reply.reached_ms));
+            }
             qos.user_network_delay(1, delay);
         }
 
@@ -436,13 +497,23 @@ pub fn run(sc: &Scenario) -> Report {
                     bits: 0.0,
                     enqueued_ms: now,
                     probe_sent_ms: Some(now),
+                    video_bits_before: video_bits,
                 });
             }
             qos.user_delay_response_elapsed(1, (now - probe_sent.unwrap()) as u128);
             if sc.abr {
+                qos.update_display_rates(
+                    "sim",
+                    (second_bits / 8.0) as usize,
+                    encoded_this_second,
+                    Duration::from_millis(second_held_ms as u64),
+                    Duration::from_secs(1),
+                );
                 qos.update_display_data("sim", encoded_this_second);
             }
             encoded_this_second = 0;
+            second_bits = 0.0;
+            second_held_ms = 0;
         }
 
         if now % 100 == 0 {
@@ -644,6 +715,8 @@ pub fn scenarios() -> Vec<Scenario> {
         encoder,
         link,
         seed: 1,
+        reports: false,
+        send_buffer_kbit: None,
     };
     use EncoderModel::*;
     vec![

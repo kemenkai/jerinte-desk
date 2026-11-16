@@ -295,5 +295,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         // Server entry names shown in the status bar; the key itself is lowercase.
         ("lan", "LAN"),
         ("wan", "WAN"),
+        // The stream quality following the network.
+        ("qos-lowered-tip", "Slow network: the image quality has been lowered. It rises again when the network recovers."),
+        ("qos-restored-tip", "Network recovered: image quality is back to your setting."),
     ].iter().cloned().collect();
 }

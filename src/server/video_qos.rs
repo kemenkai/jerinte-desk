@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Fork extension: how far the bitrate goes and how it comes back, from measured rates.
+mod capacity;
+
 /*
 FPS adjust:
 a. new user connected => set to INIT_FPS
@@ -266,6 +269,8 @@ struct UserData {
     delay: UserDelay,
     record: bool,
     joined_at: Option<Instant>, // set by on_connection_open; the start-up guard's clock
+    deliveries: capacity::Deliveries, // fork: what the path delivered to it between probes
+    relayed: bool,              // fork: its connection goes through the relay
 }
 
 impl UserData {
@@ -285,6 +290,10 @@ impl UserData {
 struct DisplayData {
     send_counter: usize, // Number of times encode during period
     support_changing_quality: bool,
+    rates: capacity::Rates, // fork: what its video loop encoded and waited, second by second
+    restartable: bool,      // fork: its encoder may be created again for another bitrate
+    restart: bool,          // fork: and is to be, for the ratio its video loop now reads
+    known: bool,            // fork: its encoder is there, so what it can do is known
 }
 
 // Main QoS controller structure
@@ -297,6 +306,14 @@ pub struct VideoQoS {
     adjust_ratio_instant: Instant,
     abr_config: bool,
     first_reply_adjusts_ratio: bool, // false on Linux, where it can create vaapi twice
+    // Fork extension, see `capacity`.
+    capacity: capacity::Capacity,
+    relay_cap_kbps: u32, // the relay's limit for a session through it, 0 for none
+    ratio_cap: Option<f32>, // the ratio the relay's limit and the path's ceiling come to
+    bitrate_ratio: f32,  // the ratio `bitrate_store` is the encoder's bitrate at
+    ratio_at_rates: f32, // the ratio when a video loop last said what it had sent
+    steady_seconds: u8,  // for how many such seconds the ratio has not moved
+    restart: capacity::Restart,
     #[cfg(test)]
     test_now: Option<Instant>,
 }
@@ -312,6 +329,13 @@ impl Default for VideoQoS {
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             first_reply_adjusts_ratio: !cfg!(target_os = "linux"),
+            capacity: Default::default(),
+            relay_cap_kbps: 0,
+            ratio_cap: None,
+            bitrate_ratio: 0.0,
+            ratio_at_rates: 0.0,
+            steady_seconds: 0,
+            restart: Default::default(),
             #[cfg(test)]
             test_now: None,
         }
@@ -358,6 +382,7 @@ impl VideoQoS {
     // Store bitrate for later use
     pub fn store_bitrate(&mut self, bitrate: u32) {
         self.bitrate_store = bitrate;
+        self.bitrate_ratio = self.ratio; // fork: the encoder was just set to it
     }
 
     // Get stored bitrate
@@ -381,6 +406,10 @@ impl VideoQoS {
     pub fn set_support_changing_quality(&mut self, video_service_name: &str, support: bool) {
         if let Some(display) = self.displays.get_mut(video_service_name) {
             display.support_changing_quality = support;
+            display.known = true;
+        }
+        if !support {
+            self.encoder_cannot_follow();
         }
     }
 
@@ -400,6 +429,7 @@ impl VideoQoS {
         };
         self.users.insert(id, user);
         self.abr_config = Config::get_option("enable-abr") != "N";
+        self.viewers_changed();
     }
 
     // Clean up user session
@@ -411,6 +441,7 @@ impl VideoQoS {
         }
         // The stream follows the remaining viewers at once; a departed viewer's
         // start-up guard left with its entry.
+        self.viewers_changed();
         self.adjust_fps();
     }
 
@@ -449,8 +480,8 @@ impl VideoQoS {
         let quality = Some((hbb_common::get_time(), convert_quality(image_quality)));
         if let Some(user) = self.users.get_mut(&id) {
             user.quality = quality;
-            // update ratio directly
-            self.ratio = self.latest_quality().ratio();
+            // update ratio directly; a target above the presets is climbed to (see `capacity`)
+            self.ratio = self.ratio_for_target();
         }
     }
 
@@ -638,6 +669,7 @@ impl VideoQoS {
     pub fn new_display(&mut self, video_service_name: String) {
         self.displays
             .insert(video_service_name, DisplayData::default());
+        self.encoder_created();
     }
 
     pub fn remove_display(&mut self, video_service_name: &str) {
@@ -651,6 +683,7 @@ impl VideoQoS {
         self.adjust_fps();
         let abr_enabled = self.in_vbr_state();
         if abr_enabled {
+            self.climb_from_start(send_counter);
             if self.since(self.adjust_ratio_instant).as_secs() >= ADJUST_RATIO_INTERVAL as u64 {
                 let dynamic_screen = self
                     .displays
@@ -658,8 +691,10 @@ impl VideoQoS {
                     .any(|d| d.1.send_counter >= ADJUST_RATIO_INTERVAL * DYNAMIC_SCREEN_THRESHOLD);
                 self.adjust_ratio(dynamic_screen);
             }
+        } else if self.restart_only() {
+            self.restart_only_step(send_counter);
         } else {
-            self.ratio = self.latest_quality().ratio();
+            self.follow_target();
         }
     }
 
@@ -751,9 +786,9 @@ impl VideoQoS {
             return;
         }
 
-        let target_ratio = self.latest_quality().ratio();
         let current_ratio = self.ratio;
         let current_bitrate = self.bitrate();
+        let asked = self.most_asked();
 
         // Calculate ratio for adding 150kbps bandwidth
         let ratio_add_150kbps = if current_bitrate > 0 {
@@ -763,15 +798,35 @@ impl VideoQoS {
         };
 
         let min = self.min_ratio();
-        let max = target_ratio * MAX_BR_MULTIPLE;
+        // The viewer's target, or less through the relay or under the path's ceiling; never
+        // under the floor.
+        let mut max = (self.max_ratio() * MAX_BR_MULTIPLE).max(min);
 
         let mut v = current_ratio;
+        // Whether the way up follows the table below, as it does without measured rates.
+        let mut table_raise = true;
 
         // Three bad replies in a row confirm congestion; with a bitrate-targeted
         // encoder the bitrate is then the only thing that drains the queue, so it
         // comes down hard.  Increases need every viewer below the threshold.
         if let Some(factor) = reduction {
-            v = current_ratio * factor;
+            // Where the deliveries say what the path carries, below that in one step, and
+            // nothing further while the queue of such a cut is being sent; else by the table.
+            v = self
+                .cut_by_delivery(current_ratio, min)
+                .unwrap_or(current_ratio * factor);
+            self.capacity.end_start();
+        } else if self.capacity.starting() {
+            // The climb from the start keeps its own pace, in `update_display_data`.
+            self.reset_send_counters();
+            return;
+        } else if self.climbs_by_measure() {
+            table_raise = false;
+            if dynamic_screen {
+                v = self.raise_by_measure(current_ratio, max_delay);
+                // The step may have raised what the ceiling allows.
+                max = (self.max_ratio() * MAX_BR_MULTIPLE).max(min);
+            }
         } else if max_delay < 50 {
             if dynamic_screen {
                 v = current_ratio * 1.15;
@@ -785,7 +840,7 @@ impl VideoQoS {
         }
 
         // Limit quality increase rate for better stability
-        if let Some(ratio_add_150kbps) = ratio_add_150kbps {
+        if let Some(ratio_add_150kbps) = ratio_add_150kbps.filter(|_| table_raise) {
             if v > ratio_add_150kbps
                 && ratio_add_150kbps > current_ratio
                 && current_ratio >= BR_SPEED
@@ -810,6 +865,7 @@ impl VideoQoS {
             }
         }
         self.ratio = v.clamp(min, max);
+        self.note_ratio_change(current_ratio, asked, reduction.is_some());
         self.reset_send_counters();
         self.adjust_ratio_instant = self.now();
     }
@@ -971,6 +1027,8 @@ mod tests {
 
     mod adaptation;
     mod baseline;
+    mod capacity_sim; // fork: the scenarios of `capacity`, on the simulation below
+    mod capacity_wiring; // fork: `capacity` through the controller's own doors
     mod jitter;
     mod recovery;
     mod sim;

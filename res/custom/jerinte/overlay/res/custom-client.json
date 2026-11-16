@@ -1,7 +1,9 @@
 {
   "app-display-name": "jerinteDesk",
   "default-settings": {
-    "image-quality": "best"
+    "image-quality": "custom",
+    "custom-image-quality": "300",
+    "custom-fps": "60"
   },
   "override-settings": {
     "custom-rendezvous-server": "@secret",
@@ -12,6 +14,7 @@
     "key": "@secret",
     "allow-websocket": "Y",
     "enable-webrtc": "Y",
+    "relay-max-bitrate": "10000",
     "ice-servers": "stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478,stun:stun.hitv.com:3478,stun:stun.cloudflare.com:3478,stun:stun.nextcloud.com:443",
     "allow-insecure-tls-fallback": "N",
     "allow-auto-update": "N",

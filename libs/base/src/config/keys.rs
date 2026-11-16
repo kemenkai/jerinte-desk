@@ -77,6 +77,9 @@ pub const OPTION_WINDOWS_SERVICE_VIDEO_SAVE_DIRECTORY: &str =
     "windows-service-video-save-directory";
 pub const OPTION_VIDEO_SAVE_DIRECTORY: &str = "video-save-directory";
 pub const OPTION_ENABLE_ABR: &str = "enable-abr";
+/// The most a session through the relay sends, in kbps; empty or 0 for no limit. The relay is one
+/// line that every relayed session shares.
+pub const OPTION_RELAY_MAX_BITRATE: &str = "relay-max-bitrate";
 pub const OPTION_ALLOW_REMOVE_WALLPAPER: &str = "allow-remove-wallpaper";
 pub const OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER: &str = "allow-always-software-render";
 pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
@@ -314,6 +317,7 @@ pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_ALLOW_AUTO_RECORD_INCOMING,
     OPTION_WINDOWS_SERVICE_VIDEO_SAVE_DIRECTORY,
     OPTION_ENABLE_ABR,
+    OPTION_RELAY_MAX_BITRATE,
     OPTION_ALLOW_REMOVE_WALLPAPER,
     OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER,
     OPTION_ENABLE_HWCODEC,

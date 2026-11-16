@@ -283,6 +283,7 @@ impl<'a> StaticRefresh<'a> {
                 .unwrap()
                 .as_mut()
                 .map(|r| r.write_message(&msg, self.width, self.height));
+            super::count_sent(&msg);
             let send_conn_ids = self.sp.send_video_frame(msg);
             frame_controller.set_send(now, send_conn_ids);
             // Static refinement must not count as motion for adaptive bitrate.

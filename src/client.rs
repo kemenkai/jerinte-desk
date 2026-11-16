@@ -103,6 +103,7 @@ mod audio_state_tests;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
+pub mod qos_report;
 pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
@@ -2910,6 +2911,23 @@ pub struct ConnPathInfo {
     pub rtt_logged: bool,
 }
 
+/// The custom image quality and the frame rate asked at the most of a peer through the relay
+/// that does not say it measures what the path carries (`Features.measured_qos`): the best
+/// preset's bitrate, 75% being its ratio of 1.5, at thirty frames. That is what such a peer was
+/// asked before the built-in default went up; it jumps to whatever it is asked, keeps no limit
+/// for the relay, and climbs back from a cut by 150 kbps at a time.
+const RELAY_QUALITY: i32 = 75;
+const RELAY_FPS: i32 = 30;
+
+/// `value` as it is asked of the peer: no more than `most` when `guarded`.
+fn asked_through_relay(value: i32, most: i32, guarded: bool) -> i32 {
+    if guarded {
+        value.min(most)
+    } else {
+        value
+    }
+}
+
 /// Login config handler for [`Client`].
 #[derive(Default)]
 pub struct LoginConfigHandler {
@@ -2938,6 +2956,8 @@ pub struct LoginConfigHandler {
     pub session_id: u64, // used for local <-> server communication
     /// 本次连接的路径遥测(阶段 1),连接建立时填,首个 RTT 到达时读。
     pub conn_path: Option<ConnPathInfo>,
+    /// The stream's quality as this side sees it: the `[CONN-QOS]` line and the notices.
+    pub qos_report: qos_report::QosReport,
     pub supported_encoding: SupportedEncoding,
     restarting_remote_device: bool,
     // Start time of the restart grace window. On Windows the peer may briefly
@@ -3081,6 +3101,9 @@ impl LoginConfigHandler {
         }
 
         self.direct = None;
+        // What the last peer said it can do is not what this one can: until its own PeerInfo
+        // comes, it has said nothing (see `guarded_for_relay`).
+        self.features = None;
         self.received = false;
         #[cfg(feature = "flutter")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -3440,6 +3463,66 @@ impl LoginConfigHandler {
         &mut self.config
     }
 
+    /// The custom image quality that is set for the peer and, with the Flutter UI, the frame
+    /// rate, within what a public server's relay is asked for.
+    fn custom_quality_set(&self) -> (i32, Option<i32>) {
+        let config = self.load_config();
+        let allow_more = !crate::using_public_server() || self.direct == Some(true);
+        let quality = match config.custom_image_quality.first() {
+            None => 50,
+            Some(quality) if !allow_more && *quality > 100 => 50,
+            Some(quality) => *quality,
+        };
+        #[cfg(feature = "flutter")]
+        let custom_fps = self.options.get("custom-fps").map(|custom_fps| {
+            let custom_fps = custom_fps.parse().unwrap_or(30);
+            if !allow_more && custom_fps > 30 {
+                30
+            } else {
+                custom_fps
+            }
+        });
+        #[cfg(not(feature = "flutter"))]
+        let custom_fps = None;
+        (quality, custom_fps)
+    }
+
+    /// Whether a custom quality is asked of the peer only up to `RELAY_QUALITY` and
+    /// `RELAY_FPS`: through the relay, unless the peer says it measures what the path carries.
+    /// Before its `PeerInfo` has come, it has not said so.
+    fn guarded_for_relay(&self) -> bool {
+        self.direct != Some(true) && !self.features.as_ref().is_some_and(|f| f.measured_qos)
+    }
+
+    /// The image quality and frame rate asked of the peer again once it has said that it measures
+    /// what the path carries: through the relay it was first asked for no more than a peer from
+    /// before that is (`guarded_for_relay`). `None` when there is nothing more to ask.
+    pub fn quality_after_peer_info(&mut self) -> Option<Message> {
+        if self.conn_type != ConnType::DEFAULT_CONN && self.conn_type != ConnType::VIEW_CAMERA {
+            return None;
+        }
+        if self.image_quality != "custom" || self.direct == Some(true) || self.guarded_for_relay() {
+            return None;
+        }
+        let mut option = OptionMessage::new();
+        let (quality, custom_fps) = self.custom_quality_set();
+        if quality > RELAY_QUALITY {
+            option.custom_image_quality = quality << 8;
+        }
+        if let Some(custom_fps) = custom_fps.filter(|fps| *fps > RELAY_FPS) {
+            option.custom_fps = custom_fps;
+            *self.custom_fps.lock().unwrap() = Some(custom_fps as _);
+        }
+        if option.custom_image_quality == 0 && option.custom_fps == 0 {
+            return None;
+        }
+        let mut misc = Misc::new();
+        misc.set_option(option);
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        Some(msg_out)
+    }
+
     /// Get [`OptionMessage`] of the current [`LoginConfigHandler`].
     /// Return `None` if there's no option, for example, when the session is only for file transfer.
     ///
@@ -3466,24 +3549,11 @@ impl LoginConfigHandler {
         if let Some(q) = self.get_image_quality_enum(&q, ignore_default) {
             msg.image_quality = q.into();
         } else if q == "custom" {
-            let config = self.load_config();
-            let allow_more = !crate::using_public_server() || self.direct == Some(true);
-            let quality = if config.custom_image_quality.is_empty() {
-                50
-            } else {
-                let mut quality = config.custom_image_quality[0];
-                if !allow_more && quality > 100 {
-                    quality = 50;
-                }
-                quality
-            };
-            msg.custom_image_quality = quality << 8;
-            #[cfg(feature = "flutter")]
-            if let Some(custom_fps) = self.options.get("custom-fps") {
-                let mut custom_fps = custom_fps.parse().unwrap_or(30);
-                if !allow_more && custom_fps > 30 {
-                    custom_fps = 30;
-                }
+            let (quality, custom_fps) = self.custom_quality_set();
+            let guarded = self.guarded_for_relay();
+            msg.custom_image_quality = asked_through_relay(quality, RELAY_QUALITY, guarded) << 8;
+            if let Some(custom_fps) = custom_fps {
+                let custom_fps = asked_through_relay(custom_fps, RELAY_FPS, guarded);
                 msg.custom_fps = custom_fps;
                 *self.custom_fps.lock().unwrap() = Some(custom_fps as _);
             }
@@ -3627,8 +3697,10 @@ impl LoginConfigHandler {
     /// * `quantizer` - The given quantizer.
     pub fn save_custom_image_quality(&mut self, image_quality: i32) -> Message {
         let mut misc = Misc::new();
+        // Saved as set; asked of the peer as at login (`guarded_for_relay`).
+        let asked = asked_through_relay(image_quality, RELAY_QUALITY, self.guarded_for_relay());
         misc.set_option(OptionMessage {
-            custom_image_quality: image_quality << 8,
+            custom_image_quality: asked << 8,
             ..Default::default()
         });
         let mut msg_out = Message::new();
@@ -3677,8 +3749,10 @@ impl LoginConfigHandler {
     /// * `save_config` - Save the config.
     pub fn set_custom_fps(&mut self, fps: i32, save_config: bool) -> Message {
         let mut misc = Misc::new();
+        // Saved as set; asked of the peer as at login (`guarded_for_relay`).
+        let asked = asked_through_relay(fps, RELAY_FPS, self.guarded_for_relay());
         misc.set_option(OptionMessage {
-            custom_fps: fps,
+            custom_fps: asked,
             ..Default::default()
         });
         let mut msg_out = Message::new();
@@ -3690,7 +3764,7 @@ impl LoginConfigHandler {
                 .insert("custom-fps".to_owned(), fps.to_string());
             self.save_config(config);
         }
-        *self.custom_fps.lock().unwrap() = Some(fps as _);
+        *self.custom_fps.lock().unwrap() = Some(asked as _);
         msg_out
     }
 
@@ -5310,6 +5384,67 @@ pub fn check_if_retry(msgtype: &str, title: &str, text: &str, retry_for_relay: b
                 && !text.to_lowercase().contains("restricted")
                 && !text.to_lowercase().contains("incoming only")
                 && !text.to_lowercase().contains("not allowed")))
+}
+
+#[cfg(test)]
+mod relay_guard_tests {
+    use super::*;
+
+    fn handler(direct: Option<bool>, measures: Option<bool>) -> LoginConfigHandler {
+        LoginConfigHandler {
+            direct,
+            features: measures.map(|measured_qos| Features {
+                measured_qos,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_peer_through_the_relay_is_asked_for_more_only_if_it_measures() {
+        // Before its PeerInfo has come, a peer has not said anything.
+        assert!(handler(Some(false), None).guarded_for_relay());
+        assert!(handler(None, None).guarded_for_relay());
+        // One from before the field, and one that says no.
+        assert!(handler(Some(false), Some(false)).guarded_for_relay());
+        // One that measures; and a direct connection, whatever the peer.
+        assert!(!handler(Some(false), Some(true)).guarded_for_relay());
+        assert!(!handler(Some(true), None).guarded_for_relay());
+        assert!(!handler(Some(true), Some(false)).guarded_for_relay());
+    }
+
+    #[test]
+    fn guarded_it_is_asked_for_the_best_preset_at_the_most() {
+        assert_eq!(asked_through_relay(300, RELAY_QUALITY, true), 75);
+        assert_eq!(asked_through_relay(60, RELAY_FPS, true), 30);
+        // What is set lower stays as set.
+        assert_eq!(asked_through_relay(40, RELAY_QUALITY, true), 40);
+        assert_eq!(asked_through_relay(15, RELAY_FPS, true), 15);
+        // Not guarded, as set.
+        assert_eq!(asked_through_relay(300, RELAY_QUALITY, false), 300);
+        assert_eq!(asked_through_relay(60, RELAY_FPS, false), 60);
+    }
+
+    #[test]
+    fn nothing_more_is_asked_of_a_peer_that_does_not_measure_or_is_not_watched() {
+        let mut direct = handler(Some(true), Some(true));
+        direct.config.image_quality = "custom".to_owned();
+        assert!(
+            direct.quality_after_peer_info().is_none(),
+            "asked in full at login"
+        );
+        let mut old = handler(Some(false), Some(false));
+        old.config.image_quality = "custom".to_owned();
+        assert!(old.quality_after_peer_info().is_none());
+        let mut preset = handler(Some(false), Some(true));
+        preset.config.image_quality = "best".to_owned();
+        assert!(preset.quality_after_peer_info().is_none());
+        let mut transfer = handler(Some(false), Some(true));
+        transfer.config.image_quality = "custom".to_owned();
+        transfer.conn_type = ConnType::FILE_TRANSFER;
+        assert!(transfer.quality_after_peer_info().is_none());
+    }
 }
 
 #[cfg(test)]

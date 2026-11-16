@@ -1014,6 +1014,20 @@ impl InvokeUiSession for FlutterHandler {
 
     fn on_connected(&self, _conn_type: ConnType) {}
 
+    fn notice(&self, key: &str) {
+        // Long enough to read a sentence; the Dart side translates the key.
+        const NOTICE_DURATION_MS: u32 = 6_000;
+        self.push_event(
+            "toast",
+            &[
+                ("type", json!("info")),
+                ("text", json!(key)),
+                ("dur_msec", json!(NOTICE_DURATION_MS)),
+            ],
+            &[],
+        );
+    }
+
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str, retry: bool) {
         if msgtype == "custom-error-trusted-device" {
             const ERROR_DURATION_MS: u32 = 10_000;

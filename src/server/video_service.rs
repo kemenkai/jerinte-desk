@@ -615,8 +615,67 @@ fn get_capturer(
     }
 }
 
+thread_local! {
+    // What this thread's video loop encoded since `check_qos` last read it, in bytes.
+    static SENT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // How long this thread's encoder takes for a frame, averaged over the last frames.
+    static ENCODE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Counts a video frame as encoded by this thread's video loop, for `VideoQoS` to set against
+/// what the viewer says it received.
+fn count_sent(msg: &Message) {
+    use hbb_common::protobuf::Message as _;
+    SENT_BYTES.with(|bytes| bytes.set(bytes.get() + msg.compute_size() as usize));
+}
+
+/// Encodes a frame, and keeps how long this thread's encoder takes for one.
+fn timed_encode(encoder: &mut Encoder, frame: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
+    let started = Instant::now();
+    let result = encoder.encode_to_message(frame, ms);
+    note_encode_time(started.elapsed());
+    result
+}
+
+/// Takes the time a frame took into this thread's average.
+fn note_encode_time(took: Duration) {
+    ENCODE_TIME.with(|time| {
+        time.set(Some(match time.get() {
+            // Up at once, down slowly: the frames of a still screen are quick to encode, and a
+            // few of them must not hide what the frames of a moving one take.
+            Some(average) if took >= average => average.mul_f32(0.5) + took.mul_f32(0.5),
+            Some(average) => average.mul_f32(0.95) + took.mul_f32(0.05),
+            None => took,
+        }))
+    });
+}
+
+/// The pace a slow software encoder is held to at the slowest: thirty frames a second, what the
+/// presets ask for and every machine was asked for before higher frame rates became the default.
+const SLOWEST_PACE: Duration = Duration::from_millis(1000 / 30);
+
+/// The time from one frame to the next, of which `spf` is what the controller asks for.
+///
+/// Above thirty frames a second a software encoder is given at least twice the time it takes for
+/// a frame. Encoding at a frame rate it can hardly keep would hold the processor at it without a
+/// pause, and nothing would bring the frame rate down: the controller follows the network, which
+/// a slow encoder does not load. Up to thirty nothing changes, and a hardware encoder is not held
+/// back at all.
+fn frame_interval(spf: Duration, hardware: bool) -> Duration {
+    if hardware {
+        return spf;
+    }
+    match ENCODE_TIME.with(|time| time.get()) {
+        Some(average) => spf.max((average * 2).min(SLOWEST_PACE)),
+        None => spf,
+    }
+}
+
 fn run(vs: VideoService) -> ResultType<()> {
     let mut _raii = Raii::new(vs.idx, vs.sp.name());
+    // A new encoder: what the last one took and left unread says nothing of it.
+    SENT_BYTES.with(|bytes| bytes.set(0));
+    ENCODE_TIME.with(|time| time.set(None));
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
     //
     // ensure_inited() is needed because clear() may be called.
@@ -686,7 +745,9 @@ fn run(vs: VideoService) -> ResultType<()> {
     }
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
-    let mut quality = video_qos.ratio();
+    // Not always where the stream is: see `ratio_for_creation`. `check_qos` brings an encoder
+    // that follows the ratio to it before the first frame.
+    let mut quality = video_qos.ratio_for_creation();
     let record_incoming = config::option2bool(
         "allow-auto-record-incoming",
         &Config::get_option("allow-auto-record-incoming"),
@@ -734,11 +795,25 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
-    VIDEO_QOS.lock().unwrap().store_bitrate(encoder.bitrate());
+    VIDEO_QOS
+        .lock()
+        .unwrap()
+        .store_bitrate_at(quality, encoder.bitrate());
     VIDEO_QOS
         .lock()
         .unwrap()
         .set_support_changing_quality(&sp.name(), encoder.support_changing_quality());
+    // An encoder that takes a new bitrate only by being created again is created again for the
+    // network on X11 alone, where that does not take the capture down with it, and not while
+    // recording, which it would cut in two.
+    #[cfg(target_os = "linux")]
+    {
+        let restartable = is_x11() && !client_record && recorder.lock().unwrap().is_none();
+        VIDEO_QOS
+            .lock()
+            .unwrap()
+            .set_restartable(&sp.name(), restartable);
+    }
     log::info!("initial quality: {quality:?}");
 
     if sp.is_option_true(OPTION_REFRESH) {
@@ -779,6 +854,8 @@ fn run(vs: VideoService) -> ResultType<()> {
         capture_height,
     );
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    // How long the loop waited for its frames to be taken since `check_qos` last read it.
+    let mut held_up = Duration::ZERO;
 
     while sp.ok() {
         #[cfg(windows)]
@@ -790,6 +867,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             client_record,
             &mut send_counter,
             &mut second_instant,
+            &mut held_up,
             &sp.name(),
         )?;
         // On macOS, a refresh here would destroy a hardware encoder that has been fed a frame but
@@ -1068,12 +1146,15 @@ fn run(vs: VideoService) -> ResultType<()> {
             }
         }
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
+        // A connection whose send is held up takes no frame: this wait is the path being full.
+        held_up += wait_begin.elapsed();
 
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
         log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
-        if elapsed < spf {
-            std::thread::sleep(spf - elapsed);
+        let interval = frame_interval(spf, encoder.is_hardware());
+        if elapsed < interval {
+            std::thread::sleep(interval - elapsed);
         }
     }
 
@@ -1381,7 +1462,7 @@ fn handle_one_frame(
     let mut vpx_no_output = false;
     let first = *first_frame;
     *first_frame = false;
-    match encoder.encode_to_message(frame, ms) {
+    match timed_encode(encoder, frame, ms) {
         Ok(mut vf) => {
             *encode_fail_counter = 0;
             *encoder_warmed_up = true;
@@ -1398,6 +1479,7 @@ fn handle_one_frame(
                 .unwrap()
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
+            count_sent(&msg);
             send_conn_ids = sp.send_video_frame(msg);
         }
         Err(e) => {
@@ -1558,6 +1640,7 @@ fn check_qos(
     client_record: bool,
     send_counter: &mut usize,
     second_instant: &mut Instant,
+    held_up: &mut Duration,
     name: &str,
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
@@ -1575,12 +1658,27 @@ fn check_qos(
             }
         }
     }
+    // Such an encoder is also created again when the controller asks for it: for the network,
+    // or for a custom quality the viewer moved. Asked whether or not the ratio moved since the
+    // last frame: it may have moved before that.
+    if !encoder.support_changing_quality() && video_qos.take_restart_request(name) {
+        log::info!("switch to change quality, asked by qos");
+        bail!("SWITCH");
+    }
     if client_record != video_qos.record() {
         log::info!("switch due to record changed");
         bail!("SWITCH");
     }
     if second_instant.elapsed() > Duration::from_secs(1) {
+        let elapsed = second_instant.elapsed();
         *second_instant = Instant::now();
+        video_qos.update_display_rates(
+            &name,
+            SENT_BYTES.with(|bytes| bytes.replace(0)),
+            *send_counter,
+            std::mem::take(held_up),
+            elapsed,
+        );
         video_qos.update_display_data(&name, *send_counter);
         *send_counter = 0;
     }
@@ -1677,5 +1775,46 @@ mod tests {
         assert!(refresh_allowed(false, false, true));
         // Nothing fed yet: no warm-up to lose, and a refresh can restart a stalled capturer.
         assert!(refresh_allowed(true, false, false));
+    }
+
+    #[test]
+    fn a_slow_software_encoder_is_held_back_only_above_thirty_frames() {
+        use super::{frame_interval, note_encode_time, ENCODE_TIME, SLOWEST_PACE};
+        use std::time::Duration;
+        let (sixty, thirty) = (Duration::from_micros(16_667), Duration::from_micros(33_333));
+        // An encoder that took these milliseconds for its frames, one after the other.
+        let after = |frames: &[u64]| {
+            ENCODE_TIME.with(|time| time.set(None));
+            for ms in frames {
+                note_encode_time(Duration::from_millis(*ms));
+            }
+        };
+        // Nothing encoded yet: the pace asked for.
+        after(&[]);
+        assert_eq!(frame_interval(sixty, false), sixty);
+        // 4 ms a frame leaves sixty frames a second alone.
+        after(&[4; 20]);
+        assert_eq!(frame_interval(sixty, false), sixty);
+        // 12 ms a frame: twice that between frames, which is 41 a second.
+        after(&[12; 20]);
+        assert_eq!(frame_interval(sixty, false), Duration::from_millis(24));
+        // 40 ms a frame: no slower than thirty a second for it, where the loop then runs as
+        // fast as the encoder lets it, as it always did.
+        after(&[40; 20]);
+        assert_eq!(frame_interval(sixty, false), SLOWEST_PACE);
+        // At thirty frames a second or fewer nothing changes, however slow the encoder.
+        assert_eq!(frame_interval(thirty, false), thirty);
+        assert_eq!(
+            frame_interval(Duration::from_millis(100), false),
+            Duration::from_millis(100)
+        );
+        // A hardware encoder is never held back.
+        assert_eq!(frame_interval(sixty, true), sixty);
+        // The quick frames of a still screen do not hide what the frames of a moving one take.
+        let mut frames = vec![12; 20];
+        frames.extend([1; 5]);
+        after(&frames);
+        assert!(frame_interval(sixty, false) > Duration::from_millis(18));
+        ENCODE_TIME.with(|time| time.set(None));
     }
 }

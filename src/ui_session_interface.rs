@@ -1962,6 +1962,9 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn adapt_size(&self);
     fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb);
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str, retry: bool);
+    /// A short word that asks for no answer: a key of the translation tables, which the UI
+    /// translates. A UI without a place for one shows nothing.
+    fn notice(&self, _key: &str) {}
     #[cfg(any(target_os = "android", target_os = "ios"))]
     fn clipboard(&self, content: String);
     fn cancel_msgbox(&self, tag: &str);
@@ -2083,6 +2086,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         *self.last_audit_note.lock().unwrap() = String::new();
         // Save recent peers, then push event to flutter. So flutter can refresh peer page.
         self.lc.write().unwrap().handle_peer_info(&pi);
+        // Through the relay the peer was first asked for no more than one from before
+        // `Features.measured_qos` is; one that says it measures is now asked for what is set.
+        let quality = self.lc.write().unwrap().quality_after_peer_info();
+        if let Some(msg) = quality {
+            self.send(Data::Message(msg));
+        }
         self.set_peer_info(&pi);
         if self.is_file_transfer() {
             self.close_success();
@@ -2149,6 +2158,10 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
         if !t.from_client {
+            // The echo tells the controlled side when its probe arrived here: taken first, before
+            // anything that could take time.
+            let mut t = t;
+            t.received_at = crate::client::qos_report::probe_received_at();
             // 阶段 1 遥测:首个 RTT 到达时,结合建连时记下的传输打一行 [CONN-RTT](每条连接只打一次)。
             // 先取 id 再拿 lc 写锁:get_id() 内部要读同一把 lc 锁,持写锁时调用会自死锁。
             if t.last_delay > 0 {
@@ -2173,6 +2186,15 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 target_bitrate: Some(t.target_bitrate as _),
                 ..Default::default()
             });
+            let notice = self.lc.write().unwrap().qos_report.on_test_delay(
+                t.last_delay,
+                t.target_bitrate,
+                t.qos_state,
+                std::time::Instant::now(),
+            );
+            if let Some(notice) = notice {
+                self.notice(notice.key());
+            }
             handle_test_delay(t, peer).await;
         }
     }

@@ -95,6 +95,8 @@ type ConnMap = HashMap<i32, ConnInner>;
 pub struct ConnectionMeta {
     pub control_permissions: Option<ControlPermissions>,
     pub controlled_context: Option<ControlledContext>,
+    /// The connection goes through the relay, a line every relayed session shares.
+    pub relayed: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -451,6 +453,10 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
+    let meta = ConnectionMeta {
+        relayed: true,
+        ..meta
+    };
     create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
 }
