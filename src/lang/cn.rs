@@ -873,5 +873,16 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("install-directory-not-empty-tip", "所选文件夹不为空。安装可能删除现有数据。建议选择其他文件夹。"),
         ("qos-lowered-tip", "网络带宽不足，画质已自动降低，网络恢复后会自动回升。"),
         ("qos-restored-tip", "网络已恢复，画质已回到设定值。"),
+        ("quality-game", "游戏级"),
+        ("quality-ultra", "超清 60 帧"),
+        ("quality-high", "高清 60 帧"),
+        ("quality-game-tip", "1080p 约 21 Mbps，60 帧。需要直连、带宽 30 Mbps 以上、被控端有硬件编码"),
+        ("quality-ultra-tip", "1080p 约 12 Mbps。需要带宽 20 Mbps 以上；经中继时受中继上限限制"),
+        ("quality-high-tip", "1080p 约 6 Mbps。需要带宽 10 Mbps 以上"),
+        ("quality-best-tip", "1080p 约 3 Mbps，30 帧"),
+        ("quality-balanced-tip", "1080p 约 1.4 Mbps，30 帧"),
+        ("quality-low-tip", "1080p 约 1 Mbps，30 帧"),
+        ("quality-needs-direct-tip", "需要直连，当前连接经过中继"),
+        ("quality-needs-new-peer-tip", "被控端版本较旧，经中继时不可用"),
     ].iter().cloned().collect();
 }

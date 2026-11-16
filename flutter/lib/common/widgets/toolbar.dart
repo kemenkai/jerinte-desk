@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/common/image_quality_tiers.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/common/widgets/login.dart';
@@ -830,30 +831,94 @@ Future<List<TRadioMenu<String>>> toolbarViewStyle(
   ], ownedActionIds: _kToolbarViewStyleActionIds);
 }
 
+/// An image quality's entry in a menu: its name and, under it, what it takes or why it is not to
+/// be had.
+Widget imageQualityMenuEntry(String label, String tip) {
+  return ConstrainedBox(
+    constraints: const BoxConstraints(maxWidth: 300),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(translate(label)),
+        Text(translate(tip),
+            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+      ],
+    ),
+  );
+}
+
 Future<List<TRadioMenu<String>>> toolbarImageQuality(
     BuildContext context, String id, FFI ffi) async {
-  final groupValue =
-      await bind.sessionGetImageQuality(sessionId: ffi.sessionId) ?? '';
+  final sessionId = ffi.sessionId;
+  final imageQuality =
+      await bind.sessionGetImageQuality(sessionId: sessionId) ?? '';
   onChanged(String? value) async {
     if (value == null) return;
-    await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: value);
+    await bind.sessionSetImageQuality(sessionId: sessionId, value: value);
   }
 
+  // The named tiers (see image_quality_tiers.dart) are the custom quality at fixed values. They
+  // are listed where the custom quality dialog offers what they need, more than 100% and a
+  // frame rate: not for a peer too old for these, nor through a public server's relay.
+  bool direct = false;
+  try {
+    direct =
+        ConnectionTypeState.find(id).direct.value == ConnectionType.strDirect;
+  } catch (_) {}
+  final tiersListed = versionCmp(ffi.ffiModel.pi.version, '1.2.2') >= 0 &&
+      (direct || !await bind.mainIsUsingPublicServer());
+  ImageQualityTier? current;
+  if (tiersListed && imageQuality == kRemoteImageQualityCustom) {
+    final quality =
+        await bind.sessionGetCustomImageQuality(sessionId: sessionId);
+    final fps =
+        await bind.sessionGetOption(sessionId: sessionId, arg: 'custom-fps');
+    current = imageQualityTierOf(
+        imageQuality,
+        quality != null && quality.isNotEmpty ? quality[0] : null,
+        imageQualityOptionValue(fps));
+  }
+  final groupValue = current?.id ?? imageQuality;
+  chooseTier(ImageQualityTier tier) async {
+    await bind.sessionSetImageQuality(
+        sessionId: sessionId, value: kRemoteImageQualityCustom);
+    await bind.sessionSetCustomImageQuality(
+        sessionId: sessionId, value: tier.quality);
+    await bind.sessionSetCustomFps(sessionId: sessionId, fps: tier.fps);
+  }
+
+  final peerMeasures = ffi.ffiModel.pi.features.measuredQos;
+  final tiers = !tiersListed
+      ? <TRadioMenu<String>>[]
+      : kImageQualityTiers.map((tier) {
+          // A tier that is not to be had says why, in place of what it takes.
+          final blocked = imageQualityTierBlocked(tier,
+              direct: direct, peerMeasures: peerMeasures);
+          return TRadioMenu<String>(
+              child: imageQualityMenuEntry(tier.label, blocked ?? tier.tip),
+              value: tier.id,
+              groupValue: groupValue,
+              onChanged: blocked != null ? null : (_) => chooseTier(tier));
+        }).toList();
+
   return _registerRadioMenuShortcuts(ffi, [
+    ...tiers,
     TRadioMenu<String>(
-        child: Text(translate('Good image quality')),
+        child: imageQualityMenuEntry('Good image quality', 'quality-best-tip'),
         value: kRemoteImageQualityBest,
         groupValue: groupValue,
         onChanged: onChanged,
         actionId: kShortcutActionImageQualityBest),
     TRadioMenu<String>(
-        child: Text(translate('Balanced')),
+        child: imageQualityMenuEntry('Balanced', 'quality-balanced-tip'),
         value: kRemoteImageQualityBalanced,
         groupValue: groupValue,
         onChanged: onChanged,
         actionId: kShortcutActionImageQualityBalanced),
     TRadioMenu<String>(
-        child: Text(translate('Optimize reaction time')),
+        child:
+            imageQualityMenuEntry('Optimize reaction time', 'quality-low-tip'),
         value: kRemoteImageQualityLow,
         groupValue: groupValue,
         onChanged: onChanged,

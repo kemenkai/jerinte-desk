@@ -188,14 +188,14 @@ mod tests {
 
     #[test]
     fn the_notice_is_a_sentence_in_every_language() {
-        // What the UI makes of the keys: English, the two Chinese tables that carry the texts,
-        // and a language that falls back.
-        for locale in ["en_US", "zh_CN", "zh_TW", "de_DE"] {
+        // The tables the UI translates the keys with: English, which every other language falls
+        // back to, and the two Chinese ones.
+        for lang in ["en", "zh-cn", "zh-tw"] {
             for notice in [Notice::Lowered, Notice::Restored] {
-                let text = crate::lang::translate_locale(notice.key().to_owned(), locale);
+                let text = crate::lang::text_in_table(lang, notice.key()).unwrap_or_default();
                 assert!(
-                    text.len() > 20 && !text.contains("qos-") && !text.contains('{'),
-                    "{locale}: {text}"
+                    text.chars().count() > 10 && !text.contains('{'),
+                    "{lang}: {text}"
                 );
             }
         }

@@ -1494,6 +1494,7 @@ class FfiModel with ChangeNotifier {
       }
       Map<String, dynamic> features = json.decode(evt['features']);
       _pi.features.privacyMode = features['privacy_mode'] == true;
+      _pi.features.measuredQos = features['measured_qos'] == true;
       if (!isCache) {
         handleResolutions(peerId, evt["resolutions"]);
       }
@@ -4570,6 +4571,9 @@ class Resolution {
 
 class Features {
   bool privacyMode = false;
+
+  /// The controlled side sizes its bitrate by what the path is measured to carry.
+  bool measuredQos = false;
 }
 
 const kInvalidDisplayIndex = -1;

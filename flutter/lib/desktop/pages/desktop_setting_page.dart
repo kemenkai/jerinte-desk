@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/common/image_quality_tiers.dart';
 import 'package:flutter_hbb/common/widgets/audio_input.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -2013,6 +2014,13 @@ class _Display extends StatefulWidget {
 }
 
 class _DisplayState extends State<_Display> {
+  // "Custom" was picked here while the custom values were those of a named tier: shown as
+  // custom, with its sliders, until something else is picked.
+  bool _imageQualityAsCustom = false;
+  // The custom quality's sliders are the choice shown. They write a second after they moved,
+  // which must not undo a tier picked in that second.
+  bool _customImageQualityShown = false;
+
   @override
   Widget build(BuildContext context) {
     final scrollController = ScrollController();
@@ -2097,30 +2105,72 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget imageQuality(BuildContext context) {
+    const qualityKey = 'custom_image_quality';
+    const fpsKey = 'custom-fps';
     onChanged(String value) async {
-      await bind.mainSetUserDefaultOption(
-          key: kOptionImageQuality, value: value);
+      // A named tier (see image_quality_tiers.dart) is stored as the custom quality it is.
+      final tier = imageQualityTierById(value);
+      if (tier == null) {
+        await bind.mainSetUserDefaultOption(
+            key: kOptionImageQuality, value: value);
+      } else {
+        await bind.mainSetUserDefaultOption(
+            key: kOptionImageQuality, value: kRemoteImageQualityCustom);
+        await bind.mainSetUserDefaultOption(
+            key: qualityKey, value: tier.quality.toString());
+        await bind.mainSetUserDefaultOption(
+            key: fpsKey, value: tier.fps.toString());
+      }
+      _imageQualityAsCustom = value == kRemoteImageQualityCustom;
       setState(() {});
     }
 
     final isOptFixed = isOptionFixed(kOptionImageQuality);
-    final groupValue = bind.mainGetUserDefaultOption(key: kOptionImageQuality);
+    // A tier writes all three options: with one of them fixed it would be half set.
+    final isTierFixed =
+        isOptFixed || isOptionFixed(qualityKey) || isOptionFixed(fpsKey);
+    final stored = bind.mainGetUserDefaultOption(key: kOptionImageQuality);
+    final storedTier = _imageQualityAsCustom
+        ? null
+        : imageQualityTierOf(
+            stored,
+            imageQualityOptionValue(
+                bind.mainGetUserDefaultOption(key: qualityKey)),
+            imageQualityOptionValue(
+                bind.mainGetUserDefaultOption(key: fpsKey)));
+    final groupValue = storedTier?.id ?? stored;
+    _customImageQualityShown = groupValue == kRemoteImageQualityCustom;
+    Widget tip(String key) => Text(translate(key),
+            style: TextStyle(fontSize: 11, color: Theme.of(context).hintColor))
+        .marginOnly(left: _kRadioLeftMargin + 37, bottom: 4);
     return _Card(title: 'Default Image Quality', children: [
+      // Not the tiers for a direct connection only: a default does not know the path.
+      for (final t in kImageQualityTiers.where((e) => !e.directOnly)) ...[
+        _Radio(context,
+            value: t.id,
+            groupValue: groupValue,
+            label: t.label,
+            onChanged: isTierFixed ? null : onChanged),
+        tip(t.tip),
+      ],
       _Radio(context,
           value: kRemoteImageQualityBest,
           groupValue: groupValue,
           label: 'Good image quality',
           onChanged: isOptFixed ? null : onChanged),
+      tip('quality-best-tip'),
       _Radio(context,
           value: kRemoteImageQualityBalanced,
           groupValue: groupValue,
           label: 'Balanced',
           onChanged: isOptFixed ? null : onChanged),
+      tip('quality-balanced-tip'),
       _Radio(context,
           value: kRemoteImageQualityLow,
           groupValue: groupValue,
           label: 'Optimize reaction time',
           onChanged: isOptFixed ? null : onChanged),
+      tip('quality-low-tip'),
       _Radio(context,
           value: kRemoteImageQualityCustom,
           groupValue: groupValue,
@@ -2128,7 +2178,8 @@ class _DisplayState extends State<_Display> {
           onChanged: isOptFixed ? null : onChanged),
       Offstage(
         offstage: groupValue != kRemoteImageQualityCustom,
-        child: customImageQualitySetting(),
+        child: customImageQualitySetting(
+            writable: () => _customImageQualityShown),
       )
     ]);
   }

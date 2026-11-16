@@ -298,5 +298,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         // The stream quality following the network.
         ("qos-lowered-tip", "Slow network: the image quality has been lowered. It rises again when the network recovers."),
         ("qos-restored-tip", "Network recovered: image quality is back to your setting."),
+        // Image qualities with a name above the presets, and what each quality takes.
+        ("quality-game", "Game"),
+        ("quality-ultra", "Ultra, 60 fps"),
+        ("quality-high", "High, 60 fps"),
+        ("quality-game-tip", "About 21 Mbps at 1080p, 60 fps. Needs a direct connection, 30 Mbps of bandwidth and a hardware encoder on the controlled side."),
+        ("quality-ultra-tip", "About 12 Mbps at 1080p. Needs 20 Mbps of bandwidth; through the relay it is held to the relay's limit."),
+        ("quality-high-tip", "About 6 Mbps at 1080p. Needs 10 Mbps of bandwidth."),
+        ("quality-best-tip", "About 3 Mbps at 1080p, 30 fps."),
+        ("quality-balanced-tip", "About 1.4 Mbps at 1080p, 30 fps."),
+        ("quality-low-tip", "About 1 Mbps at 1080p, 30 fps."),
+        ("quality-needs-direct-tip", "Needs a direct connection; this one goes through the relay."),
+        ("quality-needs-new-peer-tip", "Through the relay this needs a newer version on the controlled side."),
     ].iter().cloned().collect();
 }

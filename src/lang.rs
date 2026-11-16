@@ -191,6 +191,19 @@ pub fn translate(name: String) -> String {
     translate_locale(name, &locale)
 }
 
+/// The text a table holds for a key. For tests: `translate_locale` goes by the language the
+/// configuration names before the locale it is given, and a test does not own the configuration.
+#[cfg(test)]
+pub(crate) fn text_in_table(lang: &str, key: &str) -> Option<&'static str> {
+    let table = match lang {
+        "en" => en::T.deref(),
+        "zh-cn" => cn::T.deref(),
+        "zh-tw" => tw::T.deref(),
+        _ => return None,
+    };
+    table.get(key).copied()
+}
+
 pub fn translate_locale(name: String, locale: &str) -> String {
     let lang = resolve_lang(
         &hbb_common::config::LocalConfig::get_option("lang"),
@@ -335,6 +348,36 @@ fn extract_placeholder(input: &str) -> (String, Option<String>) {
 }
 
 mod test {
+    /// The image quality menus are written in Dart and name their texts by key. A key the tables
+    /// lack shows as itself, and nothing else would tell.
+    #[test]
+    fn the_image_quality_texts_the_flutter_menus_name_are_in_the_tables() {
+        let sources = [
+            include_str!("../flutter/lib/common/image_quality_tiers.dart"),
+            include_str!("../flutter/lib/common/widgets/toolbar.dart"),
+            include_str!("../flutter/lib/desktop/pages/desktop_setting_page.dart"),
+        ];
+        let mut keys = std::collections::BTreeSet::new();
+        for source in sources {
+            let mut rest = source;
+            while let Some(at) = rest.find("'quality-") {
+                let from = &rest[at + 1..];
+                let end = from.find('\'').unwrap_or(from.len());
+                keys.insert(&from[..end]);
+                rest = &from[end..];
+            }
+        }
+        // Three names, what each of the six takes, and the two reasons a tier is not to be had.
+        assert_eq!(keys.len(), 11, "{keys:?}");
+        // English, which every other language falls back to, and the two Chinese tables.
+        for key in keys {
+            for lang in ["en", "zh-cn", "zh-tw"] {
+                let text = super::text_in_table(lang, key);
+                assert!(text.is_some_and(|text| !text.is_empty()), "{key} in {lang}");
+            }
+        }
+    }
+
     #[test]
     fn test_extract_placeholders() {
         use super::extract_placeholder as f;

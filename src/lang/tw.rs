@@ -826,5 +826,16 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("install-directory-not-empty-tip", "所選資料夾不是空的。安裝可能刪除現有資料。建議選擇其他資料夾。"),
         ("qos-lowered-tip", "網路頻寬不足，畫質已自動降低，網路恢復後會自動回升。"),
         ("qos-restored-tip", "網路已恢復，畫質已回到設定值。"),
+        ("quality-game", "遊戲級"),
+        ("quality-ultra", "超清 60 幀"),
+        ("quality-high", "高清 60 幀"),
+        ("quality-game-tip", "1080p 約 21 Mbps，60 幀。需要直連、頻寬 30 Mbps 以上、被控端有硬體編碼"),
+        ("quality-ultra-tip", "1080p 約 12 Mbps。需要頻寬 20 Mbps 以上；經中繼時受中繼上限限制"),
+        ("quality-high-tip", "1080p 約 6 Mbps。需要頻寬 10 Mbps 以上"),
+        ("quality-best-tip", "1080p 約 3 Mbps，30 幀"),
+        ("quality-balanced-tip", "1080p 約 1.4 Mbps，30 幀"),
+        ("quality-low-tip", "1080p 約 1 Mbps，30 幀"),
+        ("quality-needs-direct-tip", "需要直連，目前連線經過中繼"),
+        ("quality-needs-new-peer-tip", "被控端版本較舊，經中繼時無法使用"),
     ].iter().cloned().collect();
 }

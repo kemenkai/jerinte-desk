@@ -147,7 +147,10 @@ customImageQualityWidget(
   );
 }
 
-customImageQualitySetting() {
+/// The sliders of the default custom image quality. They write a second after they moved:
+/// [writable], asked then, says whether they still may. Not when something else was chosen
+/// meanwhile that set the same options.
+customImageQualitySetting({bool Function()? writable}) {
   final qualityKey = 'custom_image_quality';
   final fpsKey = 'custom-fps';
 
@@ -166,12 +169,14 @@ customImageQualitySetting() {
       setQuality: isQuanlityFixed
           ? null
           : (v) {
+              if (writable?.call() == false) return;
               bind.mainSetUserDefaultOption(
                   key: qualityKey, value: v.toString());
             },
       setFps: isFpsFixed
           ? null
           : (v) {
+              if (writable?.call() == false) return;
               bind.mainSetUserDefaultOption(key: fpsKey, value: v.toString());
             },
       showFps: true,
