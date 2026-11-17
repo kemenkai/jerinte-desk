@@ -27,6 +27,11 @@ fn sync(qos: &mut VideoQoS) {
 /// One second in which the stream put out `share` of its bitrate and the probe came back after
 /// `delay` ms, the path having delivered `delivered` of what was sent (1 for all of it).
 fn second(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32) {
+    second_of(qos, delay, delivered, share, 60);
+}
+
+/// The same, with the bitrate's `share` going out in `frames` frames.
+fn second_of(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32, frames: usize) {
     qos.advance_ms(1000);
     sync(qos);
     let kbps = BASE_KBPS * qos.ratio() * share;
@@ -45,10 +50,11 @@ fn second(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32) {
     qos.update_display_rates(
         DISPLAY,
         bytes as usize,
-        60,
+        frames,
         Duration::ZERO,
         Duration::from_secs(1),
     );
+    // The video loop counts every frame it hands to the encoder, sent or not.
     qos.update_display_data(DISPLAY, 60);
     sync(qos);
 }
@@ -95,6 +101,116 @@ fn a_full_path_is_left_in_one_step_and_the_viewer_is_told() {
     }
     assert_eq!(qos.ratio(), 3.5);
     assert_eq!(qos.qos_state(), 0);
+}
+
+#[test]
+fn a_hardware_encoder_braked_on_the_first_late_reply_is_still_cut_by_what_the_path_carried() {
+    // Sixty frames a second, twice its bitrate: 42 Mbps into a path that carries 10.
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true);
+    for _ in 0..10 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    let before = qos.ratio();
+    // The first late reply: the path fell short. The frame rate is braked for it, and in the
+    // next second the encoder puts out a fifth of what it did: less than the path carries, and
+    // it all arrives, in less time than it was sent in, the reply late again.
+    // The cut comes with the second late reply or, the bitrate having been looked at less than
+    // three seconds before, with the next look at it.
+    second(&mut qos, 1100, 10.0 / 42.0, 2.0);
+    let sent = BASE_KBPS * qos.ratio() * 0.4;
+    for delay in [1200, 1300] {
+        if !qos.capacity.has_ceiling() {
+            second(&mut qos, delay, 10_000.0 / sent, 0.4);
+        }
+    }
+    assert!(qos.capacity.has_ceiling(), "cut by the path's measure");
+    assert_eq!(qos.qos_state(), 1);
+    // With the queue sent the stream settles under the 10 Mbps, at the sixty frames a second
+    // it comes back to.
+    for _ in 0..12 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    let out = BASE_KBPS * qos.ratio() * 2.0;
+    assert!(
+        (8_000.0..=9_500.0).contains(&out),
+        "{out} kbps out under a 10 Mbps path, from ratio {before}"
+    );
+}
+
+#[test]
+fn a_path_that_falls_short_again_under_its_ceiling_is_measured_again() {
+    // Sixty frames a second, twice its bitrate; brought under a path of 10 Mbps.
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true);
+    for _ in 0..10 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    for delay in [1100, 2200, 3300] {
+        second(&mut qos, delay, 10.0 / 42.0, 2.0);
+    }
+    for _ in 0..12 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!(qos.capacity.has_ceiling());
+    let out = BASE_KBPS * qos.ratio() * 2.0;
+    assert!((8_000.0..=9_500.0).contains(&out), "{out} kbps out");
+    // The path now carries 4 Mbps. The first late reply brakes the frame rate, the encoder
+    // sends a fifth of what it did, and that arrives faster than it was sent: not the queue of
+    // the cut before, which is long gone, but a path that fell short anew.
+    second(&mut qos, 1100, 4_000.0 / out, 2.0);
+    let braked = BASE_KBPS * qos.ratio() * 0.4;
+    for delay in [1200, 1300] {
+        second(&mut qos, delay, 4_000.0 / braked, 0.4);
+    }
+    for _ in 0..12 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    let out = BASE_KBPS * qos.ratio() * 2.0;
+    assert!(
+        (3_000.0..=3_900.0).contains(&out),
+        "{out} kbps out under a path of 4 Mbps"
+    );
+}
+
+#[test]
+fn a_clean_reply_ends_the_wait_for_the_queue_on_a_still_screen_too() {
+    let mut qos = session(3.5);
+    settle(&mut qos);
+    for delay in [1100, 2200, 3300] {
+        second(&mut qos, delay, 10.0 / 21.0, 1.0);
+    }
+    assert!(qos.capacity.has_ceiling());
+    let low = BASE_KBPS * qos.ratio();
+    assert!(low < 5_500.0, "{low} kbps while the queue is sent");
+    // The screen stops changing: a frame a second. The replies come back clean, and what the
+    // stream may put out is what it settles at, without waiting out the time reckoned for a
+    // queue that is gone. (The ratio itself is raised when the screen changes again.)
+    for _ in 0..3 {
+        second_of(&mut qos, 10, 1.0, 0.02, 1);
+    }
+    let allowed = BASE_KBPS * qos.max_ratio();
+    assert!(
+        (8_000.0..=9_500.0).contains(&allowed),
+        "{allowed} kbps allowed under a 10 Mbps path"
+    );
+}
+
+#[test]
+fn a_pause_the_path_catches_up_from_is_not_a_full_path() {
+    let mut qos = session(3.5);
+    settle(&mut qos);
+    // The path stops for most of a second, then delivers what was held and what is sent, at
+    // twice the stream's rate, the reply late once more for the queue on its way out. It
+    // carries the stream: no ceiling is made of it.
+    second(&mut qos, 900, 0.2, 1.0);
+    second(&mut qos, 600, 2.0, 1.0);
+    second(&mut qos, 10, 1.0, 1.0);
+    assert!(
+        !qos.capacity.has_ceiling(),
+        "what two late replies come to is left to the table"
+    );
 }
 
 #[test]
@@ -178,7 +294,9 @@ fn a_session_through_the_relay_stays_under_its_limit() {
         "the relay's limit is not a cut for the network"
     );
 
-    // An encoder that puts out twice its bitrate is held to the limit by what it really sends.
+    // A hardware encoder that puts out twice its bitrate is held to the limit by what it really
+    // sends.
+    qos.set_encoder_hardware(DISPLAY, true);
     for _ in 0..8 {
         second(&mut qos, 10, 1.0, 2.0);
     }
@@ -228,11 +346,13 @@ fn a_high_target_is_climbed_to_once_the_frame_rate_has_started() {
     assert_eq!(qos.ratio(), BR_BEST);
 }
 
-/// One viewer of one display whose encoder takes a new bitrate only by being created again.
+/// One viewer of one display whose encoder, a hardware one, takes a new bitrate only by being
+/// created again.
 fn restart_only_session() -> VideoQoS {
     let mut qos = session(3.5);
     qos.set_support_changing_quality(DISPLAY, false);
     qos.set_restartable(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true);
     qos
 }
 
@@ -245,8 +365,7 @@ fn an_encoder_that_cannot_change_is_created_again_for_a_full_path() {
     }
     assert!(!qos.take_restart_request(DISPLAY));
     assert_eq!(qos.ratio(), 3.5);
-    // Half a minute after it was created, a full path brings it down, straight to where the
-    // stream settles.
+    // Later a full path brings it down, straight to where the stream settles.
     for _ in 0..30 {
         second(&mut qos, 10, 1.0, 1.0);
     }
@@ -264,13 +383,13 @@ fn an_encoder_that_cannot_change_is_created_again_for_a_full_path() {
     recreate(&mut qos);
     // Late replies without a full path do not bring it down, and good ones do not bring it
     // back before its time.
-    for _ in 0..40 {
+    for _ in 0..25 {
         second_at(&mut qos, 10, 1.0);
     }
     assert!(!qos.take_restart_request(DISPLAY));
-    // After five minutes: half again, not all the way.
+    // After half a minute: half again, not all the way.
     let before = qos.ratio;
-    for _ in 0..300 {
+    for _ in 0..6 {
         second_at(&mut qos, 10, 1.0);
     }
     assert!(qos.take_restart_request(DISPLAY));
@@ -291,9 +410,9 @@ fn an_encoder_that_cannot_change_is_created_again_for_a_full_path() {
     assert!((qos.ratio - before * 1.5).abs() < 1e-3);
     assert!(!qos.take_restart_request(DISPLAY));
     assert_eq!(qos.qos_state(), 1);
-    // After five more minutes half again would come within a tenth of the target: all the way,
-    // by a restart, and the viewer is told.
-    for _ in 0..300 {
+    // After half a minute more, half again would come within a tenth of the target: all the
+    // way, by a restart, and the viewer is told.
+    for _ in 0..22 {
         second_at(&mut qos, 10, 1.0);
     }
     assert!(qos.take_restart_request(DISPLAY));
@@ -306,6 +425,144 @@ fn an_encoder_that_cannot_change_is_created_again_for_a_full_path() {
     assert!(!qos.take_restart_request(DISPLAY), "nothing more to ask");
 }
 
+#[test]
+fn a_try_for_more_that_ends_in_a_cut_is_waited_longer_after() {
+    let mut qos = restart_only_session();
+    for _ in 0..30 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    // The path carries 10 of the 21 Mbps, and goes on doing so. An encoder is brought down no
+    // sooner than five seconds after it was created.
+    let cut = |qos: &mut VideoQoS| {
+        let mut asked = false;
+        for delay in [1100, 2200, 3300, 3300, 3300, 3300] {
+            second_at(qos, delay, 10_000.0 / qos.bitrate() as f32);
+            asked = qos.take_restart_request(DISPLAY);
+            if asked {
+                break;
+            }
+        }
+        assert!(asked);
+        recreate(qos);
+    };
+    cut(&mut qos);
+    let low = qos.ratio;
+    // Half a minute, and it is tried half again higher, which the path does not carry.
+    let mut waited = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_at(&mut qos, 10, 1.0);
+        waited += 1;
+        assert!(waited < 40);
+    }
+    assert!((30..=32).contains(&waited), "{waited} s");
+    recreate(&mut qos);
+    assert!(qos.ratio > low * 1.4);
+    cut(&mut qos);
+    // The next try comes after a minute.
+    let mut waited = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_at(&mut qos, 10, 1.0);
+        waited += 1;
+        assert!(waited < 80);
+    }
+    assert!((60..=62).contains(&waited), "{waited} s");
+    // It ends in a cut again, and the wait would be two minutes. But the viewer goes and
+    // another comes, on a path of its own: for that one the wait is the first again.
+    recreate(&mut qos);
+    cut(&mut qos);
+    qos.viewers_changed();
+    let mut waited = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_at(&mut qos, 10, 1.0);
+        waited += 1;
+        assert!(waited < 80);
+    }
+    assert!((30..=32).contains(&waited), "{waited} s");
+}
+
+#[test]
+fn an_encoder_that_puts_out_more_than_it_was_brought_down_to_is_created_once_more() {
+    // Sixty frames a second: the encoder puts out twice its bitrate, which was seen.
+    let mut qos = restart_only_session();
+    for _ in 0..30 {
+        second_out(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    // The path carries 10 of the 42 Mbps really sent: the encoder is created again for 8.5 of
+    // real output.
+    for delay in [1100, 2200, 3300] {
+        second_out(&mut qos, delay, 10.0 / 42.0, 2.0);
+    }
+    assert!(qos.take_restart_request(DISPLAY));
+    recreate(&mut qos);
+    let to = qos.ratio;
+    assert!(
+        (BASE_KBPS * to * 2.0 - 8_500.0).abs() < 300.0,
+        "ratio {to} for 8.5 Mbps out"
+    );
+    // Its bitrate is not proportional to the ratio: at the new one it puts out 2.6 times it,
+    // 11 Mbps. Seen in a second of its own, and corrected two seconds after the encoder was
+    // created, without waiting for the path to fill again.
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out(&mut qos, 10, 1.0, 2.6);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    assert!((2..=4).contains(&seconds), "{seconds} s");
+    assert!(
+        (BASE_KBPS * qos.ratio * 2.6 - 8_500.0).abs() < 300.0,
+        "ratio {} for 8.5 Mbps out",
+        qos.ratio
+    );
+    assert_eq!(qos.qos_state(), 1);
+}
+
+#[test]
+fn an_encoder_that_cannot_change_is_held_to_the_relays_limit_too() {
+    let mut qos = restart_only_session();
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    // 21 Mbps asked for through a relay of 10: created again for the limit, once it has run
+    // five seconds, and not counted as lowered for the network.
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_at(&mut qos, 10, 1.0);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    recreate(&mut qos);
+    assert!((BASE_KBPS * qos.ratio - 10_000.0).abs() < 100.0);
+    assert_eq!(qos.qos_state(), 0);
+    // At the limit it stays, and is not created again and again for a ratio that hardly moves.
+    for _ in 0..60 {
+        second_at(&mut qos, 10, 1.0);
+    }
+    assert!(!qos.take_restart_request(DISPLAY));
+    // Sixty frames a second now: it puts out twice its bitrate, 20 Mbps through a relay of 10.
+    // That is seen though the ratio asked for is not quite the one it runs at, and it is
+    // created again for the limit.
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out(&mut qos, 10, 1.0, 2.0);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    recreate(&mut qos);
+    let out = BASE_KBPS * qos.ratio * 2.0;
+    assert!((out - 10_000.0).abs() < 100.0, "{out} kbps out");
+    // And at thirty again, for good, it is let back up to the limit.
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out(&mut qos, 10, 1.0, 1.0);
+        seconds += 1;
+        assert!(seconds < 20);
+    }
+    recreate(&mut qos);
+    assert!((BASE_KBPS * qos.ratio - 10_000.0).abs() < 100.0);
+    assert_eq!(qos.qos_state(), 0);
+}
+
 /// The video loop starts over with a new encoder of the same kind, at the ratio it reads.
 fn recreate(qos: &mut VideoQoS) {
     qos.remove_display(DISPLAY);
@@ -314,6 +571,7 @@ fn recreate(qos: &mut VideoQoS) {
     qos.store_bitrate_at(ratio, (BASE_KBPS * ratio) as u32);
     qos.set_support_changing_quality(DISPLAY, false);
     qos.set_restartable(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true);
 }
 
 #[test]
@@ -324,17 +582,17 @@ fn a_custom_quality_moved_is_given_to_an_encoder_that_cannot_change_by_a_restart
         second_at(&mut qos, 10, 1.0);
     }
     assert!(!qos.take_restart_request(DISPLAY), "nothing moved");
-    // The viewer drags the slider to 300%: the ratio follows at once, the encoder not sooner
-    // than half a minute after it was created, and once.
+    // The viewer drags the slider to 300% and on to 250% and back: the ratio follows at once,
+    // the encoder once, and when it has run five seconds since it was last created.
+    recreate(&mut qos);
     qos.user_image_quality(1, 300 << 8);
-    for _ in 0..20 {
+    for quality in [250, 300, 300, 300] {
+        qos.user_image_quality(1, quality << 8);
         second_at(&mut qos, 10, 1.0);
-        assert_eq!(qos.ratio, 6.0);
         assert!(!qos.take_restart_request(DISPLAY));
     }
-    for _ in 0..10 {
-        second_at(&mut qos, 10, 1.0);
-    }
+    assert_eq!(qos.ratio, 6.0);
+    second_at(&mut qos, 10, 1.0);
     assert!(qos.take_restart_request(DISPLAY));
     recreate(&mut qos);
     assert_eq!(
@@ -357,8 +615,13 @@ fn sync_at(qos: &mut VideoQoS) {
 }
 
 fn second_at(qos: &mut VideoQoS, delay: u32, delivered: f32) {
+    second_out(qos, delay, delivered, 1.0);
+}
+
+/// The same, the encoder putting out `share` of its bitrate.
+fn second_out(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32) {
     qos.advance_ms(1000);
-    let bytes = (qos.bitrate() as f32 * 1000.0 / 8.0) as u64;
+    let bytes = (qos.bitrate() as f32 * share * 1000.0 / 8.0) as u64;
     qos.user_delivery(
         1,
         bytes,
@@ -392,22 +655,77 @@ fn an_encoder_that_may_not_be_created_again_keeps_its_bitrate() {
 }
 
 #[test]
-fn a_cut_not_worth_the_pause_leaves_nothing_behind() {
+fn a_path_a_little_too_narrow_brings_the_encoder_down_as_well() {
     let mut qos = restart_only_session();
     for _ in 0..40 {
         second(&mut qos, 10, 1.0, 1.0);
     }
-    // The path delivers 96% of what is sent: just under it would be a fifth less at most.
+    // The path delivers 96% of what is sent, second after second. An encoder left a little over
+    // what the path carries would stay over it for good: it is created again for just under,
+    // which costs a tenth of a second. So small a cut is not one the viewer is told of.
     for delay in [300, 400, 500] {
         second(&mut qos, delay, 0.96, 1.0);
     }
-    assert!(!qos.take_restart_request(DISPLAY));
-    assert_eq!(qos.ratio(), 3.5);
+    assert!(qos.take_restart_request(DISPLAY));
+    let kbps = BASE_KBPS * qos.ratio;
     assert!(
-        !qos.capacity.has_ceiling(),
-        "as if it had not been looked at"
+        (0.80 * 21_000.0..=0.83 * 21_000.0).contains(&kbps),
+        "{kbps} kbps under a path that carries 96% of 21 Mbps"
     );
     assert_eq!(qos.qos_state(), 0);
+}
+
+#[test]
+fn an_encoder_at_the_floor_is_not_created_again_and_again() {
+    // Brought down as far as the ratio goes, a hardware encoder still puts out more than the
+    // path was seen to carry: another one at the same ratio would put out the same.
+    let mut qos = restart_only_session();
+    for _ in 0..30 {
+        second_out(&mut qos, 10, 1.0, 2.0);
+    }
+    for delay in [1100, 2200, 3300] {
+        second_out(&mut qos, delay, 0.02, 2.0);
+    }
+    assert!(qos.take_restart_request(DISPLAY));
+    recreate(&mut qos);
+    let floor = qos.ratio;
+    let mut asked = 0;
+    for _ in 0..30 {
+        second_out(&mut qos, 10, 1.0, 2.0);
+        if qos.take_restart_request(DISPLAY) {
+            asked += 1;
+            recreate(&mut qos);
+        }
+    }
+    assert!(qos.ratio >= floor, "{} from {floor}", qos.ratio);
+    assert!(asked <= 2, "created again {asked} times in half a minute");
+}
+
+#[test]
+fn a_preset_is_held_to_the_same_distance_between_restarts() {
+    // The best preset on an encoder that takes a new bitrate only by being created again: the
+    // controller says when, as for a custom quality, and the video loop does not create it
+    // again for every ratio the controller passes through (`check_qos` asks `restart_only`).
+    let mut qos = super::smoke::session(60, Quality::Best);
+    qos.abr_config = true;
+    qos.new_display(DISPLAY.to_owned());
+    qos.ratio = BR_BEST;
+    sync(&mut qos);
+    qos.set_support_changing_quality(DISPLAY, false);
+    qos.set_restartable(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true);
+    assert!(qos.restart_only() && !qos.in_vbr_state());
+    for _ in 0..10 {
+        second_at(&mut qos, 10, 1.0);
+    }
+    assert!(!qos.take_restart_request(DISPLAY));
+    // The viewer takes the balanced preset: the ratio follows, and the encoder is asked for
+    // once.
+    qos.user_image_quality(1, ImageQuality::Balanced.value());
+    second_at(&mut qos, 10, 1.0);
+    assert_eq!(qos.ratio, BR_BALANCED);
+    assert!(qos.take_restart_request(DISPLAY));
+    assert!(!qos.take_restart_request(DISPLAY));
 }
 
 #[test]
@@ -425,7 +743,7 @@ fn every_display_is_asked_for_itself() {
     qos.set_restartable("second", true);
     let before = qos.ratio;
     sync_at(&mut qos);
-    for _ in 0..300 {
+    for _ in 0..40 {
         second_at(&mut qos, 10, 1.0);
         qos.update_display_data("second", 60);
     }
@@ -514,7 +832,61 @@ fn a_viewer_coming_or_going_is_not_the_network_coming_back() {
 }
 
 #[test]
-fn a_change_of_scene_over_the_limit_is_not_taken_for_the_encoder() {
+fn a_hardware_encoder_is_held_to_a_limit_by_what_it_puts_out() {
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true);
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    // A hardware encoder is taken to put out a thirtieth of its bitrate a frame, twice its
+    // bitrate at these sixty frames a second, until two seconds show that this one keeps to
+    // its bitrate: once its frame rate is seen the stream is at half the relay's limit, and
+    // comes up to it.
+    second(&mut qos, 10, 1.0, 1.0);
+    second(&mut qos, 10, 1.0, 1.0);
+    let started = BASE_KBPS * qos.ratio();
+    assert!((started - 5_000.0).abs() < 100.0, "{started} kbps at first");
+    for _ in 0..25 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    let settled = qos.ratio();
+    assert!((BASE_KBPS * settled - 10_000.0).abs() < 100.0);
+    // One second a third over its bitrate, as one of many key frames is: not taken for the
+    // encoder, and nothing moves for it.
+    second(&mut qos, 10, 1.0, 1.3);
+    assert_eq!(qos.capacity.overshoot(), 1.0);
+    assert_eq!(qos.ratio(), settled);
+    for _ in 0..3 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    assert_eq!(qos.ratio(), settled);
+    // Sixty frames a second: twice its bitrate, second after second. The stream comes under
+    // the relay's limit by what is really sent, and stays there.
+    for _ in 0..8 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    let out = BASE_KBPS * qos.ratio() * 2.0;
+    assert!(
+        (out - 10_000.0).abs() < 300.0,
+        "{out} kbps out under 10 Mbps"
+    );
+    // Thirty again: it keeps to its bitrate, which is believed with the first second that says
+    // so, and the stream is back by the ordinary way up.
+    for _ in 0..18 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    assert_eq!(qos.capacity.overshoot(), 1.0);
+    assert!(
+        (qos.ratio() - settled).abs() < settled * 0.02,
+        "{} of {settled}",
+        qos.ratio()
+    );
+}
+
+#[test]
+fn a_software_encoder_is_never_taken_to_put_out_more_than_its_bitrate() {
+    // It keeps to its bitrate over time. A second over it (a change of scene, whole frames
+    // where others were left out) is not held against it, under a limit or not.
     let mut qos = session(3.5);
     qos.relay_cap_kbps = 10_000;
     qos.user_relayed(1, true);
@@ -522,23 +894,41 @@ fn a_change_of_scene_over_the_limit_is_not_taken_for_the_encoder() {
         second(&mut qos, 10, 1.0, 1.0);
     }
     let settled = qos.ratio();
-    // One second a third over its bitrate: held to the limit for that second, not remembered,
-    // and the stream is back where it was two steps of the way up later.
-    second(&mut qos, 10, 1.0, 1.3);
-    assert!(qos.ratio() < settled * 0.85);
+    for share in [2.0, 0.4, 1.6, 2.0, 2.0, 2.0] {
+        second(&mut qos, 10, 1.0, share);
+        assert_eq!(qos.ratio(), settled);
+        assert_eq!(qos.capacity.overshoot(), 1.0);
+    }
+    // And what a hardware encoder was seen to put out is not carried over to it.
+    qos.set_encoder_hardware(DISPLAY, true);
+    for _ in 0..4 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    qos.set_encoder_hardware(DISPLAY, false);
     assert_eq!(qos.capacity.overshoot(), 1.0);
-    for _ in 0..7 {
+}
+
+#[test]
+fn an_encoder_that_leaves_frames_out_is_not_brought_down_for_its_whole_frames() {
+    // Under a limit of 1 Mbps an encoder makes of a picture that is new in every frame one
+    // frame of 500 kbit in some seconds, two or three in others: 1 Mbps on the whole. No second
+    // of it is taken for what the encoder puts out, hardware or not, and the ratio stays where
+    // the limit put it.
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true);
+    qos.relay_cap_kbps = 1_000;
+    qos.user_relayed(1, true);
+    for _ in 0..25 {
         second(&mut qos, 10, 1.0, 1.0);
     }
-    assert!(
-        (qos.ratio() - settled).abs() < settled * 0.02,
-        "{} of {settled}",
-        qos.ratio()
-    );
-    // Twice its bitrate is the encoder, and remembered at once.
-    second(&mut qos, 10, 1.0, 2.0);
-    second(&mut qos, 10, 1.0, 2.0);
-    assert!(qos.capacity.overshoot() > 1.5);
+    let settled = qos.ratio();
+    assert!((BASE_KBPS * settled - 1_000.0).abs() < 20.0);
+    for frames in [3, 1, 2, 3, 1, 2, 2, 3, 1, 2, 2, 2] {
+        second_of(&mut qos, 10, 1.0, frames as f32 * 0.5, frames);
+        assert_eq!(qos.ratio(), settled, "after a second of {frames} frames");
+        assert_eq!(qos.capacity.overshoot(), 1.0);
+    }
 }
 
 #[test]
@@ -596,6 +986,7 @@ fn the_climb_that_ends_on_a_queue_is_not_raised_in_the_same_breath() {
 #[test]
 fn what_was_sent_over_a_limit_brings_the_ratio_down_once() {
     let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true);
     qos.relay_cap_kbps = 10_000;
     qos.user_relayed(1, true);
     for _ in 0..10 {

@@ -616,8 +616,10 @@ fn get_capturer(
 }
 
 thread_local! {
-    // What this thread's video loop encoded since `check_qos` last read it, in bytes.
+    // What this thread's video loop encoded since `check_qos` last read it, in bytes and in
+    // frames: a frame the encoder left out is in neither.
     static SENT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SENT_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // How long this thread's encoder takes for a frame, averaged over the last frames.
     static ENCODE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
@@ -627,6 +629,7 @@ thread_local! {
 fn count_sent(msg: &Message) {
     use hbb_common::protobuf::Message as _;
     SENT_BYTES.with(|bytes| bytes.set(bytes.get() + msg.compute_size() as usize));
+    SENT_FRAMES.with(|frames| frames.set(frames.get() + 1));
 }
 
 /// Encodes a frame, and keeps how long this thread's encoder takes for one.
@@ -675,6 +678,7 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut _raii = Raii::new(vs.idx, vs.sp.name());
     // A new encoder: what the last one took and left unread says nothing of it.
     SENT_BYTES.with(|bytes| bytes.set(0));
+    SENT_FRAMES.with(|frames| frames.set(0));
     ENCODE_TIME.with(|time| time.set(None));
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
     //
@@ -803,6 +807,10 @@ fn run(vs: VideoService) -> ResultType<()> {
         .lock()
         .unwrap()
         .set_support_changing_quality(&sp.name(), encoder.support_changing_quality());
+    VIDEO_QOS
+        .lock()
+        .unwrap()
+        .set_encoder_hardware(&sp.name(), encoder.is_hardware());
     // An encoder that takes a new bitrate only by being created again is created again for the
     // network on X11 alone, where that does not take the capture down with it, and not while
     // recording, which it would cut in two.
@@ -1652,7 +1660,12 @@ fn check_qos(
             video_qos.store_bitrate(encoder.bitrate());
         } else {
             // Now only vaapi doesn't support changing quality
-            if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
+            // Where the controller creates such an encoder again itself, it says when
+            // (`take_restart_request` below): not for every ratio it passes through.
+            if !video_qos.in_vbr_state()
+                && !video_qos.restart_only()
+                && !video_qos.latest_quality().is_custom()
+            {
                 log::info!("switch to change quality");
                 bail!("SWITCH");
             }
@@ -1675,7 +1688,7 @@ fn check_qos(
         video_qos.update_display_rates(
             &name,
             SENT_BYTES.with(|bytes| bytes.replace(0)),
-            *send_counter,
+            SENT_FRAMES.with(|frames| frames.replace(0)),
             std::mem::take(held_up),
             elapsed,
         );

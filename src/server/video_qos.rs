@@ -293,6 +293,7 @@ struct DisplayData {
     rates: capacity::Rates, // fork: what its video loop encoded and waited, second by second
     restartable: bool,      // fork: its encoder may be created again for another bitrate
     restart: bool,          // fork: and is to be, for the ratio its video loop now reads
+    hardware: bool,         // fork: its encoder is a hardware one, sized for a frame rate
     known: bool,            // fork: its encoder is there, so what it can do is known
 }
 
@@ -311,7 +312,7 @@ pub struct VideoQoS {
     relay_cap_kbps: u32, // the relay's limit for a session through it, 0 for none
     ratio_cap: Option<f32>, // the ratio the relay's limit and the path's ceiling come to
     bitrate_ratio: f32,  // the ratio `bitrate_store` is the encoder's bitrate at
-    ratio_at_rates: f32, // the ratio when a video loop last said what it had sent
+    ratio_at_rates: f32, // the ratio asked for when a video loop's last second ended
     steady_seconds: u8,  // for how many such seconds the ratio has not moved
     restart: capacity::Restart,
     #[cfg(test)]
@@ -696,6 +697,7 @@ impl VideoQoS {
         } else {
             self.follow_target();
         }
+        self.second_ends(); // fork: the ratio the display's next second runs at
     }
 
     #[inline]
@@ -1029,6 +1031,7 @@ mod tests {
     mod baseline;
     mod capacity_sim; // fork: the scenarios of `capacity`, on the simulation below
     mod capacity_wiring; // fork: `capacity` through the controller's own doors
+    mod field; // fork: what a real path did, on the simulation below
     mod jitter;
     mod recovery;
     mod sim;

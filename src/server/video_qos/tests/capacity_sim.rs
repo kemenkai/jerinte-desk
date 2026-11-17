@@ -61,6 +61,11 @@ fn scenario(name: &'static str, target: f32, link: Link) -> Scenario {
         seed: 1,
         reports: true,
         send_buffer_kbit: None,
+        source_fps: None,
+        relay_cap_kbps: None,
+        base_kbps: None,
+        loop_wait: None,
+        restart_only: false,
     }
 }
 
@@ -89,7 +94,7 @@ fn measure(sc: &Scenario, r: &Report) -> Measures {
     let output = |fps: u32, ratio: f32| {
         let nominal = BASE_KBPS * ratio as f64;
         match sc.encoder {
-            EncoderModel::Cbr => nominal,
+            EncoderModel::Cbr | EncoderModel::Floor(_) => nominal,
             EncoderModel::FixedRate => nominal * fps as f64 / 30.0,
         }
     };

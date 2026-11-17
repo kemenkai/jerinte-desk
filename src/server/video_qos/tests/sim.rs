@@ -188,6 +188,11 @@ pub enum EncoderModel {
     /// bytes.  Actual hardware behaviour is backend dependent (Android's MediaCodec
     /// path runs VBR).
     FixedRate,
+    /// Fork: a software encoder on a picture that is all new in every frame (a page scrolled
+    /// fast), as seen on a real machine. A frame cannot be smaller than this many kbit: below the
+    /// bitrate that takes, the rate control keeps to the bitrate by leaving frames out. What goes
+    /// out in a second is then a whole number of frames, more or less than the bitrate.
+    Floor(f64),
 }
 
 #[derive(Clone)]
@@ -208,6 +213,20 @@ pub struct Scenario {
     /// they hold the video loop up, as a connection whose send is blocked does.  `None`: without
     /// limit, as the model always was.
     pub send_buffer_kbit: Option<f64>,
+    /// Fork: the picture changes this many times a second at most, whatever is asked for.
+    pub source_fps: Option<f64>,
+    /// Fork: the viewer is relayed, and this is the relay's limit, in kbps.
+    pub relay_cap_kbps: Option<u32>,
+    /// Fork: the bitrate at ratio 1.0, where it is not `BASE_KBPS`.
+    pub base_kbps: Option<f64>,
+    /// Fork: the share of every second the video loop spends between a frame and the next that
+    /// is not the path's doing (what it checks while it waits for its frames to be taken), drawn
+    /// anew each second from this range.
+    pub loop_wait: Option<(f64, f64)>,
+    /// Fork: the encoder takes a new bitrate only by being created again, as VAAPI's, and its
+    /// bitrate is not proportional to the ratio, as the hardware encoders': at the base bitrate
+    /// `b` of a ratio it is `b × (1 + 1 / (1 + (b − 2000) / 1000))`.
+    pub restart_only: bool,
 }
 
 /// Bitrate at ratio 1.0; balanced quality (0.67) then encodes at about 4 Mbps.
@@ -241,7 +260,9 @@ impl Encoder {
         let target = match (self.content, self.model) {
             // A changed region of a static screen is small whatever the rate control does.
             (Content::Office, _) => bitrate_kbps * 1000.0 / ENCODER_CONFIGURED_FPS * 0.3,
-            (Content::Video, EncoderModel::Cbr) => bitrate_kbps * 1000.0 / produce_rate,
+            (Content::Video, EncoderModel::Cbr | EncoderModel::Floor(_)) => {
+                bitrate_kbps * 1000.0 / produce_rate
+            }
             (Content::Video, EncoderModel::FixedRate) => {
                 bitrate_kbps * 1000.0 / ENCODER_CONFIGURED_FPS
             }
@@ -314,6 +335,8 @@ pub struct Report {
     pub cold_start_min_fps: u32,
     /// First time the target reached 90% of the limit.
     pub time_to_90pct_ms: Option<u32>,
+    /// Fork: how often the encoder was created again (`restart_only`).
+    pub restarts: u32,
     pub trace: Vec<(u32, u32, u32, f32)>, // (time_ms, target fps, queue_ms, ratio)
 }
 
@@ -338,6 +361,7 @@ fn percentile_f64(values: &[f64], p: f64) -> f64 {
 pub fn run(sc: &Scenario) -> Report {
     let mut network_rng = Rng::new(sc.seed);
     let mut probe_rng = Rng::new(sc.seed ^ 0x5052_4F42_45);
+    let mut loop_rng = Rng::new(sc.seed ^ 0x4C4F_4F50);
     let mut encoder = Encoder {
         model: sc.encoder,
         content: sc.content,
@@ -360,15 +384,36 @@ pub fn run(sc: &Scenario) -> Report {
         // As when the viewer sets its quality: a target above the presets is climbed to.
         qos.ratio = qos.ratio_for_target();
     }
+    let hardware = sc.encoder == EncoderModel::FixedRate;
     if sc.abr {
         qos.new_display("sim".to_owned());
-        qos.set_support_changing_quality("sim", true);
+        qos.set_support_changing_quality("sim", !sc.restart_only);
+        // The model of the hardware encoders; the others are software.
+        qos.set_encoder_hardware("sim", hardware);
+        if sc.restart_only {
+            qos.set_restartable("sim", true);
+        }
     }
+    // `restart_only`: the ratio the encoder was created with, and how often it was created again.
+    let mut created_at = qos.ratio_for_creation();
+    let mut restarts = 0_u32;
+    // Created again, the encoder is away for a tenth of a second, as measured, and its first
+    // frame is a key frame, here five frames' worth.
+    let mut encoder_back_ms = 0_u32;
+    let mut key_frame = false;
+    if let Some(cap) = sc.relay_cap_kbps {
+        qos.relay_cap_kbps = cap;
+        qos.user_relayed(1, true);
+    }
+    let base_kbps = sc.base_kbps.unwrap_or(BASE_KBPS);
+    // `Floor`: what the rate control has to spend, at most a second of the bitrate.
+    let mut budget_bits = 0.0_f64;
 
     let mut queue: VecDeque<Packet> = VecDeque::new();
     let mut queued_bits = 0.0_f64;
     let mut encode_phase = 0.0_f64;
     let mut encoded_this_second = 0_usize;
+    let mut sent_this_second = 0_usize;
     let mut probe_sent: Option<u32> = None;
     let mut replies: Vec<Reply> = Vec::new();
     // What the video loop reports every second, and what the probes mark.
@@ -398,29 +443,73 @@ pub fn run(sc: &Scenario) -> Report {
         // Encoder: frames at the controller's rate, sized by the controller's ratio.
         // The video loop reports the bitrate as soon as it applies a new ratio.
         let fps = qos.fps();
-        let ratio = qos.ratio();
-        let bitrate_kbps = BASE_KBPS * ratio as f64;
-        qos.store_bitrate(bitrate_kbps as u32);
+        let bitrate_kbps = if sc.restart_only {
+            // As the video loop: created again when the controller asks, at the ratio it then
+            // reads; its bitrate is that one's until then.
+            if qos.take_restart_request("sim") {
+                created_at = qos.ratio_for_creation();
+                restarts += 1;
+                encoder_back_ms = now + 100;
+                key_frame = true;
+                // The video loop starts over: what the last encoder sent in this second is not
+                // counted with what this one sends.
+                second_bits = 0.0;
+                sent_this_second = 0;
+                encoded_this_second = 0;
+                second_held_ms = 0;
+                qos.remove_display("sim");
+                qos.new_display("sim".to_owned());
+                qos.set_support_changing_quality("sim", false);
+                qos.set_encoder_hardware("sim", hardware);
+                qos.set_restartable("sim", true);
+            }
+            let base = base_kbps * created_at as f64;
+            let bitrate = if base > 2000.0 {
+                base * (1.0 + 1.0 / (1.0 + (base - 2000.0) / 1000.0))
+            } else {
+                base * 2.0
+            };
+            qos.store_bitrate_at(created_at, bitrate as u32);
+            bitrate
+        } else {
+            let bitrate = base_kbps * qos.ratio() as f64;
+            qos.store_bitrate(bitrate as u32);
+            bitrate
+        };
         let produce_rate = match sc.content {
-            Content::Video => fps as f64,
+            Content::Video => (fps as f64).min(sc.source_fps.unwrap_or(f64::MAX)),
             Content::Office => (fps as f64).min(2.0),
         };
+        budget_bits = (budget_bits + bitrate_kbps * TICK_MS as f64).min(bitrate_kbps * 1000.0);
         // Full send buffers hold the video loop up: nothing is encoded meanwhile.
         if sc
             .send_buffer_kbit
             .is_some_and(|kbit| queued_bits > kbit * 1000.0)
         {
             second_held_ms += TICK_MS;
-        } else {
+        } else if now >= encoder_back_ms {
             encode_phase += produce_rate * TICK_MS as f64 / 1000.0;
         }
         while encode_phase >= 1.0 {
             encode_phase -= 1.0;
+            // As the video loop counts: every frame it hands to the encoder.
             encoded_this_second += 1;
+            let mut bits = encoder.frame_bits(now, bitrate_kbps, produce_rate);
+            if std::mem::take(&mut key_frame) {
+                bits *= 5.0;
+            }
+            if let EncoderModel::Floor(kbit) = sc.encoder {
+                bits = bits.max(kbit * 1000.0);
+                if budget_bits < bits {
+                    // Left out by the rate control: nothing is sent.
+                    continue;
+                }
+                budget_bits -= bits;
+            }
+            sent_this_second += 1;
             if now >= WARM_UP_MS {
                 produced += 1;
             }
-            let bits = encoder.frame_bits(now, bitrate_kbps, produce_rate);
             queue.push_back(Packet {
                 bits,
                 enqueued_ms: now,
@@ -502,16 +591,33 @@ pub fn run(sc: &Scenario) -> Report {
             }
             qos.user_delay_response_elapsed(1, (now - probe_sent.unwrap()) as u128);
             if sc.abr {
+                if let Some((least, most)) = sc.loop_wait {
+                    second_held_ms += (loop_rng.range(least, most) * 1000.0) as u32;
+                }
                 qos.update_display_rates(
                     "sim",
                     (second_bits / 8.0) as usize,
-                    encoded_this_second,
+                    sent_this_second,
                     Duration::from_millis(second_held_ms as u64),
                     Duration::from_secs(1),
                 );
+                if std::env::var("QOS_SIM_DEBUG").is_ok() && sc.name.starts_with("field") {
+                    eprintln!(
+                        "DBG {:>3} out={:>5.0} held={:>3} ratio={:.3} cap={:?} over={:.2} ceil={} queue={:.0}",
+                        now / 1000,
+                        second_bits / 1000.0,
+                        second_held_ms,
+                        qos.ratio,
+                        qos.ratio_cap.map(|c| (c * 1000.0).round() / 1000.0),
+                        qos.capacity.overshoot(),
+                        qos.capacity.has_ceiling(),
+                        queued_bits / capacity_kbps.max(1.0),
+                    );
+                }
                 qos.update_display_data("sim", encoded_this_second);
             }
             encoded_this_second = 0;
+            sent_this_second = 0;
             second_bits = 0.0;
             second_held_ms = 0;
         }
@@ -519,7 +625,13 @@ pub fn run(sc: &Scenario) -> Report {
         if now % 100 == 0 {
             let queue_ms = (queued_bits / capacity_kbps.max(1.0)) as u32;
             let fps = qos.fps();
-            trace.push((now, fps, queue_ms, qos.ratio()));
+            // Where the encoder is: for one that is created again, not where it is asked to be.
+            let ratio = if sc.restart_only {
+                created_at
+            } else {
+                qos.ratio()
+            };
+            trace.push((now, fps, queue_ms, ratio));
             if now < WARM_UP_MS {
                 cold_start_min_fps = cold_start_min_fps.min(fps);
             } else {
@@ -564,6 +676,7 @@ pub fn run(sc: &Scenario) -> Report {
         recovery_ms,
         cold_start_min_fps,
         time_to_90pct_ms,
+        restarts,
         trace,
     }
 }
@@ -717,6 +830,11 @@ pub fn scenarios() -> Vec<Scenario> {
         seed: 1,
         reports: false,
         send_buffer_kbit: None,
+        source_fps: None,
+        relay_cap_kbps: None,
+        base_kbps: None,
+        loop_wait: None,
+        restart_only: false,
     };
     use EncoderModel::*;
     vec![

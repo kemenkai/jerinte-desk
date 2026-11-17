@@ -14,17 +14,31 @@
 //!
 //! Two things more are needed to trust it. A pause in the path makes replies late too, and then
 //! the path catches up: in the interval after it delivers more than was sent into it. A path
-//! that is full delivers less than was sent in every interval, so that is what is asked for.
-//! And a screen that hardly changes sends little, and little arrives; that says nothing of the
-//! path. The samples count when the encoder was putting out something like its bitrate, or when
-//! the video loop was waiting for its frames to be taken: a connection whose send is held up
-//! takes no frame, so once the send buffers are full the encoder is slowed to the pace of the
-//! path, sent and delivered are the same again, and only that wait still says the path is full.
+//! that is full delivers less than was sent in every interval, so that is what is asked for; or
+//! that it did so in one interval and the replies were late at both ends of the next, in which
+//! less may have been sent (the frame rate is braked on the first late reply, and a hardware
+//! encoder sends less for it) while the queue stood all through. And a screen that hardly
+//! changes sends little, and little arrives; that says nothing of the path. The samples count
+//! when the encoder was putting out something like its bitrate, or when the video loop was
+//! waiting for its frames to be taken: a connection whose send is held up takes no frame, so
+//! once the send buffers are full the encoder is slowed to the pace of the path, sent and
+//! delivered are the same again, and only that wait still says the path is full.
 //!
-//! Then the stream goes below what the path carried in one step: well below at first, so the
-//! queue drains, then just below. That level is remembered as a ceiling, in kbps of real output,
-//! which is a property of the path and not of an encoder or a resolution. The way back is fast
-//! up to it, and past it only by small steps after a wait that grows each time it is met again.
+//! Then the stream goes below what the path carried in one step: well below at first, until a
+//! reply comes back clean and the queue is sent, then just below. That level is remembered as a
+//! ceiling, in kbps of real output, which is a property of the path and not of an encoder or a
+//! resolution. The way back is fast up to it, and past it only by small steps after a wait that
+//! grows each time it is met again.
+//!
+//! What a ceiling comes to as a ratio depends on what the encoder really puts out. A software
+//! encoder keeps to its bitrate over time, by leaving frames out when the picture cannot be
+//! made small enough, so that single seconds of it are far over and far under: it is taken at
+//! its bitrate. A hardware encoder's rate control is set for thirty frames a second, and its
+//! output goes with the frame rate: twice its bitrate at sixty. That is measured, by the frame.
+//!
+//! An encoder that takes a new bitrate only by being created again (VAAPI) is brought down by
+//! being created again, which takes a tenth of a second: straight to where the stream settles,
+//! and tried higher again after a wait.
 //!
 //! Without such a sample nothing here acts and the parent's tables stand as they were: a viewer
 //! from before the field, more than one viewer, more than one display. The one exception is a
@@ -44,9 +58,14 @@ const CLEAN_REPLY_MS: u32 = 50;
 /// A screen that changed: this many frames encoded in the second.
 const CHANGING_FRAMES: usize = 2;
 
-/// The delivery rate is the higher of this many probe intervals: a full path shows what it
-/// carries in each, and after a pause the interval of catching up shows that it carries more.
+/// The delivery rate is taken over this many probe intervals together. A full path falls short
+/// in each of them; after a pause the interval of catching up does not. And on a path that
+/// loses packets the probes are held back with the stream until what was lost is sent again, so
+/// that one interval reads too long and the next too short: together they read right.
 const SAMPLES: usize = 2;
+/// One interval more is kept, to know of a path that fell short and has had a queue since: the
+/// cut may come a second or two after the frame rate was braked.
+const SAMPLES_KEPT: usize = SAMPLES + 1;
 /// A sample older than this says nothing of now.
 const SAMPLE_AGE: Duration = Duration::from_secs(3);
 /// The path kept up in an interval: it delivered this share of what was sent into it, or more.
@@ -56,6 +75,9 @@ const KEPT_UP: f32 = 0.97;
 const AT_WORK: f32 = 0.5;
 /// The video loop waited this share of its time for its frames to be taken: the send is held up.
 const HELD_UP_SHARE: f32 = 0.3;
+/// An interval that took less than this to arrive is too short to time: its bytes over its time
+/// is not taken for what the path carries.
+const TIMED: Duration = Duration::from_millis(100);
 
 /// After a cut the stream first keeps well below what the path carried, until the queue that
 /// built up on the way is sent: low enough to send it in about this long, but between a quarter
@@ -63,8 +85,11 @@ const HELD_UP_SHARE: f32 = 0.3;
 const DRAIN_IN: Duration = Duration::from_secs(6);
 const DEEPEST_DRAIN: f32 = 0.25;
 const DRAIN: f32 = 0.5;
+/// How long that takes is reckoned from the queue the last reply showed, which is less than
+/// there is by the time it is acted on: the stream stays low until a reply comes back clean, or
+/// this long at the most.
 const SHORTEST_DRAIN: Duration = Duration::from_secs(1);
-const LONGEST_DRAIN: Duration = Duration::from_secs(15);
+const LONGEST_DRAIN: Duration = Duration::from_secs(30);
 /// Then this far below it.
 const BELOW_CAPACITY: f32 = 0.85;
 /// One cut takes the stream no lower than this share of where it was: a sample can be wrong.
@@ -87,35 +112,111 @@ const NOTICEABLE_CUT: f32 = 0.8;
 /// Back within this share of the most allowed, the stream is no longer "lowered".
 const BACK: f32 = 0.9;
 
-/// An encoder seen to put out this much more than its nominal bitrate, second after second, is
-/// taken at its word, for as long as the last seconds like it are remembered.
+/// A hardware encoder's rate control is set for thirty frames a second: given sixty it puts out
+/// twice its bitrate, given forty-five half again, as measured with VAAPI. What it puts out a
+/// frame is taken from the last second that says it, and reckoned at the frame rate the stream
+/// runs at; it counts from this much over its nominal bitrate on. A software encoder keeps to
+/// its bitrate over time whatever the frame rate, by leaving frames out if it must, and is never
+/// taken to put out more.
 const OVERSHOOT_SEEN: f32 = 1.15;
 const MOST_OVERSHOOT: f32 = 3.0;
-const OVERSHOOT_SECONDS: usize = 10;
-/// The seconds an encoder's output is judged over.
-const RATE_SECONDS: usize = 3;
-/// Sent this much above a limit, the ratio follows what was sent and not the nominal bitrate.
+/// A second says what the encoder puts out when this many frames went out in it: one frame more
+/// or less is then a tenth of it at most.
+const SMOOTH_FRAMES: usize = 10;
+/// What it was seen to put out a frame is taken anew when two seconds in a row differ from it by
+/// more than this, the same way: less is the scatter of one second to the next, and would move
+/// the ratio every second; and one second alone is a change of scene.
+const OUTPUT_MOVED: f32 = 0.1;
+/// The frame rate its output is reckoned at is the highest of this many last seconds that said
+/// what it puts out: the frame rate is braked for some seconds on a late reply and comes back,
+/// and the encoder's output with it.
+const FRAME_RATE_SECONDS: usize = 10;
+/// The frame rate a hardware encoder's rate control is set for.
+const ENCODER_FPS: f32 = 30.0;
+/// An encoder that takes a new bitrate only by being created again is created once more when it
+/// puts out this much more than it was brought down to, and that no sooner than this after it
+/// was created: its bitrate is known as soon as it is there, and is not proportional to the
+/// ratio (for H.264 it hardly falls between two ratios that are a quarter apart), so that the
+/// ratio is closed in on in two or three steps.
 const OVER_LIMIT: f32 = 1.1;
-/// Half again its bitrate in a whole second is no change of scene: that is the encoder, and
-/// remembered at once.
-const LASTING_OVERSHOOT: f32 = 1.5;
+const CLOSING_IN_APART: Duration = Duration::from_secs(2);
+/// The seconds of the video loop that are kept.
+const RATE_SECONDS: usize = 3;
 
 /// An encoder that takes a new bitrate only by being created again is created again no sooner
-/// than this after the last time: each time the picture stops for a moment.
-const RESTARTS_APART: Duration = Duration::from_secs(30);
+/// than this after the last time. Each time the picture stops for a tenth of a second (measured
+/// with VAAPI: 100 and 106 ms from the request to the new encoder) and a key frame goes out.
+const RESTARTS_APART: Duration = Duration::from_secs(5);
 /// And the bitrate is tried higher again only this long after it came down: this at first,
-/// doubled each time it comes down again, up to the longest. Then by half again at a time: a
-/// path that has not changed is overrun by half and not by all the target asks for.
-const FIRST_WAIT_BACK: Duration = Duration::from_secs(300);
-const LONGEST_WAIT_BACK: Duration = Duration::from_secs(1200);
+/// doubled each time a try ends in another cut, up to the longest. Then by half again at a time:
+/// a path that has not changed is overrun by half and not by all the target asks for.
+const FIRST_WAIT_BACK: Duration = Duration::from_secs(30);
+const LONGEST_WAIT_BACK: Duration = Duration::from_secs(120);
 const STEP_BACK: f32 = 1.5;
+/// Where the relay's limit and not the viewer's target says where such an encoder runs, it is
+/// created again only when it is this far from there: the ratio the limit comes to is worked out
+/// from where the encoder is, and moves a little each time it is.
+const RELAY_BAND: f32 = 0.1;
+/// Such an encoder is created again for a cut to this share or below: a restart costs a tenth of
+/// a second, and one a little over what the path carries stays over it for good otherwise.
+const WORTH_A_RESTART: f32 = 0.95;
 
-/// What the path delivered between two probes, and what was sent into it in that time.
+/// What was written between two probes, how long that took, and how long it took to arrive.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Delivery {
     at: Instant,
-    delivered_kbps: u32,
+    bytes: u64,
+    sent: Duration,
+    received: Duration,
+}
+
+impl Delivery {
+    fn kbps(bytes: u64, over: Duration) -> u32 {
+        let ms = over.as_millis().max(1) as u64;
+        (bytes * 8 / ms).min(u32::MAX as u64) as u32
+    }
+
+    fn delivered_kbps(&self) -> u32 {
+        Self::kbps(self.bytes, self.received)
+    }
+
+    fn sent_kbps(&self) -> u32 {
+        Self::kbps(self.bytes, self.sent)
+    }
+
+    /// The path delivered what was sent into it in this interval, as near as the probes tell.
+    fn kept_up(&self) -> bool {
+        self.delivered_kbps() as f32 >= self.sent_kbps() as f32 * KEPT_UP
+    }
+
+    /// It delivered more than was sent into it, by more than the probes' jitter: a queue is on
+    /// its way out.
+    fn caught_up(&self) -> bool {
+        self.delivered_kbps() as f32 > self.sent_kbps() as f32 * (2.0 - KEPT_UP)
+    }
+}
+
+/// What the last deliveries of a viewer say together.
+#[derive(Debug, Clone, Copy)]
+struct Delivered {
+    /// The rate the path delivered at over all of them, in kbps, and in the latest alone.
+    kbps: u32,
+    latest_kbps: u32,
+    /// What was sent into it in the latest.
     sent_kbps: u32,
+    /// In every one of them the encoder was at work and the path fell short of what was sent.
+    fell_short: bool,
+    /// How many intervals there were since one of which that is true, of those kept; `None`
+    /// when there was none, or it is the latest.
+    since_fell_short: Option<usize>,
+    /// How long the latest took to arrive.
+    latest_received: Duration,
+    /// It delivered more than was sent in the latest: the queue is getting shorter.
+    shrinking: bool,
+    /// What was sent in the interval the path last fell short in, with the encoder at work, and
+    /// when that interval ended.
+    sent_when_short_kbps: u32,
+    fell_short_at: Option<Instant>,
 }
 
 /// A viewer's last deliveries.
@@ -124,25 +225,53 @@ pub(super) struct Deliveries(VecDeque<Delivery>);
 
 impl Deliveries {
     fn push(&mut self, delivery: Delivery) {
-        if self.0.len() >= SAMPLES {
+        if self.0.len() >= SAMPLES_KEPT {
             self.0.pop_front();
         }
         self.0.push_back(delivery);
     }
 
-    /// The most the path delivered in the last intervals, what was sent in the latest, and
-    /// whether it fell short of what was sent in every one of them; if the latest is fresh.
-    fn latest(&self, now: Instant) -> Option<(u32, u32, bool)> {
+    /// What the last `SAMPLES` say, if the latest is fresh. The rate is taken over the latest
+    /// and the one before it if at least `at_work_kbps` was sent in that: an interval of a
+    /// screen that hardly changed says nothing of what the path carries.
+    fn latest(&self, now: Instant, at_work_kbps: f32) -> Option<Delivered> {
         let last = self.0.back()?;
         if now.saturating_duration_since(last.at) > SAMPLE_AGE {
             return None;
         }
-        let delivered = self.0.iter().map(|d| d.delivered_kbps).max()?;
-        let fell_short = self
-            .0
-            .iter()
-            .all(|d| (d.delivered_kbps as f32) < d.sent_kbps as f32 * KEPT_UP);
-        Some((delivered, last.sent_kbps, fell_short))
+        // Full: more went into the path than came out, and it was the stream that went in. An
+        // interval of little sent that came up a little short says nothing of the path.
+        let full = |d: &Delivery| d.sent_kbps() as f32 >= at_work_kbps && !d.kept_up();
+        let recent = || self.0.iter().rev().take(SAMPLES);
+        let counted = || {
+            recent()
+                .skip(1)
+                .filter(|d| d.sent_kbps() as f32 >= at_work_kbps)
+                .chain(std::iter::once(last))
+        };
+        let bytes = counted().map(|d| d.bytes).sum();
+        let received = counted().map(|d| d.received).sum();
+        Some(Delivered {
+            kbps: Delivery::kbps(bytes, received),
+            latest_kbps: last.delivered_kbps(),
+            latest_received: last.received,
+            sent_kbps: last.sent_kbps(),
+            fell_short: recent().all(full),
+            since_fell_short: self
+                .0
+                .iter()
+                .rev()
+                .position(full)
+                .filter(|since| *since > 0),
+            shrinking: last.caught_up(),
+            sent_when_short_kbps: self
+                .0
+                .iter()
+                .rev()
+                .find(|d| full(d))
+                .map_or(0, |d| d.sent_kbps()),
+            fell_short_at: self.0.iter().rev().find(|d| full(d)).map(|d| d.at),
+        })
     }
 }
 
@@ -151,19 +280,21 @@ impl Deliveries {
 pub(super) struct Rates {
     sent_kbps: VecDeque<u32>,
     held_up: VecDeque<f32>,
-    encoded: VecDeque<usize>,
+    frames: VecDeque<usize>,
 }
 
 impl Rates {
-    fn push(&mut self, sent_kbps: u32, held_up: f32, encoded: usize) {
+    /// A second in which `frames` frames went out, `sent_kbps` in all, the loop waiting the share
+    /// `held_up` of it for its frames to be taken.
+    fn push(&mut self, sent_kbps: u32, held_up: f32, frames: usize) {
         if self.sent_kbps.len() >= RATE_SECONDS {
             self.sent_kbps.pop_front();
             self.held_up.pop_front();
-            self.encoded.pop_front();
+            self.frames.pop_front();
         }
         self.sent_kbps.push_back(sent_kbps);
         self.held_up.push_back(held_up.clamp(0.0, 1.0));
-        self.encoded.push_back(encoded);
+        self.frames.push_back(frames);
     }
 
     /// The share of the last seconds the loop waited for its frames to be taken.
@@ -174,24 +305,12 @@ impl Rates {
         self.held_up.iter().sum::<f32>() / self.held_up.len() as f32
     }
 
-    /// The last second, if the screen changed in it and nothing held the loop up: what the
-    /// encoder put out when left to.
-    fn last_free_kbps(&self) -> Option<u32> {
-        let free = *self.held_up.back()? <= 0.1 && *self.encoded.back()? >= CHANGING_FRAMES;
-        free.then(|| *self.sent_kbps.back().unwrap_or(&0))
-    }
-
-    /// The least encoded in any of the last seconds, once there are that many, if the screen
-    /// changed in each and nothing held the loop up: what the encoder puts out second after
-    /// second. One heavy second is a change of scene, which rate control takes back.
-    fn sustained_kbps(&self) -> Option<u32> {
-        if self.sent_kbps.len() < RATE_SECONDS
-            || self.held_up.iter().any(|held| *held > 0.1)
-            || self.encoded.iter().any(|frames| *frames < CHANGING_FRAMES)
-        {
-            return None;
-        }
-        self.sent_kbps.iter().copied().min()
+    /// The last second's output and the frames that went out in it, if it says what the
+    /// encoder puts out: they were many, and the path did not hold the loop up.
+    fn last_smooth(&self) -> Option<(u32, usize)> {
+        let frames = *self.frames.back()?;
+        let smooth = frames >= SMOOTH_FRAMES && *self.held_up.back()? < HELD_UP_SHARE;
+        smooth.then(|| (*self.sent_kbps.back().unwrap_or(&0), frames))
     }
 }
 
@@ -204,6 +323,19 @@ pub(super) struct Evidence {
     pub sent_kbps: u32,
     /// The path delivered less than was sent into it in every one of the last intervals.
     pub fell_short: bool,
+    /// It delivered more than was sent into it in the latest: the reply was late for a queue
+    /// that is on its way out.
+    pub shrinking: bool,
+    /// When the path last fell short with the encoder at work, of the intervals kept.
+    pub fell_short_at: Option<Instant>,
+    /// The path fell short an interval or two before the latest, with the encoder at work, and
+    /// every reply since was late: the queue that built up stood in the path all through the
+    /// latest, and the path was busy with it. The bytes of the latest then took
+    /// as long to arrive as the path needs for them, however few they were: their rate is what
+    /// it carries, though less was sent into it by then (the frame rate is braked on the first
+    /// late reply, and a hardware encoder sends less for it). Late replies alone do not say so:
+    /// on a path with jitter they come without a queue.
+    pub queue_stood: bool,
     /// The encoder's bitrate at the current ratio.
     pub nominal_kbps: u32,
     /// The share of its time the video loop waited for its frames to be taken.
@@ -216,9 +348,8 @@ impl Evidence {
     /// The delivery says what the path carries: the path was full, with something to carry.
     fn counts(&self) -> bool {
         let at_work = self.sent_kbps as f32 >= self.nominal_kbps as f32 * AT_WORK;
-        self.delivered_kbps > 0
-            && self.nominal_kbps > 0
-            && ((self.fell_short && at_work) || self.held_up >= HELD_UP_SHARE)
+        let full = (self.fell_short && at_work) || self.queue_stood;
+        self.delivered_kbps > 0 && self.nominal_kbps > 0 && (full || self.held_up >= HELD_UP_SHARE)
     }
 }
 
@@ -241,9 +372,17 @@ pub(super) struct Capacity {
     /// How long the wait at the ceiling is now, and until when.
     hold: Duration,
     hold_until: Option<Instant>,
-    /// How much more than its nominal bitrate the encoder put out in the last seconds it was
-    /// seen at work.
-    overshoots: VecDeque<f32>,
+    /// When the stream was last brought under what the path carried.
+    cut_at: Option<Instant>,
+    /// What a hardware encoder was last seen to put out a frame, as a share of what its nominal
+    /// bitrate comes to a frame at the frame rate its rate control is set for; 1 until it is
+    /// seen, and for a software encoder.
+    output: f32,
+    /// The frames a second of the last seconds that said what it puts out.
+    frame_rates: VecDeque<usize>,
+    /// What the last such second said, when it was not what was known: believed if the next
+    /// says so too.
+    output_moved: Option<f32>,
     /// Cut for the network by a fifth or more, and not back yet.
     lowered: bool,
 }
@@ -261,7 +400,10 @@ impl Default for Capacity {
             drain_until: None,
             hold: Duration::ZERO,
             hold_until: None,
-            overshoots: Default::default(),
+            cut_at: None,
+            output: 1.0,
+            frame_rates: Default::default(),
+            output_moved: None,
             lowered: false,
         }
     }
@@ -277,6 +419,7 @@ impl Capacity {
         self.drain_until = None;
         self.hold = Duration::ZERO;
         self.hold_until = None;
+        self.cut_at = None;
     }
 
     /// The ratio to go on with when the viewer's target is `target` and the stream is at
@@ -355,7 +498,7 @@ impl Capacity {
         if !evidence.counts() {
             return false;
         }
-        // Should the sample be wrong: one cut takes the stream to a fifth of where it was at the
+        // Should the sample be wrong: one cut takes the stream to a tenth of where it was at the
         // lowest, while it drains and after.
         let least = evidence.nominal_kbps as f32 * self.overshoot() * DEEPEST_CUT;
         let ceiling = (evidence.delivered_kbps as f32).max(least / BELOW_CAPACITY);
@@ -365,6 +508,7 @@ impl Capacity {
             FIRST_HOLD
         };
         self.hold_until = Some(now + self.hold);
+        self.cut_at = Some(now);
         self.ceiling_kbps = Some(ceiling);
         self.settled_kbps = ceiling * BELOW_CAPACITY;
         // Sending at the share `level` of what the path carries, a queue of q seconds is gone in
@@ -373,13 +517,26 @@ impl Capacity {
         let level = (1.0 - queue / DRAIN_IN.as_secs_f32()).clamp(DEEPEST_DRAIN, DRAIN);
         self.drain_kbps = (ceiling * level).max(least).min(self.settled_kbps);
         let level = self.drain_kbps / ceiling;
+        // The queue is gone when a reply comes back clean (`queue_sent`); this is how long the
+        // stream waits for one before it takes the queue for gone anyway. Reckoned from the
+        // queue the reply showed, which had grown by the time it was acted on: twice that.
         let drain = if level < 0.95 {
-            Duration::from_secs_f32(queue / (1.0 - level)).clamp(SHORTEST_DRAIN, LONGEST_DRAIN)
+            Duration::from_secs_f32(2.0 * queue / (1.0 - level))
+                .clamp(SHORTEST_DRAIN, LONGEST_DRAIN)
         } else {
             LONGEST_DRAIN
         };
         self.drain_until = Some(now + drain);
         self.starting = false;
+        log::info!(
+            "qos: the path carried {} kbps of {} sent, queue {} ms: {:.0} kbps for up to {:.0} s, then {:.0}",
+            evidence.delivered_kbps,
+            evidence.sent_kbps,
+            evidence.queue_ms,
+            self.drain_kbps,
+            drain.as_secs_f32(),
+            self.settled_kbps,
+        );
         true
     }
 
@@ -387,6 +544,12 @@ impl Capacity {
     /// because of that queue.
     fn draining(&self, now: Instant) -> bool {
         self.drain_until.is_some_and(|until| now < until)
+    }
+
+    /// A reply came back clean: the probe met no queue on its way, so the queue of the last cut
+    /// is sent, however long it was reckoned to take.
+    fn queue_sent(&mut self) {
+        self.drain_until = None;
     }
 
     /// What the stream may put out under the ceiling now, in kbps; `None` without a ceiling.
@@ -401,6 +564,11 @@ impl Capacity {
 
     pub(super) fn has_ceiling(&self) -> bool {
         self.ceiling_kbps.is_some()
+    }
+
+    /// What the stream may put out under the ceiling with the queue sent; `None` without one.
+    fn settled_under_ceiling(&self) -> Option<f32> {
+        self.ceiling_kbps.map(|_| self.settled_kbps)
     }
 
     /// One step up under the ceiling, with every viewer's delay good and the screen changing:
@@ -419,6 +587,7 @@ impl Capacity {
             self.settled_kbps += ceiling * PROBE_STEP;
             if self.settled_kbps > ceiling * PAST_CEILING {
                 // The path carries more than it did.
+                log::info!("qos: {ceiling:.0} kbps is no longer what the path carries");
                 self.forget_ceiling();
             }
         }
@@ -437,32 +606,62 @@ impl Capacity {
             }
     }
 
-    /// A second of the video loop at a nominal `nominal_kbps`. How much of its bitrate the
-    /// encoder put out, second after second with nothing holding it back, is kept for the last
-    /// such seconds: an encoder's excess can depend on the frame rate, which moves.
-    fn learn_overshoot(&mut self, rates: &Rates, nominal_kbps: u32) {
-        let Some(sustained) = rates.sustained_kbps() else {
+    /// A hardware encoder put out `sent_kbps` in `frames` frames, in a second that says what it
+    /// puts out, at a nominal `nominal_kbps` and a ratio that did not move in it.
+    fn learn_output(&mut self, sent_kbps: u32, frames: usize, nominal_kbps: u32) {
+        if nominal_kbps == 0 || frames == 0 {
+            return;
+        }
+        if self.frame_rates.len() >= FRAME_RATE_SECONDS {
+            self.frame_rates.pop_front();
+        }
+        self.frame_rates.push_back(frames);
+        let a_frame = sent_kbps as f32 / nominal_kbps as f32 * ENCODER_FPS / frames as f32;
+        // Frames far smaller than its bitrate allows are a picture that hardly changes (a
+        // pointer moving over a still screen): not what it puts out when it has work to do.
+        let moved =
+            a_frame >= AT_WORK && (a_frame - self.output).abs() > self.output * OUTPUT_MOVED;
+        if !moved {
+            self.output_moved = None;
+            return;
+        }
+        // One second of many key frames puts out more, and one of an easy picture less: it is
+        // the encoder when the second after it says the same, and then by the lesser move.
+        let Some(before) = self.output_moved.replace(a_frame) else {
             return;
         };
-        if nominal_kbps == 0 {
-            return;
+        if (before > self.output) == (a_frame > self.output) {
+            self.output = if a_frame > self.output {
+                a_frame.min(before)
+            } else {
+                a_frame.max(before)
+            };
+            self.output_moved = None;
         }
-        self.note_output(sustained as f32 / nominal_kbps as f32);
     }
 
-    /// The encoder was seen to put out `share` of its nominal bitrate.
-    fn note_output(&mut self, share: f32) {
-        if self.overshoots.len() >= OVERSHOOT_SECONDS {
-            self.overshoots.pop_front();
-        }
-        self.overshoots.push_back(share.min(MOST_OVERSHOOT));
+    /// A second that says nothing of what the encoder puts out: what the one before it said is
+    /// not followed by another that says the same.
+    fn no_word_of_output(&mut self) {
+        self.output_moved = None;
     }
 
-    /// How much more than its nominal bitrate the encoder puts out, 1 when it does not.
+    /// The encoder is a software one: what a hardware one was seen to put out says nothing of
+    /// it.
+    fn forget_output(&mut self) {
+        self.output = 1.0;
+        self.frame_rates.clear();
+        self.output_moved = None;
+    }
+
+    /// How much more than its nominal bitrate the encoder puts out, 1 when it does not: what a
+    /// hardware encoder puts out a frame, at the frame rate the stream runs at when nothing
+    /// brakes it.
     pub(super) fn overshoot(&self) -> f32 {
-        let most = self.overshoots.iter().copied().fold(1.0, f32::max);
-        if most > OVERSHOOT_SEEN {
-            most
+        let frames = self.frame_rates.iter().copied().max().unwrap_or(0);
+        let output = (self.output * frames as f32 / ENCODER_FPS).min(MOST_OVERSHOOT);
+        if output > OVERSHOOT_SEEN {
+            output
         } else {
             1.0
         }
@@ -499,6 +698,8 @@ pub(super) struct Restart {
     last: Option<Instant>,
     /// How long after that the bitrate may be tried higher.
     wait_back: Duration,
+    /// It was tried higher since it last came down: another cut now is the try's end.
+    tried_back: bool,
 }
 
 impl VideoQoS {
@@ -506,16 +707,13 @@ impl VideoQoS {
     /// of video, in `sent` by this side's clock; the viewer says they reached it in `received`,
     /// by its own.
     pub fn user_delivery(&mut self, id: i32, bytes: u64, sent: Duration, received: Duration) {
-        let now = self.now();
-        let kbps = |over: Duration| {
-            let ms = over.as_millis().max(1) as u64;
-            (bytes * 8 / ms).min(u32::MAX as u64) as u32
-        };
+        let at = self.now();
         if let Some(user) = self.users.get_mut(&id) {
             user.deliveries.push(Delivery {
-                at: now,
-                delivered_kbps: kbps(received),
-                sent_kbps: kbps(sent),
+                at,
+                bytes,
+                sent,
+                received,
             });
         }
     }
@@ -557,6 +755,16 @@ impl VideoQoS {
     /// where the climb is before its first frame; one that does not, runs at the target, as it
     /// always did. Which of the two it is, is known only once it is there.
     pub fn ratio_for_creation(&mut self) -> f32 {
+        if self.restart.below && self.record() {
+            // A recording starts, and while it runs the encoder is not created again for the
+            // network: it is created now at what the viewer asks for, and not once more for
+            // that when the recording has begun, which would cut the recording in two.
+            self.restart.below = false;
+            self.restart.tried_back = false;
+            self.capacity.forget_ceiling();
+            self.capacity.lowered = false;
+            self.ratio = self.most_asked();
+        }
         if self.capacity.starting() {
             self.max_ratio()
         } else {
@@ -575,12 +783,14 @@ impl VideoQoS {
     /// target, as it always was.
     pub(super) fn follow_target(&mut self) {
         let known = self.displays.values().all(|display| display.known);
-        if self.restart.below && !known {
-            // An encoder this side holds down, while another display's is being created: what
-            // that one can do is not known yet, and nothing is let go on its account.
+        let target = self.latest_quality().ratio();
+        if !known && (self.restart.below || self.ratio < target) {
+            // An encoder this side holds down or holds to the relay's limit, while another
+            // display's is being created: what that one can do is not known yet, and nothing is
+            // let go on its account.
             return;
         }
-        self.ratio = self.latest_quality().ratio();
+        self.ratio = target;
         if known {
             self.release_restart_hold();
             self.encoder_cannot_follow();
@@ -612,14 +822,27 @@ impl VideoQoS {
             .unwrap_or(0);
         self.capacity.forget_ceiling();
         self.ratio_cap = None;
+        self.restart_wait_anew();
     }
 
-    /// A video loop started: an encoder is being created. What the last one put out says
-    /// nothing of it.
+    /// A video loop started: an encoder is being created. What the last one put out of its
+    /// bitrate is kept until it is known what this one is (`set_encoder_hardware`): created again
+    /// for another bitrate it is the same encoder.
     pub(super) fn encoder_created(&mut self) {
         self.restart.last = Some(self.now());
-        self.capacity.overshoots.clear();
         self.steady_seconds = 0;
+    }
+
+    /// The display's encoder is a hardware one, whose output goes with the frame rate, or a
+    /// software one, which keeps to its bitrate.
+    pub fn set_encoder_hardware(&mut self, video_service_name: &str, hardware: bool) {
+        let Some(display) = self.displays.get_mut(video_service_name) else {
+            return;
+        };
+        display.hardware = hardware;
+        if self.displays.values().all(|display| !display.hardware) {
+            self.capacity.forget_output();
+        }
     }
 
     /// The most the viewer's target and the relay allow.
@@ -668,7 +891,28 @@ impl VideoQoS {
         }
         let user = self.users.values().next()?;
         let display = self.displays.values().next()?;
-        let (delivered_kbps, sent_kbps, fell_short) = user.deliveries.latest(self.now())?;
+        let nominal_kbps = self.bitrate();
+        let delivered = user
+            .deliveries
+            .latest(self.now(), nominal_kbps as f32 * AT_WORK)?;
+        // The path fell short, and every reply since was late, that of the interval it fell
+        // short in and of each one after: the queue stood through the latest.
+        // And what the path delivered in the latest is less than was sent into it when it fell
+        // short: a path that paused and now catches up delivers more, and carries the stream.
+        let late = user.delay.consecutive_bad_samples as usize;
+        let queue_stood = delivered.since_fell_short.is_some_and(|since| late > since)
+            && delivered.latest_received >= TIMED
+            && (delivered.latest_kbps as f32) < delivered.sent_when_short_kbps as f32 * KEPT_UP;
+        // What the path carries is its rate over the intervals together. Where that rests on the
+        // queue having stood through the latest alone (the frame rate was braked on the first
+        // late reply, and a hardware encoder then sent less), it is the rate of the latest: the
+        // one before began before there was a queue.
+        let delivered_kbps = if queue_stood && !delivered.fell_short {
+            delivered.latest_kbps
+        } else {
+            delivered.kbps
+        };
+        let sent_kbps = delivered.sent_kbps;
         // The probe that just came back saw the queue there was when it went out. It was under
         // way for its whole delay, and all that time more went into the path than came out.
         let saw = user.delay.avg_delay() as f32;
@@ -677,8 +921,11 @@ impl VideoQoS {
         Some(Evidence {
             delivered_kbps,
             sent_kbps,
-            fell_short,
-            nominal_kbps: self.bitrate(),
+            fell_short: delivered.fell_short,
+            shrinking: delivered.shrinking,
+            fell_short_at: delivered.fell_short_at,
+            queue_stood,
+            nominal_kbps,
             held_up: display.rates.held_up(),
             queue_ms: (saw + under_way * growth) as u32,
         })
@@ -699,6 +946,24 @@ impl VideoQoS {
             return Some(ratio);
         }
         let evidence = self.evidence()?;
+        // The path has not fallen short again since the stream was brought under what it
+        // carried, and delivers more than is sent: the reply was late for the queue of that cut,
+        // which is on its way out and took longer than was reckoned. Nothing is cut for it, by
+        // the table either. A path that fell short again since (and delivers more than is sent
+        // now only because the frame rate was braked), a queue that stands (as much delivered as
+        // sent, the replies late all the same) or a send that is held up is another matter, and
+        // goes on to be looked at.
+        let since_cut = match (self.capacity.cut_at, evidence.fell_short_at) {
+            (Some(cut), Some(short)) => short > cut,
+            _ => false,
+        };
+        if self.capacity.has_ceiling()
+            && evidence.shrinking
+            && evidence.held_up < HELD_UP_SHARE
+            && !since_cut
+        {
+            return Some(ratio);
+        }
         if !self.capacity.cut(&evidence, now) {
             return None;
         }
@@ -711,7 +976,7 @@ impl VideoQoS {
             self.capacity.overshoot(),
             allowed,
         );
-        // Down, whatever the sample said, and not below a fifth of where the stream was.
+        // Down, whatever the sample said, and not below a tenth of where the stream was.
         Some(to.min(ratio).max(ratio * DEEPEST_CUT).max(least))
     }
 
@@ -739,6 +1004,7 @@ impl VideoQoS {
     pub(super) fn ratio_for_target(&mut self) -> f32 {
         let target = self.latest_quality().ratio();
         self.ratio_cap = None;
+        self.restart_wait_anew();
         // Whether the encoder follows the ratio while it runs is not asked here: the quality may
         // come before the encoder, or while it is being created. One that does not follow takes
         // its target when it says so (`encoder_cannot_follow`).
@@ -778,13 +1044,14 @@ impl VideoQoS {
         self.ratio = self.capacity.start_step(self.ratio, most, now);
     }
 
-    /// What the video loop of a display measured since it last said: the bytes and the frames it
-    /// encoded, and how long it waited for its frames to be taken, in `elapsed`.
+    /// What the video loop of a display measured since it last said: the bytes and the frames
+    /// that went out (a frame the encoder left out is none), and how long it waited for its
+    /// frames to be taken, in `elapsed`.
     pub fn update_display_rates(
         &mut self,
         video_service_name: &str,
         sent_bytes: usize,
-        encoded: usize,
+        sent_frames: usize,
         held_up: Duration,
         elapsed: Duration,
     ) {
@@ -794,14 +1061,18 @@ impl VideoQoS {
         }
         let nominal = self.bitrate();
         let alone = self.displays.len() == 1;
-        // What was sent in a second belongs to the ratio of that second: it says something of the
-        // encoder at this ratio only if the ratio did not move meanwhile.
-        self.steady_seconds = if self.ratio == self.ratio_at_rates {
+        // What was sent in a second says something of the encoder at its ratio only if it ran at
+        // one ratio all through it: the one asked for when the second began (`second_ends`),
+        // which the video loop takes with its next frame; a ratio moved since, on a reply, is
+        // not that one. An encoder that takes a new bitrate only by being created again runs at
+        // the ratio it was created with whatever is asked for, from then on (`encoder_created`).
+        let one_ratio = self.restart_only() || self.bitrate_ratio == self.ratio_at_rates;
+        self.steady_seconds = if one_ratio {
             self.steady_seconds.saturating_add(1)
         } else {
             0
         };
-        let steady = self.steady_seconds as usize >= RATE_SECONDS;
+        let steady = self.steady_seconds >= 1;
         let Some(display) = self.displays.get_mut(video_service_name) else {
             return;
         };
@@ -809,22 +1080,39 @@ impl VideoQoS {
             (sent_bytes as f32 * 8.0 / 1000.0 / secs) as u32,
             held_up.as_secs_f32() / secs,
             // By the second, as the frames are counted elsewhere.
-            (encoded as f32 / secs).round() as usize,
+            (sent_frames as f32 / secs).round() as usize,
         );
         // With one encoder its nominal bitrate is the one stored; with more, whose it is is not
         // known here.
-        if alone && steady {
-            self.capacity.learn_overshoot(&display.rates, nominal);
+        if alone && display.hardware {
+            match display.rates.last_smooth().filter(|_| steady) {
+                Some((sent, frames)) => self.capacity.learn_output(sent, frames, nominal),
+                None => self.capacity.no_word_of_output(),
+            }
         }
         self.keep_under_limits();
+    }
+
+    /// A video loop's second is over and the ratio is what the next one runs at.
+    pub(super) fn second_ends(&mut self) {
         self.ratio_at_rates = self.ratio;
     }
 
     /// The stream's real output stays under the relay's limit and under the path's ceiling, where
     /// the bitrate follows the ratio while the encoder runs. The ratio that comes to is worked
-    /// out from where the stream is, every second, so that it closes in.
+    /// out from where the stream is, every second, so that it closes in on an encoder whose
+    /// output is not proportional to the ratio.
     fn keep_under_limits(&mut self) {
         let (nominal, now) = (self.bitrate(), self.now());
+        // Every viewer's replies come back clean: the probes meet no queue, so the queue of the
+        // last cut is sent, whether the screen changes or not.
+        let clean = self
+            .users
+            .values()
+            .all(|user| user.delay.avg_delay() < CLEAN_REPLY_MS);
+        if clean && self.capacity.draining(now) {
+            self.capacity.queue_sent();
+        }
         let limit = match (self.relay_kbps(), self.capacity.allowed_kbps(now)) {
             (Some(relay), Some(path)) => Some(relay.min(path)),
             (relay, path) => relay.or(path),
@@ -835,26 +1123,12 @@ impl VideoQoS {
         };
         // From the ratio the encoder's bitrate is the bitrate of: asked twice before the video
         // loop takes a change, the answer is the same.
-        let at = self.bitrate_ratio;
-        let mut cap = ratio_for_kbps(at, nominal, self.capacity.overshoot(), limit);
-        // What was really sent says more than the nominal bitrate when it is over the limit; but
-        // only of the ratio it was sent at, so not in a second in which the ratio moved.
-        let sent = self
-            .displays
-            .values()
-            .next()
-            .filter(|_| self.displays.len() == 1 && self.steady_seconds >= 1)
-            .and_then(|display| display.rates.last_free_kbps());
-        if let Some(sent) = sent.filter(|sent| *sent as f32 > limit * OVER_LIMIT) {
-            cap = cap.min(at * limit / sent as f32);
-            // An encoder whose output goes with the frame rate would be let back up as soon as
-            // the frame rate fell, and be over the limit again as soon as it rose: that much
-            // over its bitrate is remembered at once. A change of scene is not.
-            let share = sent as f32 / nominal as f32;
-            if share >= LASTING_OVERSHOOT {
-                self.capacity.note_output(share);
-            }
-        }
+        let cap = ratio_for_kbps(
+            self.bitrate_ratio,
+            nominal,
+            self.capacity.overshoot(),
+            limit,
+        );
         let cap = cap.max(self.min_ratio());
         self.ratio_cap = Some(cap);
         let most = self.max_ratio();
@@ -872,7 +1146,7 @@ impl VideoQoS {
 
     /// Bitrate control is on, and every display's encoder takes a new bitrate only by being
     /// created again, which it may be.
-    pub(super) fn restart_only(&self) -> bool {
+    pub fn restart_only(&self) -> bool {
         self.abr_config
             && !self.displays.is_empty()
             && self
@@ -883,16 +1157,21 @@ impl VideoQoS {
 
     /// One second of bitrate control by restart.
     ///
-    /// Down: only when congestion is confirmed and the deliveries say what the path carries,
-    /// only for a cut worth the pause, and no sooner than `RESTARTS_APART` after an encoder was
-    /// last created. Up: after a long wait with every reply good and the screen changing, by
-    /// half again, and after each further such wait by half again, until the target is reached.
+    /// Down: when congestion is confirmed and the deliveries say what the path carries, straight
+    /// to where the stream settles if that is lower by a twentieth or more; and again, no sooner than
+    /// `RESTARTS_APART` later, if the encoder then puts out more than that after all (its
+    /// bitrate is not proportional to the ratio, and one step does not always get there). Up:
+    /// after a wait with every reply good and the screen changing, by half again, and after each
+    /// further such wait by half again, until the most the viewer and the relay allow is reached.
     pub(super) fn restart_only_step(&mut self, encoded: usize) {
         let now = self.now();
-        let most = self.latest_quality().ratio();
+        let target = self.latest_quality().ratio();
+        // Through the relay no more than its limit, which is worked out from where the encoder is.
+        let most = self.most_asked();
         self.capacity.end_start();
         if !self.restart.below {
-            // Where it always was: the viewer's target, which a change of preset moves.
+            // Where it always was: the viewer's target, which a change of preset moves; or the
+            // relay's limit.
             self.ratio = most;
             self.capacity.lowered = false;
         }
@@ -913,20 +1192,41 @@ impl VideoQoS {
         }
         if !self.restart.below {
             // The viewer moved a custom quality, which the video loop does not create the
-            // encoder again for by itself (a slider is dragged through many values): it is asked
-            // to here, where the last time is known, so that the encoder's bitrate is the one
-            // of the ratio again.
-            let moved = self.bitrate() > 0 && (self.bitrate_ratio - most).abs() > most * 0.01;
+            // encoder again for by itself (a slider is dragged through many values), or the
+            // relay's limit comes to another ratio now that the encoder's output is known: the
+            // loop is asked to here, where the last time is known, so that the encoder's bitrate
+            // is the one of the ratio again.
+            let band = if most < target { RELAY_BAND } else { 0.01 };
+            let moved = self.bitrate() > 0 && (self.bitrate_ratio - most).abs() > most * band;
             let asked = self.displays.values().any(|display| display.restart);
             if moved && apart && !asked {
+                if most < target {
+                    log::info!(
+                        "qos: the relay's limit comes to ratio {most:.2}, the encoder is at {:.2}",
+                        self.bitrate_ratio
+                    );
+                }
                 self.request_restart(now);
             }
             return;
         }
         if self.ratio >= most {
             // The viewer's target came down to where the stream is held: nothing is held down
-            // any more, and the encoder is created at the target as for any change of it.
-            self.restart_to(most, most, now);
+            // any more, and the encoder is created at the target as for any change of it;
+            // unless it is there already.
+            if self.bitrate_ratio == most {
+                self.ratio = most;
+                self.restart.below = false;
+                self.restart.tried_back = false;
+                self.capacity.forget_ceiling();
+                self.capacity.lowered = false;
+            } else if apart {
+                self.restart_to(most, most, now);
+            }
+            return;
+        }
+        let closing_in = since_restart.map_or(true, |since| since >= CLOSING_IN_APART);
+        if closing_in && self.restart_over_allowance(now) {
             return;
         }
         let waited = since_restart.is_some_and(|since| since >= self.restart.wait_back);
@@ -941,12 +1241,47 @@ impl VideoQoS {
         // else cost one more pause for the last tenth.
         let step = self.ratio * STEP_BACK;
         let to = if step >= most * BACK { most } else { step };
+        if std::mem::replace(&mut self.restart.tried_back, true) {
+            // The try before this one held: the path carries more than it did, and the next
+            // wait is the first again.
+            self.restart.wait_back = FIRST_WAIT_BACK;
+        }
         self.restart_to(to, most, now);
     }
 
+    /// Held down under what the path carried, the encoder puts out more than it was brought
+    /// down to: it is created again for what it really puts out. `true` when it is.
+    fn restart_over_allowance(&mut self, now: Instant) -> bool {
+        // Where the stream settles: such an encoder is not taken lower first to send the queue.
+        let Some(allowed) = self.capacity.settled_under_ceiling() else {
+            return false;
+        };
+        // What it puts out at the frame rate the stream runs at when nothing brakes it, as seen
+        // of this encoder since it was created.
+        let (from, nominal) = (self.bitrate_ratio, self.bitrate());
+        let out = nominal as f32 * self.capacity.overshoot();
+        // Of the encoder that runs at the ratio asked for, not of one about to be replaced.
+        let asked = self.displays.values().any(|display| display.restart);
+        if nominal == 0 || asked || from != self.ratio || out <= allowed * OVER_LIMIT {
+            return false;
+        }
+        let to =
+            ratio_for_kbps(from, nominal, self.capacity.overshoot(), allowed).max(self.min_ratio());
+        if to > from * NEAR_CEILING {
+            // At the floor, or as good as there: another encoder would put out the same.
+            return false;
+        }
+        log::info!(
+            "qos: the encoder puts out {out:.0} kbps where {allowed:.0} are allowed: created again, ratio {from:.2} -> {to:.2}"
+        );
+        self.ratio = to;
+        self.request_restart(now);
+        true
+    }
+
     /// Congestion is confirmed for an encoder that takes a new bitrate only by restart: if the
-    /// deliveries say what the path carries and that is a fifth less than is sent or more, the
-    /// encoder is created again for it, straight at where the stream settles.
+    /// deliveries say what the path carries and where the stream settles under it is lower than
+    /// where it is by enough to be worth it, the encoder is created again for it, straight there.
     fn restart_down(&mut self, most: f32, now: Instant) {
         let Some(evidence) = self.evidence() else {
             return;
@@ -966,35 +1301,59 @@ impl VideoQoS {
         )
         .max(from * DEEPEST_CUT)
         .max(self.min_ratio());
-        if to > from * NOTICEABLE_CUT {
+        if to > from * WORTH_A_RESTART {
             self.capacity = before;
             return;
         }
+        log::info!(
+            "qos: the path carried {} kbps of {} sent: encoder created again, ratio {from:.2} -> {to:.2}",
+            evidence.delivered_kbps,
+            evidence.sent_kbps
+        );
         self.ratio = to;
-        self.restart.below = true;
         self.capacity.note_change(from, to, most, true);
-        self.restart.wait_back = if self.restart.wait_back.is_zero() {
+        // The wait before the next try grows when a try ended in this cut, not when the cut
+        // before it did not go far enough.
+        self.restart.wait_back = if !self.restart.below || self.restart.wait_back.is_zero() {
             FIRST_WAIT_BACK
-        } else {
+        } else if std::mem::take(&mut self.restart.tried_back) {
             (self.restart.wait_back * 2).min(LONGEST_WAIT_BACK)
+        } else {
+            self.restart.wait_back
         };
+        self.restart.below = true;
         self.request_restart(now);
     }
 
     /// The encoder is created again for the ratio `to` on the way back up, of which `most` is
-    /// the viewer's target.
+    /// the most the viewer's target and the relay allow.
     fn restart_to(&mut self, to: f32, most: f32, now: Instant) {
         let from = self.ratio;
+        log::info!("qos: encoder created again on the way back, ratio {from:.2} -> {to:.2}");
         self.ratio = to;
+        // A try for more than the path carried when the encoder was brought down: what it
+        // carried then is no longer what the encoder is held to. If the path carries no more,
+        // the next cut says what it does.
+        self.capacity.forget_ceiling();
         if to >= most {
-            // All the way back: what the path carried then is not what it carries now.
+            // All the way back.
             self.restart.below = false;
-            self.capacity.forget_ceiling();
+            self.restart.tried_back = false;
             self.capacity.lowered = false;
         } else {
             self.capacity.note_change(from, to, most, false);
         }
         self.request_restart(now);
+    }
+
+    /// The viewers changed, or what they ask for: an encoder held down by restart does not wait
+    /// out what the path of the viewers before did to it. The stream stays where it is, and the
+    /// way back starts with the first wait.
+    pub(super) fn restart_wait_anew(&mut self) {
+        if self.restart.below {
+            self.restart.wait_back = FIRST_WAIT_BACK;
+            self.restart.tried_back = false;
+        }
     }
 
     /// The encoders are no longer held down by restart, as when one may no longer be created
@@ -1017,6 +1376,9 @@ mod tests {
             delivered_kbps,
             sent_kbps,
             fell_short: (delivered_kbps as f32) < sent_kbps as f32 * KEPT_UP,
+            shrinking: delivered_kbps as f32 > sent_kbps as f32 * (2.0 - KEPT_UP),
+            fell_short_at: None,
+            queue_stood: false,
             nominal_kbps: 20_000,
             held_up,
             queue_ms: 1_000,
@@ -1042,40 +1404,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_in_the_path_is_not_a_full_path() {
-        let now = Instant::now();
-        let delivery = |delivered_kbps, sent_kbps| Delivery {
-            at: now,
-            delivered_kbps,
-            sent_kbps,
-        };
-        // Full: less arrives than is sent, interval after interval.
-        let mut full = Deliveries::default();
-        full.push(delivery(10_100, 21_000));
-        full.push(delivery(9_900, 21_000));
-        assert_eq!(full.latest(now), Some((10_100, 21_000, true)));
-        // A pause: hardly anything arrives, then the path catches up with more than was sent.
-        let mut pause = Deliveries::default();
-        pause.push(delivery(2_000, 12_000));
-        pause.push(delivery(22_000, 12_000));
-        assert_eq!(pause.latest(now), Some((22_000, 12_000, false)));
-        // Old samples say nothing of now.
-        assert_eq!(
-            full.latest(now + SAMPLE_AGE + Duration::from_millis(1)),
-            None
-        );
-    }
-
-    #[test]
     fn a_cut_goes_well_below_what_the_path_carried_then_just_below() {
         let now = Instant::now();
         let mut c = Capacity::default();
         assert!(c.cut(&evidence(8_000, 20_000, 0.0), now));
-        // A second of queue is sent in two at half the path's rate.
+        // A second of queue is sent in two at half the path's rate. The stream stays there for
+        // twice as long, should no reply come back clean before: the queue had grown by the
+        // time the reply that showed it was acted on.
         assert_eq!(c.allowed_kbps(now), Some(4_000.0));
-        assert!(c.draining(now + Duration::from_millis(1_900)));
+        assert!(c.draining(now + Duration::from_millis(3_900)));
         assert_eq!(
-            c.allowed_kbps(now + Duration::from_millis(2_100)),
+            c.allowed_kbps(now + Duration::from_millis(4_100)),
             Some(6_800.0)
         );
 
@@ -1087,8 +1426,40 @@ mod tests {
         };
         assert!(c.cut(&long, now));
         assert_eq!(c.allowed_kbps(now), Some(2_000.0));
-        assert!(c.draining(now + Duration::from_millis(7_900)));
-        assert!(!c.draining(now + Duration::from_millis(8_100)));
+        assert!(c.draining(now + Duration::from_millis(15_900)));
+        assert!(!c.draining(now + Duration::from_millis(16_100)));
+        // A reply that comes back clean met no queue: it is sent, whatever was reckoned.
+        c.queue_sent();
+        assert!(!c.draining(now + Duration::from_millis(8_500)));
+        assert_eq!(
+            c.allowed_kbps(now + Duration::from_millis(8_500)),
+            Some(6_800.0)
+        );
+        // And however long the queue, the stream is not kept low for more than half a minute.
+        let mut c = Capacity::default();
+        let longest = Evidence {
+            queue_ms: 60_000,
+            ..evidence(8_000, 20_000, 0.0)
+        };
+        assert!(c.cut(&longest, now));
+        assert!(!c.draining(now + LONGEST_DRAIN));
+    }
+
+    #[test]
+    fn a_queue_that_stood_through_the_interval_says_what_the_path_carries() {
+        // The frame rate was braked on the first late reply: a hardware encoder then sent a
+        // fifth of its bitrate, less than the path carries, and all of it arrived. But the path
+        // had fallen short before, and the replies at both ends of this interval were late.
+        let stood = Evidence {
+            queue_stood: true,
+            ..evidence(8_000, 4_000, 0.0)
+        };
+        assert!(stood.counts());
+        // Without that, such an interval says nothing: the path kept up.
+        assert!(!evidence(8_000, 4_000, 0.0).counts());
+        let mut c = Capacity::default();
+        assert!(c.cut(&stood, Instant::now()));
+        assert_eq!(c.ceiling_kbps, Some(8_000.0));
     }
 
     #[test]
@@ -1128,7 +1499,9 @@ mod tests {
         // While the queue drains nothing rises.
         c.raise_allowance(t0 + Duration::from_secs(1));
         assert_eq!(c.settled_kbps, 6_800.0);
-        // Then one step to just under the ceiling, and no further for the half minute.
+        // A reply comes back clean. Then one step to just under the ceiling, and no further for
+        // the half minute.
+        c.queue_sent();
         let mut now = t0 + Duration::from_secs(3);
         c.raise_allowance(now);
         assert_eq!(c.settled_kbps, 7_200.0);
@@ -1229,38 +1602,152 @@ mod tests {
         assert!(!c.lowered());
     }
 
+    /// Seconds of (kbps sent, share held up, frames sent).
     fn rates(seconds: &[(u32, f32, usize)]) -> Rates {
         let mut rates = Rates::default();
-        for (sent, held, encoded) in seconds {
-            rates.push(*sent, *held, *encoded);
+        for (sent, held, frames) in seconds {
+            rates.push(*sent, *held, *frames);
         }
         rates
     }
 
     #[test]
-    fn an_encoder_overshoots_when_it_does_so_second_after_second() {
+    fn what_a_hardware_encoder_puts_out_goes_with_the_frame_rate() {
         let mut c = Capacity::default();
-        // One heavy second is a change of scene, not the encoder.
-        c.learn_overshoot(
-            &rates(&[(10_000, 0.0, 60), (25_000, 0.0, 60), (10_000, 0.0, 60)]),
-            10_000,
-        );
-        assert_eq!(c.overshoot(), 1.0);
-        // Asked for 10 Mbps, it puts out 20 second after second.
-        c.learn_overshoot(
-            &rates(&[(20_500, 0.0, 60), (20_000, 0.0, 60), (21_000, 0.0, 60)]),
-            10_000,
-        );
+        // Asked for 10 Mbps at sixty frames a second, it puts out 20: its rate control is set
+        // for thirty, and every frame gets a thirtieth of the bitrate. That is what is taken of
+        // a hardware encoder until it shows otherwise, so the first second says it.
+        c.learn_output(20_000, 60, 10_000);
         assert_eq!(c.overshoot(), 2.0);
-        // Held up, or with the screen still, its output says nothing about it.
-        c.learn_overshoot(&rates(&[(40_000, 0.6, 60); 3]), 10_000);
-        c.learn_overshoot(&rates(&[(40_000, 0.0, 1); 3]), 10_000);
+        // The scatter of one second to the next is not taken for a change.
+        c.learn_output(21_000, 60, 10_000);
+        c.learn_output(19_000, 60, 10_000);
         assert_eq!(c.overshoot(), 2.0);
-        // At another frame rate it keeps to its bitrate: after ten such seconds that is believed.
-        for _ in 0..OVERSHOOT_SECONDS {
-            c.learn_overshoot(&rates(&[(10_000, 0.0, 30); 3]), 10_000);
+        // Nor is one second of many key frames, or one of an easy picture.
+        c.learn_output(30_000, 60, 10_000);
+        c.learn_output(20_000, 60, 10_000);
+        c.learn_output(12_000, 60, 10_000);
+        c.learn_output(20_000, 60, 10_000);
+        assert_eq!(c.overshoot(), 2.0);
+        // Nor two seconds that are not one after the other.
+        c.learn_output(30_000, 60, 10_000);
+        c.no_word_of_output();
+        c.learn_output(30_000, 60, 10_000);
+        assert_eq!(c.overshoot(), 2.0);
+        c.no_word_of_output();
+        // A late reply brakes the frame rate for some seconds, and it puts out less: it is
+        // still reckoned at the sixty the stream comes back to.
+        c.learn_output(10_000, 30, 10_000);
+        c.learn_output(5_000, 15, 10_000);
+        assert_eq!(c.overshoot(), 2.0);
+        // A picture that changes thirty times a second, for good: it keeps to its bitrate.
+        for _ in 0..FRAME_RATE_SECONDS {
+            c.learn_output(10_000, 30, 10_000);
         }
         assert_eq!(c.overshoot(), 1.0);
+        // An encoder that puts out half again a frame, whatever the frame rate; by the lesser
+        // of the two seconds that say so.
+        c.learn_output(16_000, 30, 10_000);
+        c.learn_output(15_000, 30, 10_000);
+        assert_eq!(c.overshoot(), 1.5);
+        // Nothing is made of more than three times its bitrate.
+        for _ in 0..FRAME_RATE_SECONDS {
+            c.learn_output(50_000, 60, 10_000);
+        }
+        assert_eq!(c.overshoot(), MOST_OVERSHOOT);
+        // A software encoder comes in its place.
+        c.forget_output();
+        assert_eq!(c.overshoot(), 1.0);
+    }
+
+    #[test]
+    fn a_second_of_few_frames_or_held_up_says_nothing_of_the_encoder() {
+        // Asked for 240 kbps of a picture it cannot make a frame of under 320 kbit, a software
+        // encoder sends a frame in some seconds, two in others, none in others.
+        for second in [(640, 0.0, 2), (0, 0.0, 0), (320, 0.0, 1), (2_880, 0.0, 9)] {
+            assert_eq!(
+                rates(&[second]).last_smooth().map(|(kbps, _)| kbps),
+                None,
+                "{second:?}"
+            );
+        }
+        // Held up by the path, the loop sends what the path takes and not what the encoder would.
+        assert_eq!(
+            rates(&[(40_000, 0.6, 60)])
+                .last_smooth()
+                .map(|(kbps, _)| kbps),
+            None
+        );
+        // Sixty frames with nothing in the way: that is the encoder.
+        assert_eq!(
+            rates(&[(20_000, 0.1, 60)])
+                .last_smooth()
+                .map(|(kbps, _)| kbps),
+            Some(20_000)
+        );
+        // It is the last second that is asked about.
+        let seconds = [(20_000, 0.0, 60), (640, 0.0, 2)];
+        assert_eq!(rates(&seconds).last_smooth().map(|(kbps, _)| kbps), None);
+    }
+
+    #[test]
+    fn the_rate_delivered_is_taken_over_both_intervals_and_a_pause_is_not_a_full_path() {
+        let now = Instant::now();
+        let delivery = |bytes, sent_ms, received_ms| Delivery {
+            at: now,
+            bytes,
+            sent: Duration::from_millis(sent_ms),
+            received: Duration::from_millis(received_ms),
+        };
+        // A megabyte a second (8 Mbps) into a path that carries half of it. What was lost on the
+        // way is sent again and holds the first probe back: the first megabyte reads 2.6 s, the
+        // second 1.4 s, four seconds for the two as it was.
+        let mut d = Deliveries::default();
+        d.push(delivery(1_000_000, 1_000, 2_600));
+        d.push(delivery(1_000_000, 1_000, 1_400));
+        let said = d.latest(now, 4_000.0).unwrap();
+        assert_eq!(said.kbps, 4_000, "not the 5714 of the shorter interval");
+        assert!(said.fell_short && !said.shrinking);
+        assert_eq!(
+            said.since_fell_short, None,
+            "it is the latest that fell short"
+        );
+        // After a pause the path catches up: it did not fall short in every interval, and in
+        // the latest it kept up.
+        let mut d = Deliveries::default();
+        d.push(delivery(1_000_000, 1_000, 3_000));
+        d.push(delivery(1_000_000, 1_000, 500));
+        let said = d.latest(now, 4_000.0).unwrap();
+        assert!(!said.fell_short && said.shrinking);
+        // A screen that hardly changed, then one that moves: the interval before says nothing
+        // of the path. The rate is that of the latest alone, and the path is not taken to have
+        // fallen short interval after interval for the little that came late in the first.
+        let mut d = Deliveries::default();
+        d.push(delivery(12_500, 1_000, 1_250));
+        d.push(delivery(1_000_000, 1_000, 2_000));
+        let said = d.latest(now, 4_000.0).unwrap();
+        assert_eq!(said.kbps, 4_000, "not the 2492 of the two together");
+        assert!(!said.fell_short && said.since_fell_short.is_none());
+        // Full in the first interval; in the next two a quarter as much is sent (the frame rate
+        // was braked) and arrives in a quarter of the time: the queue is on its way out, and
+        // the path is as busy as it was.
+        let mut d = Deliveries::default();
+        d.push(delivery(1_000_000, 1_000, 2_000));
+        d.push(delivery(250_000, 1_000, 500));
+        let said = d.latest(now, 4_000.0).unwrap();
+        assert!(!said.fell_short && said.shrinking);
+        assert_eq!(said.since_fell_short, Some(1));
+        assert_eq!(said.latest_kbps, 4_000);
+        assert!(said.latest_received >= TIMED);
+        d.push(delivery(250_000, 1_000, 500));
+        assert_eq!(d.latest(now, 4_000.0).unwrap().since_fell_short, Some(2));
+        // One more and it is no longer known when the path fell short.
+        d.push(delivery(250_000, 1_000, 500));
+        assert_eq!(d.latest(now, 4_000.0).unwrap().since_fell_short, None);
+        // An old word says nothing of now.
+        assert!(d
+            .latest(now + SAMPLE_AGE + Duration::from_millis(1), 4_000.0)
+            .is_none());
     }
 
     #[test]
