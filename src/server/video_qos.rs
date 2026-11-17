@@ -294,6 +294,8 @@ struct DisplayData {
     restartable: bool,      // fork: its encoder may be created again for another bitrate
     restart: bool,          // fork: and is to be, for the ratio its video loop now reads
     hardware: bool,         // fork: its encoder is a hardware one, sized for a frame rate
+    fps: u32,               // fork: the frame rate it puts out its bitrate at (0: not known)
+    fps_moved: bool,        // fork: and that changed in the second under way
     known: bool,            // fork: its encoder is there, so what it can do is known
 }
 

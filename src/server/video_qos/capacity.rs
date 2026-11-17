@@ -131,8 +131,12 @@ const OUTPUT_MOVED: f32 = 0.1;
 /// what it puts out: the frame rate is braked for some seconds on a late reply and comes back,
 /// and the encoder's output with it.
 const FRAME_RATE_SECONDS: usize = 10;
-/// The frame rate a hardware encoder's rate control is set for.
-const ENCODER_FPS: f32 = 30.0;
+/// The frame rate an encoder is taken to put out its bitrate at while it has not said
+/// (`set_encoder_hardware`): the one hardware encoders were always created for.
+const DEFAULT_ENCODER_FPS: u32 = 30;
+/// An encoder that takes a new bitrate only by being created again, created for a frame rate the
+/// stream's is now this much above or below, is created again for it.
+const FPS_BAND: f32 = 1.25;
 /// An encoder that takes a new bitrate only by being created again is created once more when it
 /// puts out this much more than it was brought down to, and that no sooner than this after it
 /// was created: its bitrate is known as soon as it is there, and is not proportional to the
@@ -338,6 +342,8 @@ pub(super) struct Evidence {
     pub queue_stood: bool,
     /// The encoder's bitrate at the current ratio.
     pub nominal_kbps: u32,
+    /// How much more than that it puts out (`VideoQoS::overshoot`).
+    pub overshoot: f32,
     /// The share of its time the video loop waited for its frames to be taken.
     pub held_up: f32,
     /// How much queue there is to send, in milliseconds of the path's rate.
@@ -500,7 +506,7 @@ impl Capacity {
         }
         // Should the sample be wrong: one cut takes the stream to a tenth of where it was at the
         // lowest, while it drains and after.
-        let least = evidence.nominal_kbps as f32 * self.overshoot() * DEEPEST_CUT;
+        let least = evidence.nominal_kbps as f32 * evidence.overshoot * DEEPEST_CUT;
         let ceiling = (evidence.delivered_kbps as f32).max(least / BELOW_CAPACITY);
         self.hold = if self.ceiling_kbps.is_some() {
             (self.hold * 2).clamp(FIRST_HOLD, LONGEST_HOLD)
@@ -606,17 +612,18 @@ impl Capacity {
             }
     }
 
-    /// A hardware encoder put out `sent_kbps` in `frames` frames, in a second that says what it
-    /// puts out, at a nominal `nominal_kbps` and a ratio that did not move in it.
-    fn learn_output(&mut self, sent_kbps: u32, frames: usize, nominal_kbps: u32) {
-        if nominal_kbps == 0 || frames == 0 {
+    /// A hardware encoder that puts out its nominal `nominal_kbps` at `encoder_fps` frames a
+    /// second put out `sent_kbps` in `frames` frames, in a second that says what it puts out, at
+    /// a ratio that did not move in it.
+    fn learn_output(&mut self, sent_kbps: u32, frames: usize, nominal_kbps: u32, encoder_fps: u32) {
+        if nominal_kbps == 0 || frames == 0 || encoder_fps == 0 {
             return;
         }
         if self.frame_rates.len() >= FRAME_RATE_SECONDS {
             self.frame_rates.pop_front();
         }
         self.frame_rates.push_back(frames);
-        let a_frame = sent_kbps as f32 / nominal_kbps as f32 * ENCODER_FPS / frames as f32;
+        let a_frame = sent_kbps as f32 / nominal_kbps as f32 * encoder_fps as f32 / frames as f32;
         // Frames far smaller than its bitrate allows are a picture that hardly changes (a
         // pointer moving over a still screen): not what it puts out when it has work to do.
         let moved =
@@ -654,12 +661,22 @@ impl Capacity {
         self.output_moved = None;
     }
 
-    /// How much more than its nominal bitrate the encoder puts out, 1 when it does not: what a
-    /// hardware encoder puts out a frame, at the frame rate the stream runs at when nothing
-    /// brakes it.
-    pub(super) fn overshoot(&self) -> f32 {
-        let frames = self.frame_rates.iter().copied().max().unwrap_or(0);
-        let output = (self.output * frames as f32 / ENCODER_FPS).min(MOST_OVERSHOOT);
+    /// How much more than its nominal bitrate an encoder that puts it out at `encoder_fps` frames
+    /// a second puts out, 1 when it does not: what a hardware encoder puts out a frame, at the
+    /// frame rate the stream runs at when nothing brakes it, which is no more than the `fps_cap`
+    /// the viewers allow now.
+    pub(super) fn overshoot(&self, fps_cap: u32, encoder_fps: u32) -> f32 {
+        self.overshoot_at(self.frames_seen().min(fps_cap as usize), encoder_fps)
+    }
+
+    /// The most frames a second of the last seconds that said what the encoder puts out.
+    pub(super) fn frames_seen(&self) -> usize {
+        self.frame_rates.iter().copied().max().unwrap_or(0)
+    }
+
+    /// The same, at `frames` frames a second.
+    pub(super) fn overshoot_at(&self, frames: usize, encoder_fps: u32) -> f32 {
+        let output = (self.output * frames as f32 / encoder_fps.max(1) as f32).min(MOST_OVERSHOOT);
         if output > OVERSHOOT_SEEN {
             output
         } else {
@@ -680,6 +697,12 @@ impl Capacity {
     pub(super) fn lowered(&self) -> bool {
         self.lowered
     }
+}
+
+/// The frame rate the display's encoder puts out its bitrate at, once it has said: of a hardware
+/// encoder, which a software one keeps to at any frame rate.
+fn encoder_fps(display: &DisplayData) -> Option<u32> {
+    (display.hardware && display.fps > 0).then_some(display.fps)
 }
 
 /// The ratio at which an encoder that puts out `nominal_kbps × overshoot` at `ratio` puts out
@@ -834,15 +857,73 @@ impl VideoQoS {
     }
 
     /// The display's encoder is a hardware one, whose output goes with the frame rate, or a
-    /// software one, which keeps to its bitrate.
-    pub fn set_encoder_hardware(&mut self, video_service_name: &str, hardware: bool) {
+    /// software one, which keeps to its bitrate; and it puts out its bitrate at `fps` frames a
+    /// second (`EncoderApi::set_fps`).
+    pub fn set_encoder_hardware(&mut self, video_service_name: &str, hardware: bool, fps: u32) {
         let Some(display) = self.displays.get_mut(video_service_name) else {
             return;
         };
         display.hardware = hardware;
+        if display.fps != fps {
+            // A second that ran at the old frame rate and the new says nothing of either; the
+            // first one an encoder says does not end such a second.
+            display.fps_moved = display.fps > 0;
+            display.fps = fps;
+        }
         if self.displays.values().all(|display| !display.hardware) {
             self.capacity.forget_output();
         }
+    }
+
+    /// The frame rate the viewers allow the stream: what a hardware encoder is sized for, so
+    /// that it puts out its bitrate when the stream runs at it.
+    pub fn asked_fps(&self) -> u32 {
+        self.highest_fps()
+    }
+
+    /// How much more than its nominal bitrate the encoder puts out, as it runs: of the display's
+    /// encoder that puts out its bitrate at the lowest frame rate.
+    pub(super) fn overshoot(&self) -> f32 {
+        let fps = self.displays.values().filter_map(encoder_fps).min();
+        self.capacity
+            .overshoot(self.highest_fps(), fps.unwrap_or(DEFAULT_ENCODER_FPS))
+    }
+
+    /// How much more than its nominal bitrate the encoder a ratio is chosen for puts out: one
+    /// that takes a new bitrate while it runs is that one; one that takes it only by being
+    /// created again is a new one, created for the frame rate the stream may run at now.
+    pub(super) fn overshoot_next(&self) -> f32 {
+        if !self.restart_only() {
+            return self.overshoot();
+        }
+        let fps = self.highest_fps();
+        // The frames seen are of the frame rate allowed before, when it has risen since: the
+        // stream is taken to come up to the new one.
+        let frames = if self.fps_risen() {
+            fps as usize
+        } else {
+            self.capacity.frames_seen().min(fps as usize)
+        };
+        self.capacity.overshoot_at(frames, fps)
+    }
+
+    /// The stream may run at more frames than an encoder was created for, by more than
+    /// `FPS_BAND`: it puts out more than its bitrate.
+    pub(super) fn fps_risen(&self) -> bool {
+        let fps = self.highest_fps() as f32;
+        self.displays
+            .values()
+            .filter_map(encoder_fps)
+            .any(|encoder| fps > encoder as f32 * FPS_BAND)
+    }
+
+    /// Or at fewer: it puts out less.
+    fn fps_fallen(&self) -> bool {
+        let fps = self.highest_fps() as f32;
+        self.displays
+            .values()
+            .filter_map(encoder_fps)
+            .any(|encoder| fps * FPS_BAND < encoder as f32)
     }
 
     /// The most the viewer's target and the relay allow.
@@ -873,14 +954,8 @@ impl VideoQoS {
     fn relay_ratio(&self) -> Option<f32> {
         let nominal = self.bitrate();
         let limit = self.relay_kbps()?;
-        (nominal > 0).then(|| {
-            ratio_for_kbps(
-                self.bitrate_ratio,
-                nominal,
-                self.capacity.overshoot(),
-                limit,
-            )
-        })
+        (nominal > 0)
+            .then(|| ratio_for_kbps(self.bitrate_ratio, nominal, self.overshoot_next(), limit))
     }
 
     /// One viewer that says when the probes reach it, of one display: the deliveries describe
@@ -926,6 +1001,7 @@ impl VideoQoS {
             fell_short_at: delivered.fell_short_at,
             queue_stood,
             nominal_kbps,
+            overshoot: self.overshoot(),
             held_up: display.rates.held_up(),
             queue_ms: (saw + under_way * growth) as u32,
         })
@@ -973,7 +1049,7 @@ impl VideoQoS {
         let to = ratio_for_kbps(
             self.bitrate_ratio,
             evidence.nominal_kbps,
-            self.capacity.overshoot(),
+            evidence.overshoot,
             allowed,
         );
         // Down, whatever the sample said, and not below a tenth of where the stream was.
@@ -1066,8 +1142,12 @@ impl VideoQoS {
         // which the video loop takes with its next frame; a ratio moved since, on a reply, is
         // not that one. An encoder that takes a new bitrate only by being created again runs at
         // the ratio it was created with whatever is asked for, from then on (`encoder_created`).
+        let one_fps = self
+            .displays
+            .get_mut(video_service_name)
+            .is_some_and(|display| !std::mem::take(&mut display.fps_moved));
         let one_ratio = self.restart_only() || self.bitrate_ratio == self.ratio_at_rates;
-        self.steady_seconds = if one_ratio {
+        self.steady_seconds = if one_ratio && one_fps {
             self.steady_seconds.saturating_add(1)
         } else {
             0
@@ -1085,8 +1165,9 @@ impl VideoQoS {
         // With one encoder its nominal bitrate is the one stored; with more, whose it is is not
         // known here.
         if alone && display.hardware {
+            let fps = encoder_fps(display).unwrap_or(DEFAULT_ENCODER_FPS);
             match display.rates.last_smooth().filter(|_| steady) {
-                Some((sent, frames)) => self.capacity.learn_output(sent, frames, nominal),
+                Some((sent, frames)) => self.capacity.learn_output(sent, frames, nominal, fps),
                 None => self.capacity.no_word_of_output(),
             }
         }
@@ -1123,12 +1204,7 @@ impl VideoQoS {
         };
         // From the ratio the encoder's bitrate is the bitrate of: asked twice before the video
         // loop takes a change, the answer is the same.
-        let cap = ratio_for_kbps(
-            self.bitrate_ratio,
-            nominal,
-            self.capacity.overshoot(),
-            limit,
-        );
+        let cap = ratio_for_kbps(self.bitrate_ratio, nominal, self.overshoot(), limit);
         let cap = cap.max(self.min_ratio());
         self.ratio_cap = Some(cap);
         let most = self.max_ratio();
@@ -1184,10 +1260,26 @@ impl VideoQoS {
             .users
             .values()
             .any(|user| user.delay.needs_bitrate_reduction());
+        if confirmed && apart && self.restart_down(most, now) {
+            return;
+        }
+        // The stream may run at more frames than the encoder was created for: it puts out more
+        // than it is taken to, and is created again for the frame rate, also on a congested path
+        // that a restart for the path was not worth it for. At fewer it puts out less, which is
+        // put right where nothing holds it down: held down or congested, that does no harm, and
+        // the wait to step back up is not started anew for it.
+        let asked = self.displays.values().any(|display| display.restart);
+        let fallen = !confirmed && !self.restart.below && self.fps_fallen();
+        if apart && !asked && (self.fps_risen() || fallen) {
+            log::info!(
+                "qos: encoder created again for {} fps, ratio {:.2}",
+                self.highest_fps(),
+                self.ratio
+            );
+            self.request_restart(now);
+            return;
+        }
         if confirmed {
-            if apart {
-                self.restart_down(most, now);
-            }
             return;
         }
         if !self.restart.below {
@@ -1259,14 +1351,15 @@ impl VideoQoS {
         // What it puts out at the frame rate the stream runs at when nothing brakes it, as seen
         // of this encoder since it was created.
         let (from, nominal) = (self.bitrate_ratio, self.bitrate());
-        let out = nominal as f32 * self.capacity.overshoot();
+        let out = nominal as f32 * self.overshoot();
         // Of the encoder that runs at the ratio asked for, not of one about to be replaced.
         let asked = self.displays.values().any(|display| display.restart);
         if nominal == 0 || asked || from != self.ratio || out <= allowed * OVER_LIMIT {
             return false;
         }
+        // The next one is created for the frame rate the stream may run at now.
         let to =
-            ratio_for_kbps(from, nominal, self.capacity.overshoot(), allowed).max(self.min_ratio());
+            ratio_for_kbps(from, nominal, self.overshoot_next(), allowed).max(self.min_ratio());
         if to > from * NEAR_CEILING {
             // At the floor, or as good as there: another encoder would put out the same.
             return false;
@@ -1282,28 +1375,29 @@ impl VideoQoS {
     /// Congestion is confirmed for an encoder that takes a new bitrate only by restart: if the
     /// deliveries say what the path carries and where the stream settles under it is lower than
     /// where it is by enough to be worth it, the encoder is created again for it, straight there.
-    fn restart_down(&mut self, most: f32, now: Instant) {
+    /// `true` when it is.
+    fn restart_down(&mut self, most: f32, now: Instant) -> bool {
         let Some(evidence) = self.evidence() else {
-            return;
+            return false;
         };
         // Looked at, and left as it was if nothing comes of it.
         let before = self.capacity.clone();
         if !self.capacity.cut(&evidence, now) {
-            return;
+            return false;
         }
         // Where the encoder is, which is the ratio its bitrate belongs to.
         let from = self.bitrate_ratio;
         let to = ratio_for_kbps(
             from,
             evidence.nominal_kbps,
-            self.capacity.overshoot(),
+            self.overshoot_next(),
             self.capacity.settled_kbps,
         )
         .max(from * DEEPEST_CUT)
         .max(self.min_ratio());
         if to > from * WORTH_A_RESTART {
             self.capacity = before;
-            return;
+            return false;
         }
         log::info!(
             "qos: the path carried {} kbps of {} sent: encoder created again, ratio {from:.2} -> {to:.2}",
@@ -1323,6 +1417,7 @@ impl VideoQoS {
         };
         self.restart.below = true;
         self.request_restart(now);
+        true
     }
 
     /// The encoder is created again for the ratio `to` on the way back up, of which `most` is
@@ -1380,6 +1475,7 @@ mod tests {
             fell_short_at: None,
             queue_stood: false,
             nominal_kbps: 20_000,
+            overshoot: 1.0,
             held_up,
             queue_ms: 1_000,
         }
@@ -1617,47 +1713,47 @@ mod tests {
         // Asked for 10 Mbps at sixty frames a second, it puts out 20: its rate control is set
         // for thirty, and every frame gets a thirtieth of the bitrate. That is what is taken of
         // a hardware encoder until it shows otherwise, so the first second says it.
-        c.learn_output(20_000, 60, 10_000);
-        assert_eq!(c.overshoot(), 2.0);
+        c.learn_output(20_000, 60, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 2.0);
         // The scatter of one second to the next is not taken for a change.
-        c.learn_output(21_000, 60, 10_000);
-        c.learn_output(19_000, 60, 10_000);
-        assert_eq!(c.overshoot(), 2.0);
+        c.learn_output(21_000, 60, 10_000, 30);
+        c.learn_output(19_000, 60, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 2.0);
         // Nor is one second of many key frames, or one of an easy picture.
-        c.learn_output(30_000, 60, 10_000);
-        c.learn_output(20_000, 60, 10_000);
-        c.learn_output(12_000, 60, 10_000);
-        c.learn_output(20_000, 60, 10_000);
-        assert_eq!(c.overshoot(), 2.0);
+        c.learn_output(30_000, 60, 10_000, 30);
+        c.learn_output(20_000, 60, 10_000, 30);
+        c.learn_output(12_000, 60, 10_000, 30);
+        c.learn_output(20_000, 60, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 2.0);
         // Nor two seconds that are not one after the other.
-        c.learn_output(30_000, 60, 10_000);
+        c.learn_output(30_000, 60, 10_000, 30);
         c.no_word_of_output();
-        c.learn_output(30_000, 60, 10_000);
-        assert_eq!(c.overshoot(), 2.0);
+        c.learn_output(30_000, 60, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 2.0);
         c.no_word_of_output();
         // A late reply brakes the frame rate for some seconds, and it puts out less: it is
         // still reckoned at the sixty the stream comes back to.
-        c.learn_output(10_000, 30, 10_000);
-        c.learn_output(5_000, 15, 10_000);
-        assert_eq!(c.overshoot(), 2.0);
+        c.learn_output(10_000, 30, 10_000, 30);
+        c.learn_output(5_000, 15, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 2.0);
         // A picture that changes thirty times a second, for good: it keeps to its bitrate.
         for _ in 0..FRAME_RATE_SECONDS {
-            c.learn_output(10_000, 30, 10_000);
+            c.learn_output(10_000, 30, 10_000, 30);
         }
-        assert_eq!(c.overshoot(), 1.0);
+        assert_eq!(c.overshoot(60, 30), 1.0);
         // An encoder that puts out half again a frame, whatever the frame rate; by the lesser
         // of the two seconds that say so.
-        c.learn_output(16_000, 30, 10_000);
-        c.learn_output(15_000, 30, 10_000);
-        assert_eq!(c.overshoot(), 1.5);
+        c.learn_output(16_000, 30, 10_000, 30);
+        c.learn_output(15_000, 30, 10_000, 30);
+        assert_eq!(c.overshoot(60, 30), 1.5);
         // Nothing is made of more than three times its bitrate.
         for _ in 0..FRAME_RATE_SECONDS {
-            c.learn_output(50_000, 60, 10_000);
+            c.learn_output(50_000, 60, 10_000, 30);
         }
-        assert_eq!(c.overshoot(), MOST_OVERSHOOT);
+        assert_eq!(c.overshoot(60, 30), MOST_OVERSHOOT);
         // A software encoder comes in its place.
         c.forget_output();
-        assert_eq!(c.overshoot(), 1.0);
+        assert_eq!(c.overshoot(60, 30), 1.0);
     }
 
     #[test]

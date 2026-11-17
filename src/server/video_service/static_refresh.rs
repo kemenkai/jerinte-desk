@@ -751,6 +751,7 @@ mod tests {
                 height: 1080,
                 quality: BR_BALANCED,
                 keyframe_interval: None,
+                fps: 30,
             });
             let codec_format = if name.starts_with("hevc_") {
                 CodecFormat::H265
@@ -791,6 +792,7 @@ mod tests {
                 height: 1080,
                 quality: BR_BALANCED,
                 keyframe_interval: None,
+                fps: 30,
                 feature: serde_json::from_value(serde_json::json!({
                     "driver": "FFMPEG",
                     "vendor": vendor,

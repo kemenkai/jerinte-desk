@@ -107,11 +107,11 @@ fn a_full_path_is_left_in_one_step_and_the_viewer_is_told() {
 fn a_hardware_encoder_braked_on_the_first_late_reply_is_still_cut_by_what_the_path_carried() {
     // Sixty frames a second, twice its bitrate: 42 Mbps into a path that carries 10.
     let mut qos = session(3.5);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     for _ in 0..10 {
         second(&mut qos, 10, 1.0, 2.0);
     }
-    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
     let before = qos.ratio();
     // The first late reply: the path fell short. The frame rate is braked for it, and in the
     // next second the encoder puts out a fifth of what it did: less than the path carries, and
@@ -143,7 +143,7 @@ fn a_hardware_encoder_braked_on_the_first_late_reply_is_still_cut_by_what_the_pa
 fn a_path_that_falls_short_again_under_its_ceiling_is_measured_again() {
     // Sixty frames a second, twice its bitrate; brought under a path of 10 Mbps.
     let mut qos = session(3.5);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     for _ in 0..10 {
         second(&mut qos, 10, 1.0, 2.0);
     }
@@ -296,7 +296,7 @@ fn a_session_through_the_relay_stays_under_its_limit() {
 
     // A hardware encoder that puts out twice its bitrate is held to the limit by what it really
     // sends.
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     for _ in 0..8 {
         second(&mut qos, 10, 1.0, 2.0);
     }
@@ -347,12 +347,12 @@ fn a_high_target_is_climbed_to_once_the_frame_rate_has_started() {
 }
 
 /// One viewer of one display whose encoder, a hardware one, takes a new bitrate only by being
-/// created again.
+/// created again, and was created for the sixty frames a second the viewer allows.
 fn restart_only_session() -> VideoQoS {
     let mut qos = session(3.5);
     qos.set_support_changing_quality(DISPLAY, false);
     qos.set_restartable(DISPLAY, true);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 60);
     qos
 }
 
@@ -487,7 +487,7 @@ fn an_encoder_that_puts_out_more_than_it_was_brought_down_to_is_created_once_mor
     for _ in 0..30 {
         second_out(&mut qos, 10, 1.0, 2.0);
     }
-    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
     // The path carries 10 of the 42 Mbps really sent: the encoder is created again for 8.5 of
     // real output.
     for delay in [1100, 2200, 3300] {
@@ -563,7 +563,8 @@ fn an_encoder_that_cannot_change_is_held_to_the_relays_limit_too() {
     assert_eq!(qos.qos_state(), 0);
 }
 
-/// The video loop starts over with a new encoder of the same kind, at the ratio it reads.
+/// The video loop starts over with a new encoder of the same kind, at the ratio and for the frame
+/// rate it reads.
 fn recreate(qos: &mut VideoQoS) {
     qos.remove_display(DISPLAY);
     qos.new_display(DISPLAY.to_owned());
@@ -571,7 +572,8 @@ fn recreate(qos: &mut VideoQoS) {
     qos.store_bitrate_at(ratio, (BASE_KBPS * ratio) as u32);
     qos.set_support_changing_quality(DISPLAY, false);
     qos.set_restartable(DISPLAY, true);
-    qos.set_encoder_hardware(DISPLAY, true);
+    let fps = qos.asked_fps();
+    qos.set_encoder_hardware(DISPLAY, true, fps);
 }
 
 #[test]
@@ -620,6 +622,11 @@ fn second_at(qos: &mut VideoQoS, delay: u32, delivered: f32) {
 
 /// The same, the encoder putting out `share` of its bitrate.
 fn second_out(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32) {
+    second_out_of(qos, delay, delivered, share, 60);
+}
+
+/// The same, in `frames` frames.
+fn second_out_of(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32, frames: usize) {
     qos.advance_ms(1000);
     let bytes = (qos.bitrate() as f32 * share * 1000.0 / 8.0) as u64;
     qos.user_delivery(
@@ -632,11 +639,11 @@ fn second_out(qos: &mut VideoQoS, delay: u32, delivered: f32, share: f32) {
     qos.update_display_rates(
         DISPLAY,
         bytes as usize,
-        60,
+        frames,
         Duration::ZERO,
         Duration::from_secs(1),
     );
-    qos.update_display_data(DISPLAY, 60);
+    qos.update_display_data(DISPLAY, frames);
 }
 
 #[test]
@@ -713,7 +720,7 @@ fn a_preset_is_held_to_the_same_distance_between_restarts() {
     sync(&mut qos);
     qos.set_support_changing_quality(DISPLAY, false);
     qos.set_restartable(DISPLAY, true);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 60);
     assert!(qos.restart_only() && !qos.in_vbr_state());
     for _ in 0..10 {
         second_at(&mut qos, 10, 1.0);
@@ -834,7 +841,7 @@ fn a_viewer_coming_or_going_is_not_the_network_coming_back() {
 #[test]
 fn a_hardware_encoder_is_held_to_a_limit_by_what_it_puts_out() {
     let mut qos = session(3.5);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     qos.relay_cap_kbps = 10_000;
     qos.user_relayed(1, true);
     // A hardware encoder is taken to put out a thirtieth of its bitrate a frame, twice its
@@ -853,7 +860,7 @@ fn a_hardware_encoder_is_held_to_a_limit_by_what_it_puts_out() {
     // One second a third over its bitrate, as one of many key frames is: not taken for the
     // encoder, and nothing moves for it.
     second(&mut qos, 10, 1.0, 1.3);
-    assert_eq!(qos.capacity.overshoot(), 1.0);
+    assert_eq!(qos.overshoot(), 1.0);
     assert_eq!(qos.ratio(), settled);
     for _ in 0..3 {
         second(&mut qos, 10, 1.0, 1.0);
@@ -864,7 +871,7 @@ fn a_hardware_encoder_is_held_to_a_limit_by_what_it_puts_out() {
     for _ in 0..8 {
         second(&mut qos, 10, 1.0, 2.0);
     }
-    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
     let out = BASE_KBPS * qos.ratio() * 2.0;
     assert!(
         (out - 10_000.0).abs() < 300.0,
@@ -875,7 +882,7 @@ fn a_hardware_encoder_is_held_to_a_limit_by_what_it_puts_out() {
     for _ in 0..18 {
         second(&mut qos, 10, 1.0, 1.0);
     }
-    assert_eq!(qos.capacity.overshoot(), 1.0);
+    assert_eq!(qos.overshoot(), 1.0);
     assert!(
         (qos.ratio() - settled).abs() < settled * 0.02,
         "{} of {settled}",
@@ -897,16 +904,16 @@ fn a_software_encoder_is_never_taken_to_put_out_more_than_its_bitrate() {
     for share in [2.0, 0.4, 1.6, 2.0, 2.0, 2.0] {
         second(&mut qos, 10, 1.0, share);
         assert_eq!(qos.ratio(), settled);
-        assert_eq!(qos.capacity.overshoot(), 1.0);
+        assert_eq!(qos.overshoot(), 1.0);
     }
     // And what a hardware encoder was seen to put out is not carried over to it.
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     for _ in 0..4 {
         second(&mut qos, 10, 1.0, 2.0);
     }
-    assert!((qos.capacity.overshoot() - 2.0).abs() < 0.01);
-    qos.set_encoder_hardware(DISPLAY, false);
-    assert_eq!(qos.capacity.overshoot(), 1.0);
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
+    qos.set_encoder_hardware(DISPLAY, false, 30);
+    assert_eq!(qos.overshoot(), 1.0);
 }
 
 #[test]
@@ -916,7 +923,7 @@ fn an_encoder_that_leaves_frames_out_is_not_brought_down_for_its_whole_frames() 
     // of it is taken for what the encoder puts out, hardware or not, and the ratio stays where
     // the limit put it.
     let mut qos = session(3.5);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     qos.relay_cap_kbps = 1_000;
     qos.user_relayed(1, true);
     for _ in 0..25 {
@@ -927,7 +934,7 @@ fn an_encoder_that_leaves_frames_out_is_not_brought_down_for_its_whole_frames() 
     for frames in [3, 1, 2, 3, 1, 2, 2, 3, 1, 2, 2, 2] {
         second_of(&mut qos, 10, 1.0, frames as f32 * 0.5, frames);
         assert_eq!(qos.ratio(), settled, "after a second of {frames} frames");
-        assert_eq!(qos.capacity.overshoot(), 1.0);
+        assert_eq!(qos.overshoot(), 1.0);
     }
 }
 
@@ -986,7 +993,7 @@ fn the_climb_that_ends_on_a_queue_is_not_raised_in_the_same_breath() {
 #[test]
 fn what_was_sent_over_a_limit_brings_the_ratio_down_once() {
     let mut qos = session(3.5);
-    qos.set_encoder_hardware(DISPLAY, true);
+    qos.set_encoder_hardware(DISPLAY, true, 30);
     qos.relay_cap_kbps = 10_000;
     qos.user_relayed(1, true);
     for _ in 0..10 {
@@ -1016,4 +1023,208 @@ fn lowered_stays_said_when_more_is_asked_of_a_full_path() {
     // The viewer settles for a preset the stream is above: nothing is lowered any more.
     qos.user_image_quality(1, ImageQuality::Low.value());
     assert_eq!(qos.qos_state(), 0);
+}
+
+#[test]
+fn a_hardware_encoder_is_set_to_put_out_its_bitrate_at_the_frame_rate_allowed() {
+    use scrap::codec::FpsSizing;
+    // Created for sixty frames a second, it is set to its bitrate there.
+    let sizing = FpsSizing::new(60);
+    assert_eq!(sizing.bitrate(6_000), 6_000);
+    // Thirty are allowed: twice its bitrate, every frame getting a thirtieth of the bitrate it
+    // puts out at thirty; and so for every bitrate after that, until another frame rate.
+    let sizing = sizing.resized(30);
+    assert_eq!((sizing.sized(), sizing.bitrate(6_000)), (30, 12_000));
+    assert_eq!(sizing.bitrate(3_000), 6_000);
+    // Ten: no more than twice its bitrate, so it is sized for thirty and puts out a third of its
+    // bitrate at ten.
+    let sizing = sizing.resized(10);
+    assert_eq!((sizing.sized(), sizing.bitrate(6_000)), (30, 12_000));
+    // Sixty again, and none asked for: its bitrate.
+    let sizing = sizing.resized(60);
+    assert_eq!((sizing.sized(), sizing.bitrate(6_000)), (60, 6_000));
+    assert_eq!(sizing.resized(0), sizing);
+    // Created for thirty and asked for sixty: half.
+    let sizing = FpsSizing::new(30).resized(60);
+    assert_eq!((sizing.sized(), sizing.bitrate(6_000)), (60, 3_000));
+}
+
+#[test]
+fn a_hardware_encoder_sized_for_the_frame_rate_is_taken_at_its_bitrate() {
+    let mut qos = session(3.5);
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    // Sized for the sixty frames a second the viewer allows, it puts out its bitrate: from the
+    // first second the stream is held to the relay's limit, and not to half of it.
+    qos.set_encoder_hardware(DISPLAY, true, 60);
+    for _ in 0..3 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    assert_eq!(qos.overshoot(), 1.0);
+    assert!((BASE_KBPS * qos.ratio() - 10_000.0).abs() < 100.0);
+}
+
+#[test]
+fn a_lower_frame_rate_allowed_is_not_reckoned_at_the_frames_before_it() {
+    let mut qos = session(3.5);
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    // An encoder sized for thirty at sixty frames a second: twice its bitrate.
+    qos.set_encoder_hardware(DISPLAY, true, 30);
+    for _ in 0..5 {
+        second(&mut qos, 10, 1.0, 2.0);
+    }
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
+    // The viewer allows thirty now: the sixty frames of the seconds before do not count, and it
+    // is taken at its bitrate at once.
+    qos.user_custom_fps(1, 30);
+    assert_eq!(qos.overshoot(), 1.0);
+}
+
+#[test]
+fn an_encoder_that_cannot_change_is_created_again_for_a_higher_frame_rate_once() {
+    let mut qos = restart_only_session();
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    // Created for thirty frames a second, as through a relay the viewer first asks for, and
+    // brought to the relay's limit for it; then the viewer allows sixty, and it puts out twice
+    // its bitrate.
+    qos.user_custom_fps(1, 30);
+    recreate(&mut qos);
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out_of(&mut qos, 10, 1.0, 1.0, 30);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    recreate(&mut qos);
+    assert!((BASE_KBPS * qos.ratio - 10_000.0).abs() < 100.0);
+    qos.user_custom_fps(1, 60);
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out(&mut qos, 10, 1.0, 2.0);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    // Created again for sixty, at the same ratio: it puts out its bitrate again, the relay's
+    // limit, and is not created once more for the limit.
+    recreate(&mut qos);
+    assert!((BASE_KBPS * qos.ratio - 10_000.0).abs() < 100.0);
+    for _ in 0..30 {
+        second_out(&mut qos, 10, 1.0, 1.0);
+    }
+    assert!(!qos.take_restart_request(DISPLAY));
+}
+
+#[test]
+fn an_encoder_that_cannot_change_follows_a_frame_rate_that_moves_far_and_not_near() {
+    let mut qos = restart_only_session();
+    for _ in 0..10 {
+        second_at(&mut qos, 10, 1.0);
+    }
+    // The viewer's decoder allows a little less now and then: not worth a restart.
+    for fps in [54, 58, 50, 60] {
+        qos.user_custom_fps(1, fps);
+        for _ in 0..10 {
+            second_at(&mut qos, 10, 1.0);
+        }
+        assert!(!qos.take_restart_request(DISPLAY), "{fps} fps");
+    }
+    // It allows thirty: the encoder created for sixty puts out half its bitrate, and is created
+    // again for thirty.
+    qos.user_custom_fps(1, 30);
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out_of(&mut qos, 10, 1.0, 0.5, 30);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    recreate(&mut qos);
+    for _ in 0..30 {
+        second_out_of(&mut qos, 10, 1.0, 1.0, 30);
+    }
+    assert!(!qos.take_restart_request(DISPLAY));
+    // And a little more than it was created for, now and then: not worth a restart either.
+    qos.user_custom_fps(1, 36);
+    for _ in 0..10 {
+        second_out_of(&mut qos, 10, 1.0, 1.0, 36);
+    }
+    assert!(!qos.take_restart_request(DISPLAY));
+}
+
+#[test]
+fn an_encoder_held_down_is_not_created_again_for_a_lower_frame_rate() {
+    let mut qos = restart_only_session();
+    for _ in 0..40 {
+        second_at(&mut qos, 10, 1.0);
+    }
+    // Brought down for a path that carries 10 of the 21 Mbps.
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_at(&mut qos, 1100 + seconds * 300, 10.0 / 21.0);
+        seconds += 1;
+        assert!(seconds < 15);
+    }
+    recreate(&mut qos);
+    assert_eq!(qos.qos_state(), 1);
+    // The viewer allows thirty frames a second: held down, the encoder putting out less does no
+    // harm, and the wait to step back up is not started anew for a restart.
+    qos.user_custom_fps(1, 30);
+    for _ in 0..20 {
+        second_out_of(&mut qos, 10, 1.0, 0.5, 30);
+        assert!(!qos.take_restart_request(DISPLAY));
+    }
+}
+
+#[test]
+fn a_congested_path_does_not_keep_an_encoder_from_being_created_for_a_higher_frame_rate() {
+    let mut qos = restart_only_session();
+    // Created for thirty frames a second; the viewer allows sixty and it puts out twice its
+    // bitrate, 42 Mbps on a path of 30: replies come late. Brought down to where an encoder
+    // created for sixty would settle, it would hardly come down at all (no restart for the
+    // path is worth it); it is created again for the frame rate all the same.
+    qos.user_custom_fps(1, 30);
+    recreate(&mut qos);
+    qos.user_custom_fps(1, 60);
+    for _ in 0..6 {
+        second_out(&mut qos, 10, 1.0, 2.0);
+    }
+    let _ = qos.take_restart_request(DISPLAY);
+    let mut seconds = 0;
+    while !qos.take_restart_request(DISPLAY) {
+        second_out(&mut qos, 1100 + seconds * 300, 30.0 / 42.0, 2.0);
+        seconds += 1;
+        assert!(seconds < 10);
+    }
+    recreate(&mut qos);
+    assert_eq!(qos.capacity.overshoot_at(60, qos.asked_fps()), 1.0);
+}
+
+#[test]
+fn a_second_display_with_a_software_encoder_is_not_reckoned_with() {
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true, 60);
+    // Another display's encoder is a software one, created when thirty were allowed: it keeps to
+    // its bitrate at any frame rate, and says nothing of the hardware one's.
+    qos.new_display("second".to_owned());
+    qos.set_support_changing_quality("second", true);
+    qos.set_encoder_hardware("second", false, 30);
+    assert!(!qos.fps_risen());
+    assert_eq!(qos.overshoot(), 1.0);
+}
+
+#[test]
+fn the_second_an_encoder_is_sized_anew_in_says_nothing_of_it() {
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, true, 60);
+    for _ in 0..3 {
+        second(&mut qos, 10, 1.0, 1.0);
+    }
+    assert_eq!(qos.overshoot(), 1.0);
+    // Sized for thirty in the middle of a second that ran at sixty and so put out its bitrate:
+    // not taken for an encoder that, sized for thirty, puts out half at sixty frames.
+    qos.set_encoder_hardware(DISPLAY, true, 30);
+    second(&mut qos, 10, 1.0, 1.0);
+    second(&mut qos, 10, 1.0, 2.0);
+    assert!((qos.overshoot() - 2.0).abs() < 0.01);
 }

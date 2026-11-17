@@ -80,6 +80,66 @@ pub trait EncoderApi {
     fn is_hardware(&self) -> bool;
 
     fn disable(&self);
+
+    /// Fork: the frame rate the stream may run at is now `fps`. A hardware encoder's rate control
+    /// is sized for a frame rate: at a higher one it puts out more than its bitrate, at a lower
+    /// one less. One that takes a new bitrate while it runs is sized for this one, as far as
+    /// `sized_fps` goes. Returns the frame rate at which it now puts out its bitrate: `fps` for a
+    /// software encoder, which keeps to its bitrate at any frame rate.
+    fn set_fps(&mut self, fps: u32) -> ResultType<u32> {
+        Ok(fps)
+    }
+}
+
+/// Fork: an encoder whose rate control was created for `created_fps` frames a second is set to no
+/// more than this many times its bitrate, to be sized for fewer: further down it puts out less
+/// than its bitrate. That covers a change between sixty and thirty frames; a larger factor would
+/// ask for frames far larger than the encoder's buffers were made for.
+const MOST_BITRATE_SCALE: u32 = 2;
+
+/// Fork: the frame rate an encoder whose rate control is sized by its frame rate was created for,
+/// and the one it is sized for now, by the bitrate it is set to: every frame gets the share of
+/// the bitrate its rate control was created for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FpsSizing {
+    created: u32,
+    sized: u32,
+}
+
+impl FpsSizing {
+    pub fn new(created_fps: u32) -> Self {
+        Self {
+            created: created_fps,
+            sized: created_fps,
+        }
+    }
+
+    pub fn created(&self) -> u32 {
+        self.created
+    }
+
+    /// The frame rate at which it puts out the bitrate it is meant to.
+    pub fn sized(&self) -> u32 {
+        self.sized
+    }
+
+    /// Sized for `fps` instead, as far as that goes.
+    pub fn resized(&self, fps: u32) -> Self {
+        let sized = if fps == 0 {
+            self.sized
+        } else {
+            fps.max(self.created.div_ceil(MOST_BITRATE_SCALE))
+        };
+        Self { sized, ..*self }
+    }
+
+    /// The bitrate to set it to, for it to put out `bitrate` at the frame rate it is sized for.
+    pub fn bitrate(&self, bitrate: u32) -> u32 {
+        if self.created == 0 || self.sized == 0 {
+            return bitrate;
+        }
+        (bitrate as u64 * self.created as u64 / self.sized as u64).min(u32::MAX as u64) as u32
+    }
 }
 
 pub struct Encoder {

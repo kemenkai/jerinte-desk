@@ -186,7 +186,8 @@ pub enum EncoderModel {
     /// Hardware encoders configured for a fixed 30 fps rate-control assumption:
     /// every frame carries a thirtieth of the bitrate, so fewer frames mean fewer
     /// bytes.  Actual hardware behaviour is backend dependent (Android's MediaCodec
-    /// path runs VBR).
+    /// path runs VBR).  Fork: the frame rate is the one the encoder is created for,
+    /// which is the one the viewers allow (`Scenario::encoder_sized_for`).
     FixedRate,
     /// Fork: a software encoder on a picture that is all new in every frame (a page scrolled
     /// fast), as seen on a real machine. A frame cannot be smaller than this many kbit: below the
@@ -227,6 +228,10 @@ pub struct Scenario {
     /// bitrate is not proportional to the ratio, as the hardware encoders': at the base bitrate
     /// `b` of a ratio it is `b × (1 + 1 / (1 + (b − 2000) / 1000))`.
     pub restart_only: bool,
+    /// Fork: a `FixedRate` encoder gives every frame this share of its bitrate, whatever frame
+    /// rate it is created for, as the hardware encoders did when they were all created for
+    /// thirty. `None`: it is created for the frame rate the viewers allow, and keeps to it.
+    pub encoder_sized_for: Option<f64>,
 }
 
 /// Bitrate at ratio 1.0; balanced quality (0.67) then encodes at about 4 Mbps.
@@ -256,16 +261,20 @@ struct Encoder {
 const SCENE_INTERVAL_MS: u32 = 5_000;
 
 impl Encoder {
-    fn frame_bits(&mut self, now_ms: u32, bitrate_kbps: f64, produce_rate: f64) -> f64 {
+    fn frame_bits(
+        &mut self,
+        now_ms: u32,
+        bitrate_kbps: f64,
+        produce_rate: f64,
+        sized_fps: f64,
+    ) -> f64 {
         let target = match (self.content, self.model) {
             // A changed region of a static screen is small whatever the rate control does.
             (Content::Office, _) => bitrate_kbps * 1000.0 / ENCODER_CONFIGURED_FPS * 0.3,
             (Content::Video, EncoderModel::Cbr | EncoderModel::Floor(_)) => {
                 bitrate_kbps * 1000.0 / produce_rate
             }
-            (Content::Video, EncoderModel::FixedRate) => {
-                bitrate_kbps * 1000.0 / ENCODER_CONFIGURED_FPS
-            }
+            (Content::Video, EncoderModel::FixedRate) => bitrate_kbps * 1000.0 / sized_fps,
         };
         // Mean one: the spread must not change the offered load.
         let noise = self.rng.log_normal(1.0, FRAME_SIZE_SIGMA)
@@ -385,11 +394,15 @@ pub fn run(sc: &Scenario) -> Report {
         qos.ratio = qos.ratio_for_target();
     }
     let hardware = sc.encoder == EncoderModel::FixedRate;
+    // The frame rate the encoder is created for, as the video loop creates it, and the one its
+    // frames are sized by.
+    let mut created_fps = qos.asked_fps();
+    let sized_fps = |created_fps: u32| sc.encoder_sized_for.unwrap_or(created_fps as f64);
     if sc.abr {
         qos.new_display("sim".to_owned());
         qos.set_support_changing_quality("sim", !sc.restart_only);
         // The model of the hardware encoders; the others are software.
-        qos.set_encoder_hardware("sim", hardware);
+        qos.set_encoder_hardware("sim", hardware, created_fps);
         if sc.restart_only {
             qos.set_restartable("sim", true);
         }
@@ -457,10 +470,11 @@ pub fn run(sc: &Scenario) -> Report {
                 sent_this_second = 0;
                 encoded_this_second = 0;
                 second_held_ms = 0;
+                created_fps = qos.asked_fps();
                 qos.remove_display("sim");
                 qos.new_display("sim".to_owned());
                 qos.set_support_changing_quality("sim", false);
-                qos.set_encoder_hardware("sim", hardware);
+                qos.set_encoder_hardware("sim", hardware, created_fps);
                 qos.set_restartable("sim", true);
             }
             let base = base_kbps * created_at as f64;
@@ -494,7 +508,8 @@ pub fn run(sc: &Scenario) -> Report {
             encode_phase -= 1.0;
             // As the video loop counts: every frame it hands to the encoder.
             encoded_this_second += 1;
-            let mut bits = encoder.frame_bits(now, bitrate_kbps, produce_rate);
+            let mut bits =
+                encoder.frame_bits(now, bitrate_kbps, produce_rate, sized_fps(created_fps));
             if std::mem::take(&mut key_frame) {
                 bits *= 5.0;
             }
@@ -609,7 +624,7 @@ pub fn run(sc: &Scenario) -> Report {
                         second_held_ms,
                         qos.ratio,
                         qos.ratio_cap.map(|c| (c * 1000.0).round() / 1000.0),
-                        qos.capacity.overshoot(),
+                        qos.overshoot(),
                         qos.capacity.has_ceiling(),
                         queued_bits / capacity_kbps.max(1.0),
                     );
@@ -835,6 +850,7 @@ pub fn scenarios() -> Vec<Scenario> {
         base_kbps: None,
         loop_wait: None,
         restart_only: false,
+        encoder_sized_for: None,
     };
     use EncoderModel::*;
     vec![

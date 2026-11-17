@@ -1,5 +1,7 @@
 use crate::{
-    codec::{base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg},
+    codec::{
+        base_bitrate, codec_thread_num, enable_hwcodec_option, EncoderApi, EncoderCfg, FpsSizing,
+    },
     convert::*,
     CodecFormat, EncodeInput, ImageFormat, ImageRgb, Pixfmt, HW_STRIDE_ALIGN,
 };
@@ -53,6 +55,8 @@ pub struct HwRamEncoderConfig {
     pub height: usize,
     pub quality: f32,
     pub keyframe_interval: Option<usize>,
+    /// Fork: the frame rate the stream may run at, which the rate control is sized for.
+    pub fps: u32,
 }
 
 pub struct HwRamEncoder {
@@ -61,6 +65,9 @@ pub struct HwRamEncoder {
     pub pixfmt: AVPixelFormat,
     bitrate: u32, //kbs
     config: HwRamEncoderConfig,
+    /// Fork: the frame rate its rate control was created for, and the one it is sized for now
+    /// (`set_fps`): the bitrate it is set to is `bitrate` scaled by the two.
+    sizing: FpsSizing,
 }
 
 impl EncoderApi for HwRamEncoder {
@@ -75,6 +82,7 @@ impl EncoderApi for HwRamEncoder {
                     Self::bitrate(&config.name, config.width, config.height, config.quality);
                 bitrate = Self::check_bitrate_range(&config, bitrate);
                 let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
+                let fps = Self::created_fps(&config);
                 let ctx = EncodeContext {
                     name: config.name.clone(),
                     mc_name: config.mc_name.clone(),
@@ -83,7 +91,7 @@ impl EncoderApi for HwRamEncoder {
                     pixfmt: DEFAULT_PIXFMT,
                     align: HW_STRIDE_ALIGN as _,
                     kbs: bitrate as i32,
-                    fps: DEFAULT_FPS,
+                    fps: fps as i32,
                     gop,
                     quality: DEFAULT_HW_QUALITY,
                     rc,
@@ -106,6 +114,7 @@ impl EncoderApi for HwRamEncoder {
                         pixfmt: ctx.pixfmt,
                         bitrate,
                         config,
+                        sizing: FpsSizing::new(fps),
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -185,11 +194,36 @@ impl EncoderApi for HwRamEncoder {
         );
         if bitrate > 0 {
             bitrate = Self::check_bitrate_range(&self.config, bitrate);
-            self.encoder.set_bitrate(bitrate as _).ok();
+            self.encoder
+                .set_bitrate(self.sizing.bitrate(bitrate) as _)
+                .ok();
             self.bitrate = bitrate;
         }
         self.config.quality = ratio;
         Ok(())
+    }
+
+    fn set_fps(&mut self, fps: u32) -> ResultType<u32> {
+        if !Self::sized_by_frame_rate(&self.config.name) {
+            // Its rate control goes by the frames' timestamps.
+            return Ok(fps);
+        }
+        if !self.support_changing_quality() {
+            // As it was created, until it is created again.
+            return Ok(self.sizing.created());
+        }
+        let sizing = self.sizing.resized(fps);
+        if sizing != self.sizing {
+            let bitrate = sizing.bitrate(self.bitrate);
+            if self.encoder.set_bitrate(bitrate as _).is_err() {
+                bail!(
+                    "failed to set bitrate {bitrate} kbps for {} fps",
+                    sizing.sized()
+                );
+            }
+            self.sizing = sizing;
+        }
+        Ok(self.sizing.sized())
     }
 
     fn bitrate(&self) -> u32 {
@@ -243,6 +277,26 @@ impl HwRamEncoder {
                 Ok(data)
             }
             Err(code) => Err(anyhow!("RAM encode failed: {}", code)),
+        }
+    }
+
+    /// Fork: ffmpeg's vaapi, nvenc, amf and qsv encoders size their rate control by the frame
+    /// rate they are created with (`AVCodecContext::framerate`): each frame gets that share of the
+    /// bitrate, whatever the timestamps say. VideoToolbox's goes by the frames' timestamps, and
+    /// MediaCodec's is left as it always was.
+    fn sized_by_frame_rate(name: &str) -> bool {
+        !["videotoolbox", "mediacodec"]
+            .iter()
+            .any(|&x| name.contains(x))
+    }
+
+    /// Fork: the frame rate to create the encoder for: the stream's, where the rate control is
+    /// sized by it.
+    fn created_fps(config: &HwRamEncoderConfig) -> u32 {
+        if config.fps > 0 && Self::sized_by_frame_rate(&config.name) {
+            config.fps
+        } else {
+            DEFAULT_FPS as u32
         }
     }
 

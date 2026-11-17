@@ -66,6 +66,7 @@ fn scenario(name: &'static str, target: f32, link: Link) -> Scenario {
         base_kbps: None,
         loop_wait: None,
         restart_only: false,
+        encoder_sized_for: None,
     }
 }
 
@@ -95,7 +96,9 @@ fn measure(sc: &Scenario, r: &Report) -> Measures {
         let nominal = BASE_KBPS * ratio as f64;
         match sc.encoder {
             EncoderModel::Cbr | EncoderModel::Floor(_) => nominal,
-            EncoderModel::FixedRate => nominal * fps as f64 / 30.0,
+            EncoderModel::FixedRate => {
+                nominal * fps as f64 / sc.encoder_sized_for.unwrap_or(sc.limit as f64)
+            }
         }
     };
     let drop_ms = sc
@@ -284,10 +287,11 @@ fn capacity_scenarios() {
     );
 
     // The same with an encoder that puts out twice its bitrate at sixty frames a second, as the
-    // hardware ones may.
+    // hardware ones did when they were all created for thirty.
     let o = compare(&Scenario {
         name: "high_tight_12_fixed_rate",
         encoder: EncoderModel::FixedRate,
+        encoder_sized_for: Some(30.0),
         ..tight.clone()
     });
     assert!(

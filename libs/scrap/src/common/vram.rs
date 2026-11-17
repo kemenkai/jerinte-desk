@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    codec::{enable_vram_option, EncoderApi, EncoderCfg},
+    codec::{enable_vram_option, EncoderApi, EncoderCfg, FpsSizing},
     hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
@@ -45,6 +45,8 @@ pub struct VRamEncoderConfig {
     pub quality: f32,
     pub feature: FeatureContext,
     pub keyframe_interval: Option<usize>,
+    /// Fork: the frame rate the stream may run at, which the rate control is sized for.
+    pub fps: u32,
 }
 
 pub struct VRamEncoder {
@@ -52,6 +54,9 @@ pub struct VRamEncoder {
     pub format: DataFormat,
     ctx: EncodeContext,
     bitrate: u32,
+    /// Fork: the frame rate its rate control was created for (`ctx.d.framerate`), and the one it
+    /// is sized for now (`set_fps`).
+    sizing: FpsSizing,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -68,6 +73,9 @@ impl EncoderApi for VRamEncoder {
                     config.quality,
                 );
                 let gop = config.keyframe_interval.unwrap_or(MAX_GOP as _) as i32;
+                // Fork: the encoders behind it (ffmpeg's nvenc, amf and qsv) size their rate
+                // control by this frame rate.
+                let fps = if config.fps > 0 { config.fps } else { 30 };
                 let ctx = EncodeContext {
                     f: config.feature.clone(),
                     d: DynamicContext {
@@ -75,7 +83,7 @@ impl EncoderApi for VRamEncoder {
                         width: config.width as _,
                         height: config.height as _,
                         kbitrate: bitrate as _,
-                        framerate: 30,
+                        framerate: fps as _,
                         gop,
                     },
                 };
@@ -85,6 +93,7 @@ impl EncoderApi for VRamEncoder {
                         ctx,
                         format: config.feature.data_format,
                         bitrate,
+                        sizing: FpsSizing::new(fps),
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -171,11 +180,30 @@ impl EncoderApi for VRamEncoder {
             ratio,
         );
         if bitrate > 0 {
-            if self.encoder.set_bitrate((bitrate) as _).is_ok() {
+            if self
+                .encoder
+                .set_bitrate(self.sizing.bitrate(bitrate) as _)
+                .is_ok()
+            {
                 self.bitrate = bitrate;
             }
         }
         Ok(())
+    }
+
+    fn set_fps(&mut self, fps: u32) -> ResultType<u32> {
+        let sizing = self.sizing.resized(fps);
+        if sizing != self.sizing {
+            let bitrate = sizing.bitrate(self.bitrate);
+            if let Err(code) = self.encoder.set_bitrate(bitrate as _) {
+                bail!(
+                    "failed to set bitrate {bitrate} kbps for {} fps: {code}",
+                    sizing.sized()
+                );
+            }
+            self.sizing = sizing;
+        }
+        Ok(self.sizing.sized())
     }
 
     fn bitrate(&self) -> u32 {

@@ -752,6 +752,9 @@ fn run(vs: VideoService) -> ResultType<()> {
     // Not always where the stream is: see `ratio_for_creation`. `check_qos` brings an encoder
     // that follows the ratio to it before the first frame.
     let mut quality = video_qos.ratio_for_creation();
+    // Fork: a hardware encoder is created for the frame rate the viewers allow, and puts out its
+    // bitrate at it; `check_qos` sizes it for another while it runs.
+    let mut asked_fps = video_qos.asked_fps();
     let record_incoming = config::option2bool(
         "allow-auto-record-incoming",
         &Config::get_option("allow-auto-record-incoming"),
@@ -762,6 +765,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         &c,
         sp.name(),
         quality,
+        asked_fps,
         client_record,
         record_incoming,
         last_portable_service_running,
@@ -782,6 +786,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 &c,
                 sp.name(),
                 quality,
+                asked_fps,
                 client_record,
                 record_incoming,
                 last_portable_service_running,
@@ -807,10 +812,11 @@ fn run(vs: VideoService) -> ResultType<()> {
         .lock()
         .unwrap()
         .set_support_changing_quality(&sp.name(), encoder.support_changing_quality());
+    let encoder_fps = encoder.set_fps(asked_fps).unwrap_or(asked_fps);
     VIDEO_QOS
         .lock()
         .unwrap()
-        .set_encoder_hardware(&sp.name(), encoder.is_hardware());
+        .set_encoder_hardware(&sp.name(), encoder.is_hardware(), encoder_fps);
     // An encoder that takes a new bitrate only by being created again is created again for the
     // network on X11 alone, where that does not take the capture down with it, and not while
     // recording, which it would cut in two.
@@ -872,6 +878,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut encoder,
             &mut quality,
             &mut spf,
+            &mut asked_fps,
             client_record,
             &mut send_counter,
             &mut second_instant,
@@ -1238,6 +1245,7 @@ fn setup_encoder(
     c: &CapturerInfo,
     name: String,
     quality: f32,
+    fps: u32,
     client_record: bool,
     record_incoming: bool,
     last_portable_service_running: bool,
@@ -1254,6 +1262,7 @@ fn setup_encoder(
         &c,
         name.to_string(),
         quality,
+        fps,
         client_record || record_incoming,
         last_portable_service_running,
         source,
@@ -1270,6 +1279,7 @@ fn get_encoder_config(
     c: &CapturerInfo,
     _name: String,
     quality: f32,
+    _fps: u32,
     record: bool,
     _portable_service: bool,
     _source: VideoSource,
@@ -1295,6 +1305,7 @@ fn get_encoder_config(
                     quality,
                     feature,
                     keyframe_interval,
+                    fps: _fps,
                 });
             }
             #[cfg(feature = "hwcodec")]
@@ -1306,6 +1317,7 @@ fn get_encoder_config(
                     height: c.height,
                     quality,
                     keyframe_interval,
+                    fps: _fps,
                 });
             }
             EncoderCfg::VPX(VpxEncoderConfig {
@@ -1645,6 +1657,7 @@ fn check_qos(
     encoder: &mut Encoder,
     ratio: &mut f32,
     spf: &mut Duration,
+    asked_fps: &mut u32,
     client_record: bool,
     send_counter: &mut usize,
     second_instant: &mut Instant,
@@ -1685,6 +1698,24 @@ fn check_qos(
     if second_instant.elapsed() > Duration::from_secs(1) {
         let elapsed = second_instant.elapsed();
         *second_instant = Instant::now();
+        // Fork: the viewers allow another frame rate. A hardware encoder that takes a new bitrate
+        // while it runs is sized for it, by the second; one that does not is created again for
+        // it by the controller, which is told what it puts out its bitrate at either way.
+        let fps = video_qos.asked_fps();
+        if fps != *asked_fps {
+            if !encoder.is_hardware() {
+                *asked_fps = fps;
+            } else {
+                match encoder.set_fps(fps) {
+                    Ok(sized) => {
+                        *asked_fps = fps;
+                        video_qos.set_encoder_hardware(name, true, sized);
+                    }
+                    // Tried again a second later.
+                    Err(err) => log::warn!("failed to size the encoder for {fps} fps: {err:?}"),
+                }
+            }
+        }
         video_qos.update_display_rates(
             &name,
             SENT_BYTES.with(|bytes| bytes.replace(0)),

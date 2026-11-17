@@ -177,6 +177,7 @@ fn hardware_repeats_own_pixels_and_reset_on_recreation() {
                             format,
                             ctx,
                             bitrate: 1000,
+                            sizing: crate::codec::FpsSizing::new(30),
                         };
                         assert!(encoder.encode_to_message(EncodeInput::Repeat, 0).is_err());
                         assert!(encoder

@@ -60,26 +60,40 @@ fn relay_squeeze(seed: u64, frame_kbit: f64) -> Scenario {
         // time, more or less.
         loop_wait: Some((0.05, 0.15)),
         restart_only: false,
+        encoder_sized_for: None,
     }
 }
 
 /// The second measurement: a Linux machine with an Intel GPU as the controlled side, direct,
 /// 1280x720 at sixty frames a second. The encoder is VAAPI's: it takes a new bitrate only by
-/// being created again, its bitrate is not proportional to the ratio, and at sixty frames a
-/// second it puts out twice its bitrate, 14.4 Mbps where 7.2 are asked for. The path was cut to
-/// 8 Mbps, of which 7.6 are the stream's.
+/// being created again, and its bitrate is not proportional to the ratio. Created for thirty
+/// frames a second, as hardware encoders then were, at sixty it put out twice its bitrate,
+/// 14.4 Mbps where 7.2 were asked for. The path was cut to 8 Mbps, of which 7.6 are the
+/// stream's.
 const VAAPI_BASE_KBPS: f64 = 1000.0;
 const VAAPI_CUT_KBPS: f64 = 7_600.0;
+/// Created for the sixty frames a second the stream runs at, it puts out its 7.2 Mbps: the same
+/// path cut to half of that.
+const VAAPI_SIZED_CUT_KBPS: f64 = 3_600.0;
 
 fn vaapi_squeeze(seed: u64) -> Scenario {
+    vaapi_cut(seed, VAAPI_CUT_KBPS, Some(30.0))
+}
+
+fn vaapi_sized_squeeze(seed: u64) -> Scenario {
+    vaapi_cut(seed, VAAPI_SIZED_CUT_KBPS, None)
+}
+
+fn vaapi_cut(seed: u64, cut_kbps: f64, sized_for: Option<f64>) -> Scenario {
     Scenario {
         name: "field_vaapi_squeeze",
         seconds: 420,
         encoder: EncoderModel::FixedRate,
+        encoder_sized_for: sized_for,
         link: Link {
             capacity_kbps: vec![
                 (0, 100_000.0),
-                (CUT_FROM_MS, VAAPI_CUT_KBPS),
+                (CUT_FROM_MS, cut_kbps),
                 (CUT_TO_MS, 100_000.0),
             ],
             wobble: 0.03,
@@ -101,10 +115,11 @@ fn vaapi_squeeze(seed: u64) -> Scenario {
     }
 }
 
-/// What the encoder really puts out at the ratio it was created with, at sixty frames a second.
-fn vaapi_out_kbps(ratio: f64) -> f64 {
+/// What the encoder really puts out at the ratio it was created with, at sixty frames a second,
+/// created for thirty (`times` 2) or for sixty (1).
+fn vaapi_out_kbps(ratio: f64, times: f64) -> f64 {
     let base = VAAPI_BASE_KBPS * ratio;
-    2.0 * base * (1.0 + 1.0 / (1.0 + (base - 2000.0).max(0.0) / 1000.0))
+    times * base * (1.0 + 1.0 / (1.0 + (base - 2000.0).max(0.0) / 1000.0))
 }
 
 /// The nominal bitrate over a stretch of the run, in kbps: the least, the mean and the last.
@@ -135,7 +150,8 @@ fn print_timeline(r: &Report) {
 
 /// Prints one run second by second, to set against the log of the real one:
 /// `QOS_SIM_DEBUG=1 cargo test --lib field_timeline -- --ignored --nocapture` prints the
-/// controller's state as well; `QOS_SIM_SCENARIO=vaapi` runs the second measurement,
+/// controller's state as well; `QOS_SIM_SCENARIO=vaapi` runs the second measurement (`vaapi60`
+/// with the encoder created for sixty frames a second),
 /// `QOS_SIM_FRAME=320` the first with smaller frames, `QOS_SIM_SEED=6` another seed.
 #[test]
 #[ignore]
@@ -149,6 +165,7 @@ fn field_timeline() {
     let seed = seed.unwrap_or(1);
     let sc = match std::env::var("QOS_SIM_SCENARIO").as_deref() {
         Ok("vaapi") => vaapi_squeeze(seed),
+        Ok("vaapi60") => vaapi_sized_squeeze(seed),
         _ => relay_squeeze(seed, frame_kbit.unwrap_or(540.0)),
     };
     print_timeline(&run(&sc));
@@ -208,56 +225,68 @@ fn a_cut_path_is_used_and_an_open_one_is_gone_back_to() {
 #[test]
 fn an_encoder_created_again_for_a_cut_path_gets_there_and_comes_back() {
     for seed in 1..=10 {
-        let r = run(&vaapi_squeeze(seed));
-        let out = |from_ms: u32, to_ms: u32| -> Vec<f64> {
-            r.trace
-                .iter()
-                .filter(|(at, ..)| *at >= from_ms && *at < to_ms)
-                .map(|(.., ratio)| vaapi_out_kbps(*ratio as f64))
-                .collect()
-        };
-        // Twenty seconds after the cut the encoder is where the path carries it: it was created
-        // again for what the path carried, and once or twice more where its bitrate did not
-        // come down as far as the ratio. From then on it puts out at least half of what the
-        // path carries, and a queue a person feels (half a second) stands for a tenth of the
-        // time at most: while it tries for more, half a minute after it came down, and is
-        // brought down again.
-        let settled = out(CUT_FROM_MS + 20_000, CUT_TO_MS);
-        let least = settled.iter().copied().fold(f64::MAX, f64::min);
-        let queues: Vec<u32> = r
-            .trace
-            .iter()
-            .filter(|(at, ..)| *at >= CUT_FROM_MS + 20_000 && *at < CUT_TO_MS)
-            .map(|(_, _, queue_ms, _)| *queue_ms)
-            .collect();
-        let felt = queues.iter().filter(|queue_ms| **queue_ms >= 500).count();
-        assert!(
-            felt * 10 <= queues.len(),
-            "seed {seed}: a queue of half a second for {felt} tenths of a second"
-        );
-        assert!(
-            least >= VAAPI_CUT_KBPS * 0.5,
-            "seed {seed}: down to {least:.0} kbps on a path of {VAAPI_CUT_KBPS:.0}"
-        );
-        let mean = settled.iter().sum::<f64>() / settled.len() as f64;
-        assert!(
-            mean >= VAAPI_CUT_KBPS * 0.7,
-            "seed {seed}: {mean:.0} kbps on average on a path of {VAAPI_CUT_KBPS:.0}"
-        );
-        // Four minutes after the path opened the stream is back at what was asked for.
-        let last = *out(CUT_TO_MS, CUT_TO_MS + 240_000).last().unwrap();
-        assert!(
-            last >= 0.9 * vaapi_out_kbps(TARGET as f64),
-            "seed {seed}: at {last:.0} kbps four minutes after the path opened"
-        );
-        // Each time the encoder is created again the picture stops for a tenth of a second:
-        // two or three times to get under the path, twice for each try for more that fails,
-        // four times on the way back.
-        println!("seed {seed}: created again {} times", r.restarts);
-        assert!(
-            r.restarts <= 16,
-            "seed {seed}: created {} times",
-            r.restarts
-        );
+        vaapi_gets_there_and_comes_back(&vaapi_squeeze(seed), VAAPI_CUT_KBPS, 2.0);
     }
+}
+
+#[test]
+fn an_encoder_created_for_the_frame_rate_gets_there_and_comes_back() {
+    for seed in 1..=10 {
+        vaapi_gets_there_and_comes_back(&vaapi_sized_squeeze(seed), VAAPI_SIZED_CUT_KBPS, 1.0);
+    }
+}
+
+/// The VAAPI encoder on a path cut to `cut_kbps`, putting out `times` its bitrate.
+fn vaapi_gets_there_and_comes_back(sc: &Scenario, cut_kbps: f64, times: f64) {
+    let seed = sc.seed;
+    let r = run(sc);
+    let out = |from_ms: u32, to_ms: u32| -> Vec<f64> {
+        r.trace
+            .iter()
+            .filter(|(at, ..)| *at >= from_ms && *at < to_ms)
+            .map(|(.., ratio)| vaapi_out_kbps(*ratio as f64, times))
+            .collect()
+    };
+    // Twenty seconds after the cut the encoder is where the path carries it: it was created
+    // again for what the path carried, and once or twice more where its bitrate did not come
+    // down as far as the ratio. From then on it puts out at least half of what the path carries,
+    // and a queue a person feels (half a second) stands for a tenth of the time at most: while
+    // it tries for more, half a minute after it came down, and is brought down again.
+    let settled = out(CUT_FROM_MS + 20_000, CUT_TO_MS);
+    let least = settled.iter().copied().fold(f64::MAX, f64::min);
+    let queues: Vec<u32> = r
+        .trace
+        .iter()
+        .filter(|(at, ..)| *at >= CUT_FROM_MS + 20_000 && *at < CUT_TO_MS)
+        .map(|(_, _, queue_ms, _)| *queue_ms)
+        .collect();
+    let felt = queues.iter().filter(|queue_ms| **queue_ms >= 500).count();
+    assert!(
+        felt * 10 <= queues.len(),
+        "seed {seed}: a queue of half a second for {felt} tenths of a second"
+    );
+    assert!(
+        least >= cut_kbps * 0.5,
+        "seed {seed}: down to {least:.0} kbps on a path of {cut_kbps:.0}"
+    );
+    let mean = settled.iter().sum::<f64>() / settled.len() as f64;
+    assert!(
+        mean >= cut_kbps * 0.7,
+        "seed {seed}: {mean:.0} kbps on average on a path of {cut_kbps:.0}"
+    );
+    // Four minutes after the path opened the stream is back at what was asked for.
+    let last = *out(CUT_TO_MS, CUT_TO_MS + 240_000).last().unwrap();
+    assert!(
+        last >= 0.9 * vaapi_out_kbps(TARGET as f64, times),
+        "seed {seed}: at {last:.0} kbps four minutes after the path opened"
+    );
+    // Each time the encoder is created again the picture stops for a tenth of a second: two or
+    // three times to get under the path, twice for each try for more that fails, four times on
+    // the way back.
+    println!("seed {seed}: created again {} times", r.restarts);
+    assert!(
+        r.restarts <= 16,
+        "seed {seed}: created {} times",
+        r.restarts
+    );
 }
