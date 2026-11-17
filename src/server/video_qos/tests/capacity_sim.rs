@@ -67,6 +67,7 @@ fn scenario(name: &'static str, target: f32, link: Link) -> Scenario {
         loop_wait: None,
         restart_only: false,
         encoder_sized_for: None,
+        encoder_buffer_ms: None,
     }
 }
 

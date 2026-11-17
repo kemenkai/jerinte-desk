@@ -5,6 +5,10 @@
 //! The picture was a page scrolled fast, new in every frame: the software encoder could not make
 //! a frame of it smaller than some forty kilobytes, so below the bitrate that takes it kept to
 //! the bitrate by leaving frames out, and what went out in a second was a whole number of frames.
+//! It left them out only once its rate control buffer ran low: with libvpx's own buffer, of up
+//! to six seconds, it went on sending two or three times its bitrate for seconds after each cut,
+//! and the queue stood again and again (measured once more with the fix that follows, on the
+//! same day). The encoder is now given a buffer of a second (`VPX_BUFFER_MS`).
 //! The picture's source gave twelve frames a second. At ratio 1 the bitrate was 1074 kbps
 //! (1280x800), the target ratio 6, and the relay's limit 10 Mbps.
 use super::sim::{run, Content, EncoderModel, Link, Report, Scenario};
@@ -25,6 +29,12 @@ const CUT_TO_MS: u32 = 120_000;
 /// stream, which go out at three quarters of the path's rate in up to eighteen; a clean reply
 /// then ends it, and the next step of the way up comes within three more.
 const FOUND_AND_SENT_MS: u32 = 35_000;
+
+/// libvpx's own rate control buffer for VP9, which the encoder ran with: four seconds to start
+/// with, five where it aims to be, six at most.
+const VP9_BUFFER_MS: (f64, f64, f64) = (4000.0, 5000.0, 6000.0);
+/// The one the encoder is given now, as AV1's and as WebRTC's: a second at most.
+const VPX_BUFFER_MS: (f64, f64, f64) = (600.0, 600.0, 1000.0);
 
 fn relay_squeeze(seed: u64, frame_kbit: f64) -> Scenario {
     Scenario {
@@ -61,6 +71,7 @@ fn relay_squeeze(seed: u64, frame_kbit: f64) -> Scenario {
         loop_wait: Some((0.05, 0.15)),
         restart_only: false,
         encoder_sized_for: None,
+        encoder_buffer_ms: Some(VPX_BUFFER_MS),
     }
 }
 
@@ -189,10 +200,12 @@ fn a_cut_path_is_used_and_an_open_one_is_gone_back_to() {
             // Once the cut is found and the queue sent, it uses two thirds of the path and more.
             // It goes to half of what the path was measured to carry for a second or two each
             // time it has tried for more and met the limit again (measured, that is a little
-            // under what the path carries), and never lower.
+            // under what the path carries); paced, the queue of such a try is sent in a second
+            // or two, and the replies that met it may still take the table one step lower for
+            // a few seconds, to a third of the path. Never lower.
             let (least, mean, _) = kbps(&r, CUT_FROM_MS + FOUND_AND_SENT_MS, CUT_TO_MS);
             assert!(
-                least >= CUT_KBPS * 0.45,
+                least >= CUT_KBPS / 3.0,
                 "{run}: down to {least:.0} kbps with the queue sent"
             );
             assert!(
@@ -289,4 +302,57 @@ fn vaapi_gets_there_and_comes_back(sc: &Scenario, cut_kbps: f64, times: f64) {
         "seed {seed}: created {} times",
         r.restarts
     );
+}
+
+/// The relay measurement over every seed with libvpx's own buffer and with the encoder's:
+/// `cargo test --lib field_buffers -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn field_buffers() {
+    let felt = |r: &Report, from_ms: u32| {
+        let queues: Vec<u32> = r
+            .trace
+            .iter()
+            .filter(|(at, ..)| *at >= from_ms && *at < CUT_TO_MS)
+            .map(|(_, _, queue_ms, _)| *queue_ms)
+            .collect();
+        let felt = queues.iter().filter(|q| **q >= 500).count() as f64;
+        let worst = queues.iter().copied().max().unwrap_or(0);
+        (felt / queues.len() as f64 * 100.0, worst)
+    };
+    for (name, buffer) in [
+        ("libvpx", Some(VP9_BUFFER_MS)),
+        ("2 s", Some((1000.0, 1500.0, 2000.0))),
+        ("1.5 s", Some((1000.0, 1000.0, 1500.0))),
+        ("encoder", Some(VPX_BUFFER_MS)),
+    ] {
+        for frame_kbit in [320.0, 540.0] {
+            let mut rows = Vec::new();
+            for seed in 1..=10 {
+                let r = run(&Scenario {
+                    encoder_buffer_ms: buffer,
+                    ..relay_squeeze(seed, frame_kbit)
+                });
+                let (all, worst_all) = felt(&r, CUT_FROM_MS);
+                let (after, worst_after) = felt(&r, CUT_FROM_MS + FOUND_AND_SENT_MS);
+                let (_, mean, _) = kbps(&r, CUT_FROM_MS + FOUND_AND_SENT_MS, CUT_TO_MS);
+                rows.push((all, worst_all, after, worst_after, mean));
+            }
+            let n = rows.len() as f64;
+            let avg =
+                |f: fn(&(f64, u32, f64, u32, f64)) -> f64| rows.iter().map(f).sum::<f64>() / n;
+            let max =
+                |f: fn(&(f64, u32, f64, u32, f64)) -> f64| rows.iter().map(f).fold(0.0, f64::max);
+            println!(
+                "{name:>8}, frames of {frame_kbit}: felt {:.1}% of the cut (worst {:.0} ms); after {} s {:.1}% (most {:.1}%, worst {:.0} ms); {:.0} kbps asked",
+                avg(|r| r.0),
+                max(|r| r.1 as f64),
+                FOUND_AND_SENT_MS / 1000,
+                avg(|r| r.2),
+                max(|r| r.2),
+                max(|r| r.3 as f64),
+                avg(|r| r.4),
+            );
+        }
+    }
 }

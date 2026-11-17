@@ -131,6 +131,12 @@ const OUTPUT_MOVED: f32 = 0.1;
 /// what it puts out: the frame rate is braked for some seconds on a late reply and comes back,
 /// and the encoder's output with it.
 const FRAME_RATE_SECONDS: usize = 10;
+/// What a paced software encoder may send ahead of its pace (`VideoQoS::pace_kbps`) before its
+/// video loop waits: frames of a picture that can be made smaller keep the frame rate they come
+/// at, and a burst of this much stands in the path for less than a person notices. Frames that
+/// cannot be made smaller come at the pace.
+pub const PACE_AHEAD: Duration = Duration::from_millis(150);
+
 /// The frame rate an encoder is taken to put out its bitrate at while it has not said
 /// (`set_encoder_hardware`): the one hardware encoders were always created for.
 const DEFAULT_ENCODER_FPS: u32 = 30;
@@ -845,6 +851,7 @@ impl VideoQoS {
             .unwrap_or(0);
         self.capacity.forget_ceiling();
         self.ratio_cap = None;
+        self.pace_kbps = None;
         self.restart_wait_anew();
     }
 
@@ -872,6 +879,26 @@ impl VideoQoS {
         }
         if self.displays.values().all(|display| !display.hardware) {
             self.capacity.forget_output();
+        }
+    }
+
+    /// What a software encoder's video loop is paced to, in kbps, while the stream is held under
+    /// the relay's limit or the path's ceiling: at the lowest quality a picture new in every
+    /// frame cannot be made smaller, and such an encoder keeps to its bitrate only by leaving
+    /// frames out, and that only after its buffer ran low. What it sends over this rate makes
+    /// the loop wait before the next frame (`video_service::pace`), so the frame rate comes
+    /// down instead, frame by frame. A hardware encoder keeps to its bitrate and is not paced.
+    pub fn pace_kbps(&self) -> Option<f32> {
+        self.pace_kbps
+    }
+
+    /// The frames a video loop says it encoded in a second, for whether the screen changes: a
+    /// loop that was paced had a picture to send, however few frames that came to.
+    pub fn frames_or_paced(send_counter: usize, paced: bool) -> usize {
+        if paced {
+            send_counter.max(DYNAMIC_SCREEN_THRESHOLD)
+        } else {
+            send_counter
         }
     }
 
@@ -1080,6 +1107,7 @@ impl VideoQoS {
     pub(super) fn ratio_for_target(&mut self) -> f32 {
         let target = self.latest_quality().ratio();
         self.ratio_cap = None;
+        self.pace_kbps = None;
         self.restart_wait_anew();
         // Whether the encoder follows the ratio while it runs is not asked here: the quality may
         // come before the encoder, or while it is being created. One that does not follow takes
@@ -1200,7 +1228,15 @@ impl VideoQoS {
         };
         let Some(limit) = limit.filter(|_| nominal > 0 && self.in_vbr_state()) else {
             self.ratio_cap = None;
+            self.pace_kbps = None;
             return;
+        };
+        // Each display's video loop is paced for itself: the relay's limit is shared out
+        // already, the path's allowance is for all of them.
+        let displays = self.displays.len().max(1) as f32;
+        self.pace_kbps = match (self.relay_kbps(), self.capacity.allowed_kbps(now)) {
+            (Some(relay), Some(path)) => Some(relay.min(path / displays)),
+            (relay, path) => relay.or(path.map(|path| path / displays)),
         };
         // From the ratio the encoder's bitrate is the bitrate of: asked twice before the video
         // loop takes a change, the answer is the same.

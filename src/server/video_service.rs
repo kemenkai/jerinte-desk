@@ -620,6 +620,11 @@ thread_local! {
     // frames: a frame the encoder left out is in neither.
     static SENT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SENT_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Fork: the rate a software encoder is paced to (`VideoQoS::pace_kbps`, 0 for none), what it
+    // sent and has not paid off at that rate yet, in bits, and up to when it was paid off.
+    static PACE_KBPS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static PACE_BITS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static PACE_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     // How long this thread's encoder takes for a frame, averaged over the last frames.
     static ENCODE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
@@ -628,8 +633,45 @@ thread_local! {
 /// what the viewer says it received.
 fn count_sent(msg: &Message) {
     use hbb_common::protobuf::Message as _;
-    SENT_BYTES.with(|bytes| bytes.set(bytes.get() + msg.compute_size() as usize));
+    let bytes = msg.compute_size() as usize;
+    SENT_BYTES.with(|sent| sent.set(sent.get() + bytes));
     SENT_FRAMES.with(|frames| frames.set(frames.get() + 1));
+    // Paid off up to now first: a frame does not use the time before it.
+    pay_off(Instant::now());
+    PACE_BITS.with(|bits| bits.set(bits.get() + bytes as f64 * 8.0));
+}
+
+/// Fork: what this thread's encoder sent is paid off at the rate it is paced to, up to `now`.
+fn pay_off(now: Instant) {
+    let rate = PACE_KBPS.with(|kbps| kbps.get()) * 1000.0;
+    let since = PACE_AT.with(|at| at.replace(Some(now)));
+    PACE_BITS.with(|bits| {
+        let paid = since.map_or(0.0, |at| rate * now.saturating_duration_since(at).as_secs_f64());
+        bits.set(if rate > 0.0 {
+            (bits.get() - paid).max(0.0)
+        } else {
+            0.0
+        });
+    });
+}
+
+/// Fork: the rate this thread's software encoder is paced to from now on (`VideoQoS::pace_kbps`,
+/// `None` for none).
+fn set_pace(kbps: Option<f32>) {
+    pay_off(Instant::now());
+    PACE_KBPS.with(|rate| rate.set(kbps.map_or(0.0, |kbps| kbps.max(0.0) as f64)));
+}
+
+/// Fork: how long what this thread's encoder sent over its pace takes to pay off. The video
+/// loop takes no new picture before then: frames that cannot be made smaller come at the pace,
+/// and a frame twice the pace's share of a frame interval sets the next one back by one.
+fn pace_wait() -> Duration {
+    pay_off(Instant::now());
+    let rate = PACE_KBPS.with(|kbps| kbps.get()) * 1000.0;
+    if rate <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(PACE_BITS.with(|bits| bits.get()) / rate)
 }
 
 /// Encodes a frame, and keeps how long this thread's encoder takes for one.
@@ -679,6 +721,7 @@ fn run(vs: VideoService) -> ResultType<()> {
     // A new encoder: what the last one took and left unread says nothing of it.
     SENT_BYTES.with(|bytes| bytes.set(0));
     SENT_FRAMES.with(|frames| frames.set(0));
+    set_pace(None);
     ENCODE_TIME.with(|time| time.set(None));
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
     //
@@ -870,6 +913,9 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
     // How long the loop waited for its frames to be taken since `check_qos` last read it.
     let mut held_up = Duration::ZERO;
+    // Fork: whether the pace held a new picture back past its frame interval since `check_qos`
+    // last read it, and whether the last round had a new picture.
+    let (mut paced, mut captured_last) = (false, false);
 
     while sp.ok() {
         #[cfg(windows)]
@@ -879,12 +925,15 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut quality,
             &mut spf,
             &mut asked_fps,
+            &mut paced,
             client_record,
             &mut send_counter,
             &mut second_instant,
             &mut held_up,
             &sp.name(),
         )?;
+        // Fork: whether this round has a new picture, for whether a pace says the screen changes.
+        let captured_before = send_counter;
         // On macOS, a refresh here would destroy a hardware encoder that has been fed a frame but
         // not yet produced its first packet, restarting the warm-up forever. Defer until it has;
         // one that never does is still switched away from by max_fail_times in handle_one_frame.
@@ -937,6 +986,18 @@ fn run(vs: VideoService) -> ResultType<()> {
             // This check may be redundant, but it is better to be safe.
             // The previous check in `sp.is_option_true(OPTION_REFRESH)` block may be enough.
             try_broadcast_display_changed(&sp, display_idx, &c, false)?;
+        }
+
+        // Fork: what a software encoder sent runs no further ahead of its pace than
+        // `PACE_AHEAD` when the next picture is taken (`pace_wait`). Looked at again at least
+        // once a second.
+        let pace = pace_wait();
+        if pace > super::video_qos::PACE_AHEAD {
+            // A pace after a new picture: the screen changes, however few frames that leaves.
+            // Counted once for that picture, however many seconds its pace takes.
+            paced |= std::mem::take(&mut captured_last);
+            std::thread::sleep(pace.min(Duration::from_secs(1)));
+            continue;
         }
 
         frame_controller.reset();
@@ -1167,6 +1228,8 @@ fn run(vs: VideoService) -> ResultType<()> {
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
         log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
+        // Fork: a new picture, not a static refresh's repeat of an old one.
+        captured_last = send_counter > captured_before;
         let interval = frame_interval(spf, encoder.is_hardware());
         if elapsed < interval {
             std::thread::sleep(interval - elapsed);
@@ -1504,10 +1567,20 @@ fn handle_one_frame(
         }
         Err(e) => {
             vpx_no_output = e.is::<scrap::VpxNoOutput>();
-            *encode_fail_counter += 1;
-            // Encoding errors are not frequent except on Android
-            if !cfg!(target_os = "android") {
-                log::error!("encode fail: {e:?}, times: {}", *encode_fail_counter,);
+            // Fork: a frame VP8/VP9's rate control left out is no failure. It does so for every
+            // other frame and more on a narrow path, now that its buffer is a second.
+            if vpx_no_output {
+                hbb_common::throttled_log!(
+                    Duration::from_secs(60),
+                    debug,
+                    "frames left out by the rate control: {e:?}"
+                );
+            } else {
+                *encode_fail_counter += 1;
+                // Encoding errors are not frequent except on Android
+                if !cfg!(target_os = "android") {
+                    log::error!("encode fail: {e:?}, times: {}", *encode_fail_counter,);
+                }
             }
             let max_fail_times = if cfg!(target_os = "android") && encoder.is_hardware() {
                 9
@@ -1658,6 +1731,7 @@ fn check_qos(
     ratio: &mut f32,
     spf: &mut Duration,
     asked_fps: &mut u32,
+    paced: &mut bool,
     client_record: bool,
     send_counter: &mut usize,
     second_instant: &mut Instant,
@@ -1666,6 +1740,8 @@ fn check_qos(
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     *spf = video_qos.spf();
+    // Fork: a hardware encoder keeps to its bitrate, and is not paced.
+    set_pace(video_qos.pace_kbps().filter(|_| !encoder.is_hardware()));
     if *ratio != video_qos.ratio() {
         *ratio = video_qos.ratio();
         if encoder.support_changing_quality() {
@@ -1723,7 +1799,8 @@ fn check_qos(
             std::mem::take(held_up),
             elapsed,
         );
-        video_qos.update_display_data(&name, *send_counter);
+        let frames = VideoQoS::frames_or_paced(*send_counter, std::mem::take(paced));
+        video_qos.update_display_data(&name, frames);
         *send_counter = 0;
     }
     drop(video_qos);
@@ -1819,6 +1896,34 @@ mod tests {
         assert!(refresh_allowed(false, false, true));
         // Nothing fed yet: no warm-up to lose, and a refresh can restart a stalled capturer.
         assert!(refresh_allowed(true, false, false));
+    }
+
+    #[test]
+    fn a_software_encoder_waits_for_what_it_sent_over_its_pace() {
+        use super::{pace_wait, set_pace, PACE_AT, PACE_BITS};
+        use std::time::{Duration, Instant};
+        set_pace(Some(1000.0));
+        // Nothing sent: nothing to wait for.
+        assert_eq!(pace_wait(), Duration::ZERO);
+        // A frame of 500 kbit at a pace of 1000 kbps: the next one waits half a second, less
+        // what has passed since.
+        PACE_BITS.with(|bits| bits.set(500_000.0));
+        let wait = pace_wait();
+        assert!(wait <= Duration::from_millis(500), "{wait:?}");
+        assert!(wait > Duration::from_millis(450), "{wait:?}");
+        // Paid off as time passes.
+        PACE_AT.with(|at| at.set(Some(Instant::now() - Duration::from_millis(300))));
+        assert!(pace_wait() <= Duration::from_millis(200));
+        // Time with nothing owed is no credit for the frames after it.
+        PACE_BITS.with(|bits| bits.set(0.0));
+        PACE_AT.with(|at| at.set(Some(Instant::now() - Duration::from_secs(5))));
+        assert_eq!(pace_wait(), Duration::ZERO);
+        PACE_BITS.with(|bits| bits.set(300_000.0));
+        assert!(pace_wait() > Duration::from_millis(250));
+        // No pace: nothing waits, and nothing is owed when one comes.
+        set_pace(None);
+        assert_eq!(pace_wait(), Duration::ZERO);
+        assert_eq!(PACE_BITS.with(|bits| bits.get()), 0.0);
     }
 
     #[test]

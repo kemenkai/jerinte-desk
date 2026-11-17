@@ -7,6 +7,7 @@ use std::{
 
 // Fork extension: how far the bitrate goes and how it comes back, from measured rates.
 mod capacity;
+pub use capacity::PACE_AHEAD; // fork: what a paced software encoder may send ahead
 
 /*
 FPS adjust:
@@ -313,6 +314,7 @@ pub struct VideoQoS {
     capacity: capacity::Capacity,
     relay_cap_kbps: u32, // the relay's limit for a session through it, 0 for none
     ratio_cap: Option<f32>, // the ratio the relay's limit and the path's ceiling come to
+    pace_kbps: Option<f32>, // fork: and the rate itself, which a software encoder is paced to
     bitrate_ratio: f32,  // the ratio `bitrate_store` is the encoder's bitrate at
     ratio_at_rates: f32, // the ratio asked for when a video loop's last second ended
     steady_seconds: u8,  // for how many such seconds the ratio has not moved
@@ -335,6 +337,7 @@ impl Default for VideoQoS {
             capacity: Default::default(),
             relay_cap_kbps: 0,
             ratio_cap: None,
+            pace_kbps: None,
             bitrate_ratio: 0.0,
             ratio_at_rates: 0.0,
             steady_seconds: 0,
@@ -673,10 +676,12 @@ impl VideoQoS {
         self.displays
             .insert(video_service_name, DisplayData::default());
         self.encoder_created();
+        self.pace_kbps = None; // fork: shared out anew among the displays there are now
     }
 
     pub fn remove_display(&mut self, video_service_name: &str) {
         self.displays.remove(video_service_name);
+        self.pace_kbps = None; // fork: shared out anew among the displays there are now
     }
 
     pub fn update_display_data(&mut self, video_service_name: &str, send_counter: usize) {

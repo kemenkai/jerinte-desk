@@ -79,6 +79,14 @@ impl EncoderApi for VpxEncoder {
                 c.g_timebase.num = 1;
                 c.g_timebase.den = 1000; // Output timestamp precision
                 c.rc_undershoot_pct = 95;
+                // Fork: the rate control buffer, as AV1's (`aom.rs`), and about WebRTC's: a
+                // second at most. libvpx's own (four seconds to start, six at most) lets an encoder whose
+                // frames cannot get smaller (a picture new in every frame at the lowest quality)
+                // send seconds more than its bitrate before it leaves frames out: a queue of
+                // seconds on a path it was brought down to fit.
+                c.rc_buf_initial_sz = 600;
+                c.rc_buf_optimal_sz = 600;
+                c.rc_buf_sz = 1000;
                 // When the data buffer falls below this percentage of fullness, a dropped frame is indicated. Set the threshold to zero (0) to disable this feature.
                 // In dynamic scenes, low bitrate gets low fps while high bitrate gets high fps.
                 c.rc_dropframe_thresh = 25;

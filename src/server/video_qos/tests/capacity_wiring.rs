@@ -1228,3 +1228,21 @@ fn the_second_an_encoder_is_sized_anew_in_says_nothing_of_it() {
     second(&mut qos, 10, 1.0, 2.0);
     assert!((qos.overshoot() - 2.0).abs() < 0.01);
 }
+
+#[test]
+fn a_software_encoder_is_paced_to_the_limit_the_stream_is_held_under() {
+    let mut qos = session(3.5);
+    qos.set_encoder_hardware(DISPLAY, false, 60);
+    // Direct, nothing measured yet: no limit, nothing paced.
+    second(&mut qos, 10, 1.0, 1.0);
+    assert_eq!(qos.pace_kbps(), None);
+    // Through a relay of 10 Mbps: paced to it.
+    qos.relay_cap_kbps = 10_000;
+    qos.user_relayed(1, true);
+    second(&mut qos, 10, 1.0, 1.0);
+    assert_eq!(qos.pace_kbps(), Some(10_000.0));
+    // A paced second is one of a changing screen, however few frames it had.
+    assert_eq!(VideoQoS::frames_or_paced(1, true), DYNAMIC_SCREEN_THRESHOLD);
+    assert_eq!(VideoQoS::frames_or_paced(1, false), 1);
+    assert_eq!(VideoQoS::frames_or_paced(30, true), 30);
+}

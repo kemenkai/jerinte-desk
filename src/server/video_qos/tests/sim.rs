@@ -232,6 +232,14 @@ pub struct Scenario {
     /// rate it is created for, as the hardware encoders did when they were all created for
     /// thirty. `None`: it is created for the frame rate the viewers allow, and keeps to it.
     pub encoder_sized_for: Option<f64>,
+    /// Fork: the rate control buffer of a `Floor` encoder, as libvpx's CBR keeps it, in
+    /// milliseconds of its bitrate: (initial, optimal, size). It spends what the buffer holds
+    /// before it leaves frames out: every other frame once the buffer is under a quarter of the
+    /// optimal level, every frame once it is empty (`vp9_test_drop`). A new bitrate keeps the
+    /// bits the buffer holds, up to its new size; one less than half or more than half again
+    /// the last fills it to the optimal level (`vp9_check_reset_rc_flag`). `None`: a second of
+    /// the bitrate, spent down to nothing.
+    pub encoder_buffer_ms: Option<(f64, f64, f64)>,
 }
 
 /// Bitrate at ratio 1.0; balanced quality (0.67) then encodes at about 4 Mbps.
@@ -419,8 +427,18 @@ pub fn run(sc: &Scenario) -> Report {
         qos.user_relayed(1, true);
     }
     let base_kbps = sc.base_kbps.unwrap_or(BASE_KBPS);
-    // `Floor`: what the rate control has to spend, at most a second of the bitrate.
-    let mut budget_bits = 0.0_f64;
+    // `Floor`: what the rate control has to spend, and whether it left the last frame out while
+    // it is low (`Scenario::encoder_buffer_ms`).
+    let mut budget_bits = match sc.encoder_buffer_ms {
+        Some((initial_ms, ..)) => initial_ms * base_kbps * qos.ratio() as f64,
+        None => 0.0,
+    };
+    let mut left_out = false;
+    let mut budget_kbps = 0.0_f64;
+    // A software encoder's video loop is paced (`video_service::pace`): what it sent over the
+    // controller's limit and has not paid off yet, and whether that held a frame back this second.
+    let mut pace_bits = 0.0_f64;
+    let mut paced = false;
 
     let mut queue: VecDeque<Packet> = VecDeque::new();
     let mut queued_bits = 0.0_f64;
@@ -494,14 +512,33 @@ pub fn run(sc: &Scenario) -> Report {
             Content::Video => (fps as f64).min(sc.source_fps.unwrap_or(f64::MAX)),
             Content::Office => (fps as f64).min(2.0),
         };
-        budget_bits = (budget_bits + bitrate_kbps * TICK_MS as f64).min(bitrate_kbps * 1000.0);
+        if let Some((_, optimal_ms, _)) = sc.encoder_buffer_ms {
+            if budget_kbps > 0.0
+                && (bitrate_kbps < budget_kbps * 0.5 || bitrate_kbps > budget_kbps * 1.5)
+            {
+                budget_bits = bitrate_kbps * optimal_ms;
+            }
+        }
+        budget_kbps = bitrate_kbps;
+        let buffer_ms = sc.encoder_buffer_ms.map_or(1000.0, |(.., size_ms)| size_ms);
+        budget_bits = (budget_bits + bitrate_kbps * TICK_MS as f64).min(bitrate_kbps * buffer_ms);
+        let pace_kbps = qos.pace_kbps().filter(|_| sc.abr && !hardware);
+        pace_bits = match pace_kbps {
+            Some(kbps) => (pace_bits - kbps as f64 * TICK_MS as f64).max(0.0),
+            None => 0.0,
+        };
+        // The loop takes no new picture while what it sent runs further ahead of the pace than
+        // `PACE_AHEAD` (`video_service::pace_wait`).
+        let pace_held = pace_kbps
+            .is_some_and(|kbps| pace_bits > kbps as f64 * PACE_AHEAD.as_secs_f64() * 1000.0);
+        paced |= pace_held;
         // Full send buffers hold the video loop up: nothing is encoded meanwhile.
         if sc
             .send_buffer_kbit
             .is_some_and(|kbit| queued_bits > kbit * 1000.0)
         {
             second_held_ms += TICK_MS;
-        } else if now >= encoder_back_ms {
+        } else if !pace_held && now >= encoder_back_ms {
             encode_phase += produce_rate * TICK_MS as f64 / 1000.0;
         }
         while encode_phase >= 1.0 {
@@ -515,13 +552,22 @@ pub fn run(sc: &Scenario) -> Report {
             }
             if let EncoderModel::Floor(kbit) = sc.encoder {
                 bits = bits.max(kbit * 1000.0);
-                if budget_bits < bits {
+                let leave_out = match sc.encoder_buffer_ms {
+                    Some((_, optimal_ms, _)) => {
+                        let low = budget_bits <= bitrate_kbps * optimal_ms * 0.25;
+                        budget_bits < 0.0 || (low && !std::mem::replace(&mut left_out, true))
+                    }
+                    None => budget_bits < bits,
+                };
+                if leave_out {
                     // Left out by the rate control: nothing is sent.
                     continue;
                 }
+                left_out = false;
                 budget_bits -= bits;
             }
             sent_this_second += 1;
+            pace_bits += bits;
             if now >= WARM_UP_MS {
                 produced += 1;
             }
@@ -618,7 +664,7 @@ pub fn run(sc: &Scenario) -> Report {
                 );
                 if std::env::var("QOS_SIM_DEBUG").is_ok() && sc.name.starts_with("field") {
                     eprintln!(
-                        "DBG {:>3} out={:>5.0} held={:>3} ratio={:.3} cap={:?} over={:.2} ceil={} queue={:.0}",
+                        "DBG {:>3} out={:>5.0} held={:>3} ratio={:.3} cap={:?} over={:.2} ceil={} queue={:.0} pace={:?} fps={}",
                         now / 1000,
                         second_bits / 1000.0,
                         second_held_ms,
@@ -627,9 +673,14 @@ pub fn run(sc: &Scenario) -> Report {
                         qos.overshoot(),
                         qos.capacity.has_ceiling(),
                         queued_bits / capacity_kbps.max(1.0),
+                        qos.pace_kbps().map(|k| k.round()),
+                        fps,
+
                     );
                 }
-                qos.update_display_data("sim", encoded_this_second);
+                let frames =
+                    VideoQoS::frames_or_paced(encoded_this_second, std::mem::take(&mut paced));
+                qos.update_display_data("sim", frames);
             }
             encoded_this_second = 0;
             sent_this_second = 0;
@@ -851,6 +902,7 @@ pub fn scenarios() -> Vec<Scenario> {
         loop_wait: None,
         restart_only: false,
         encoder_sized_for: None,
+        encoder_buffer_ms: None,
     };
     use EncoderModel::*;
     vec![
