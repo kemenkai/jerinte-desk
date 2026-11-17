@@ -439,6 +439,9 @@ pub fn run(sc: &Scenario) -> Report {
     // controller's limit and has not paid off yet, and whether that held a frame back this second.
     let mut pace_bits = 0.0_f64;
     let mut paced = false;
+    // When the last frame was taken: a software encoder's rate control goes by the time between
+    // frames, and a frame after a wait the pace made is that much larger.
+    let mut last_frame_ms: Option<u32> = None;
 
     let mut queue: VecDeque<Packet> = VecDeque::new();
     let mut queued_bits = 0.0_f64;
@@ -547,6 +550,13 @@ pub fn run(sc: &Scenario) -> Report {
             encoded_this_second += 1;
             let mut bits =
                 encoder.frame_bits(now, bitrate_kbps, produce_rate, sized_fps(created_fps));
+            let gap_ms = last_frame_ms.replace(now).map_or(0, |last| now - last) as f64;
+            if matches!(sc.encoder, EncoderModel::Cbr | EncoderModel::Floor(_))
+                && gap_ms > 2000.0 / produce_rate
+            {
+                // Held up for more than a frame: it spends the time it waited on this frame.
+                bits *= (gap_ms * produce_rate / 1000.0).min(produce_rate);
+            }
             if std::mem::take(&mut key_frame) {
                 bits *= 5.0;
             }
@@ -664,7 +674,7 @@ pub fn run(sc: &Scenario) -> Report {
                 );
                 if std::env::var("QOS_SIM_DEBUG").is_ok() && sc.name.starts_with("field") {
                     eprintln!(
-                        "DBG {:>3} out={:>5.0} held={:>3} ratio={:.3} cap={:?} over={:.2} ceil={} queue={:.0} pace={:?} fps={}",
+                        "DBG {:>3} out={:>5.0} held={:>3} ratio={:.3} cap={:?} over={:.2} ceil={} queue={:.0} pace={:?} fps={} sent={}",
                         now / 1000,
                         second_bits / 1000.0,
                         second_held_ms,
@@ -675,7 +685,7 @@ pub fn run(sc: &Scenario) -> Report {
                         queued_bits / capacity_kbps.max(1.0),
                         qos.pace_kbps().map(|k| k.round()),
                         fps,
-
+                        sent_this_second,
                     );
                 }
                 let frames =

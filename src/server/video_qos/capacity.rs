@@ -137,6 +137,15 @@ const FRAME_RATE_SECONDS: usize = 10;
 /// cannot be made smaller come at the pace.
 pub const PACE_AHEAD: Duration = Duration::from_millis(150);
 
+/// A software encoder is paced this much over the limit the stream is held under. Its rate
+/// control goes by the time between frames: held back for a while, it makes the next frame that
+/// much larger, so paced at the very bitrate it keeps to, it would be held to however few frames
+/// a burst once left it (measured: one or two a second, of 200 KB each, where it had sent ten).
+/// A fifth over, an encoder that keeps to its bitrate is never held; one that cannot make its
+/// frames small enough comes at no more than this, which under the path's settled allowance (85%
+/// of what it carried) is about what the path carries.
+const PACE_HEADROOM: f32 = 1.2;
+
 /// The frame rate an encoder is taken to put out its bitrate at while it has not said
 /// (`set_encoder_hardware`): the one hardware encoders were always created for.
 const DEFAULT_ENCODER_FPS: u32 = 30;
@@ -1234,10 +1243,11 @@ impl VideoQoS {
         // Each display's video loop is paced for itself: the relay's limit is shared out
         // already, the path's allowance is for all of them.
         let displays = self.displays.len().max(1) as f32;
-        self.pace_kbps = match (self.relay_kbps(), self.capacity.allowed_kbps(now)) {
+        let display_limit = match (self.relay_kbps(), self.capacity.allowed_kbps(now)) {
             (Some(relay), Some(path)) => Some(relay.min(path / displays)),
             (relay, path) => relay.or(path.map(|path| path / displays)),
         };
+        self.pace_kbps = display_limit.map(|limit| limit * PACE_HEADROOM);
         // From the ratio the encoder's bitrate is the bitrate of: asked twice before the video
         // loop takes a change, the answer is the same.
         let cap = ratio_for_kbps(self.bitrate_ratio, nominal, self.overshoot(), limit);
