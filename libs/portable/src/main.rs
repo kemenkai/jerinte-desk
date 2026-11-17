@@ -236,7 +236,7 @@ fn setup_with(
 }
 
 /// The display name for messages: the executable the payload launches, without
-/// its extension, e.g. "jerinteDesk".
+/// its extension, e.g. "JerinteDesk".
 fn app_display_name(exe: &str) -> String {
     Path::new(&exe.replace('\\', "/"))
         .file_stem()
@@ -389,7 +389,7 @@ fn main() -> Result<(), String> {
         }
         Ok(reader) => {
             // The product name in this file's version resource is what users know
-            // the app as ("jerinteDesk"); the executable may keep RustDesk's name.
+            // the app as ("JerinteDesk"); the executable may keep RustDesk's name.
             #[cfg(windows)]
             let app = win::own_product_name().unwrap_or_else(|| app_display_name(&reader.exe));
             #[cfg(not(windows))]
@@ -484,7 +484,7 @@ mod win {
         let _allow_err = std::fs::copy(src, &format!("{}\\{}", dir.to_string_lossy(), tgt));
     }
 
-    /// ProductName from this executable's version resource, e.g. "jerinteDesk".
+    /// ProductName from this executable's version resource, e.g. "JerinteDesk".
     pub(super) fn own_product_name() -> Option<String> {
         use winapi::um::winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
         let path = std::env::current_exe().ok()?;
@@ -564,7 +564,7 @@ mod meta_tests {
     fn reader(files: Vec<bin_reader::BinaryData>) -> BinaryReader {
         BinaryReader {
             files,
-            exe: "./jerinteDesk.exe".to_owned(),
+            exe: "./JerinteDesk.exe".to_owned(),
             package_paths: Vec::new(),
         }
     }
@@ -587,14 +587,14 @@ mod meta_tests {
         let mut ui = false;
         let exe = setup_with(
             PACKER,
-            reader(vec![packed("./jerinteDesk.exe", b"exe"), packed("./librustdesk.dll", b"core")]),
+            reader(vec![packed("./JerinteDesk.exe", b"exe"), packed("./librustdesk.dll", b"core")]),
             Some(dir.clone()),
             false,
             &args(),
             &mut ui,
         )
         .unwrap();
-        assert_eq!(exe, dir.join("./jerinteDesk.exe"));
+        assert_eq!(exe, dir.join("./JerinteDesk.exe"));
         assert!(trusted_next_time(&dir));
     }
 
@@ -608,7 +608,7 @@ mod meta_tests {
         let mut broken = packed("./librustdesk.dll", b"core");
         broken.raw = b"not brotli";
         let mut ui = false;
-        let mut reader = reader(vec![packed("./jerinteDesk.exe", b"exe"), broken]);
+        let mut reader = reader(vec![packed("./JerinteDesk.exe", b"exe"), broken]);
         reader.package_paths = vec!["./brand.png".to_owned()];
         let err = setup_with(PACKER, reader, Some(dir.clone()), false, &args(), &mut ui)
             .unwrap_err();
@@ -626,10 +626,10 @@ mod meta_tests {
             path: PathBuf::from(r"C:\Users\u\AppData\Local\jerintedesk\librustdesk.dll"),
             error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         });
-        let app = app_display_name("./jerinteDesk.exe");
-        assert_eq!(app, "jerinteDesk");
+        let app = app_display_name("./JerinteDesk.exe");
+        assert_eq!(app, "JerinteDesk");
         let message = setup_failure_message(&app, &err);
-        assert!(message.contains("jerinteDesk 解压失败"));
+        assert!(message.contains("JerinteDesk 解压失败"));
         assert!(message.contains("librustdesk.dll"));
         assert!(message.contains("以管理员身份运行"));
         assert!(message.contains("Run as administrator"));

@@ -24,7 +24,7 @@ const wchar_t* getWindowClassName();
 
 #pragma comment(lib, "version.lib")
 
-// ProductName from this executable's version resource ("jerinteDesk" for our builds,
+// ProductName from this executable's version resource ("JerinteDesk" for our builds,
 // whose executable keeps RustDesk's name), or "" when it has none.
 static std::wstring OwnProductName()
 {

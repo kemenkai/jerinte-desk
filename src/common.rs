@@ -3822,7 +3822,7 @@ mod tests {
 
     #[test]
     fn test_is_valid_app_display_name() {
-        for name in ["jerinteDesk", "A-1", "Console", "COM10", "Startups"] {
+        for name in ["JerinteDesk", "A-1", "Console", "COM10", "Startups"] {
             assert!(is_valid_app_display_name(name), "{name}");
         }
         let too_long = "x".repeat(65);
