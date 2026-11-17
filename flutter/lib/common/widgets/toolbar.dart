@@ -832,7 +832,7 @@ Future<List<TRadioMenu<String>>> toolbarViewStyle(
 }
 
 /// An image quality's entry in a menu: its name and, under it, what it takes or why it is not to
-/// be had.
+/// be had ([tip], translated already).
 Widget imageQualityMenuEntry(String label, String tip) {
   return ConstrainedBox(
     constraints: const BoxConstraints(maxWidth: 300),
@@ -841,11 +841,25 @@ Widget imageQualityMenuEntry(String label, String tip) {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(translate(label)),
-        Text(translate(tip),
-            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        Text(tip, style: const TextStyle(fontSize: 11, color: Colors.grey)),
       ],
     ),
   );
+}
+
+/// What a quality at [ratio] takes in this session: its bitrate for the size of the picture shown
+/// and then [need] (with the bandwidth for its `{}`); [tip], at 1080p, while that size is not
+/// known.
+String imageQualityTipFor(FFI ffi, double ratio, String need, String tip) {
+  final display = ffi.ffiModel.pi.tryGetDisplay();
+  final width = display?.width ?? 0;
+  final height = display?.height ?? 0;
+  if (width <= 0 || height <= 0) return translate(tip);
+  final rate = imageQualityRateAt(width, height, ratio);
+  final about =
+      translate(kImageQualityAbout.replaceFirst('{}', '{${rate.mbps}}'));
+  final rest = translate(need.replaceFirst('{}', '{${rate.bandwidth}}'));
+  return '$about ($width×$height)$rest';
 }
 
 Future<List<TRadioMenu<String>>> toolbarImageQuality(
@@ -896,7 +910,12 @@ Future<List<TRadioMenu<String>>> toolbarImageQuality(
           final blocked = imageQualityTierBlocked(tier,
               direct: direct, peerMeasures: peerMeasures);
           return TRadioMenu<String>(
-              child: imageQualityMenuEntry(tier.label, blocked ?? tier.tip),
+              child: imageQualityMenuEntry(
+                  tier.label,
+                  blocked != null
+                      ? translate(blocked)
+                      : imageQualityTipFor(
+                          ffi, tier.ratio, tier.need, tier.tip)),
               value: tier.id,
               groupValue: groupValue,
               onChanged: blocked != null ? null : (_) => chooseTier(tier));
@@ -905,20 +924,28 @@ Future<List<TRadioMenu<String>>> toolbarImageQuality(
   return _registerRadioMenuShortcuts(ffi, [
     ...tiers,
     TRadioMenu<String>(
-        child: imageQualityMenuEntry('Good image quality', 'quality-best-tip'),
+        child: imageQualityMenuEntry(
+            'Good image quality',
+            imageQualityTipFor(ffi, kImageQualityRatioBest,
+                kImageQualityPresetNeed, 'quality-best-tip')),
         value: kRemoteImageQualityBest,
         groupValue: groupValue,
         onChanged: onChanged,
         actionId: kShortcutActionImageQualityBest),
     TRadioMenu<String>(
-        child: imageQualityMenuEntry('Balanced', 'quality-balanced-tip'),
+        child: imageQualityMenuEntry(
+            'Balanced',
+            imageQualityTipFor(ffi, kImageQualityRatioBalanced,
+                kImageQualityPresetNeed, 'quality-balanced-tip')),
         value: kRemoteImageQualityBalanced,
         groupValue: groupValue,
         onChanged: onChanged,
         actionId: kShortcutActionImageQualityBalanced),
     TRadioMenu<String>(
-        child:
-            imageQualityMenuEntry('Optimize reaction time', 'quality-low-tip'),
+        child: imageQualityMenuEntry(
+            'Optimize reaction time',
+            imageQualityTipFor(ffi, kImageQualityRatioLow,
+                kImageQualityPresetNeed, 'quality-low-tip')),
         value: kRemoteImageQualityLow,
         groupValue: groupValue,
         onChanged: onChanged,

@@ -367,14 +367,62 @@ mod test {
                 rest = &from[end..];
             }
         }
-        // Three names, what each of the six takes, and the two reasons a tier is not to be had.
-        assert_eq!(keys.len(), 11, "{keys:?}");
+        // Three names, what each of the six takes at 1080p, the two reasons a tier is not to be
+        // had, and the pieces of what they take at the size of the picture shown: the bitrate,
+        // and what each of the three tiers and the presets take besides.
+        assert_eq!(keys.len(), 16, "{keys:?}");
         // English, which every other language falls back to, and the two Chinese tables.
         for key in keys {
             for lang in ["en", "zh-cn", "zh-tw"] {
                 let text = super::text_in_table(lang, key);
                 assert!(text.is_some_and(|text| !text.is_empty()), "{key} in {lang}");
             }
+        }
+    }
+
+    /// The session's image quality menu shows what each quality comes to at the size of the
+    /// picture, by a table of the controlled side's bitrates written out again in Dart.
+    #[test]
+    fn the_bitrates_the_flutter_menus_show_are_the_controlled_sides() {
+        let source = include_str!("../flutter/lib/common/image_quality_tiers.dart");
+        let from = source.find("kImageQualityBaseBitrates = ").unwrap();
+        let to = from + source[from..].find("];").unwrap();
+        let mut sizes = 0;
+        for line in source[from..to].lines() {
+            let numbers: Vec<u32> = line
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches("],")
+                .split(", ")
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            if let [width, height, kbps] = numbers[..] {
+                assert_eq!(
+                    scrap::codec::base_bitrate(width, height),
+                    kbps,
+                    "{width}x{height}"
+                );
+                sizes += 1;
+            }
+        }
+        assert_eq!(sizes, 13);
+        // Between the sizes, the nearest one scaled: flutter/test/image_quality_tiers_test.dart
+        // expects the same.
+        assert_eq!(scrap::codec::base_bitrate(1920, 1200), 2292);
+        for (name, ratio) in [
+            ("kImageQualityRatioBest", scrap::codec::BR_BEST),
+            ("kImageQualityRatioBalanced", scrap::codec::BR_BALANCED),
+            ("kImageQualityRatioLow", scrap::codec::BR_SPEED),
+        ] {
+            let at = source.find(&format!("const {name} = ")).unwrap();
+            let value: f32 = source[at..]
+                .split(['=', ';'])
+                .nth(1)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(value, ratio, "{name}");
         }
     }
 

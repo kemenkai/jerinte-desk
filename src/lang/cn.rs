@@ -882,6 +882,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("quality-best-tip", "1080p 约 3 Mbps，30 帧"),
         ("quality-balanced-tip", "1080p 约 1.4 Mbps，30 帧"),
         ("quality-low-tip", "1080p 约 1 Mbps，30 帧"),
+        ("quality-about {}", "约 {} Mbps"),
+        ("quality-game-need {}", "，60 帧。需要直连、带宽 {} Mbps 以上、被控端有硬件编码"),
+        ("quality-ultra-need {}", "。需要带宽 {} Mbps 以上；经中继时受中继上限限制"),
+        ("quality-high-need {}", "。需要带宽 {} Mbps 以上"),
+        ("quality-30-fps", "，30 帧"),
         ("quality-needs-direct-tip", "需要直连，当前连接经过中继"),
         ("quality-needs-new-peer-tip", "被控端版本较旧，经中继时不可用"),
     ].iter().cloned().collect();

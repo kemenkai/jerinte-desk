@@ -308,6 +308,11 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("quality-best-tip", "About 3 Mbps at 1080p, 30 fps."),
         ("quality-balanced-tip", "About 1.4 Mbps at 1080p, 30 fps."),
         ("quality-low-tip", "About 1 Mbps at 1080p, 30 fps."),
+        ("quality-about {}", "About {} Mbps"),
+        ("quality-game-need {}", ", 60 fps. Needs a direct connection, {} Mbps of bandwidth and a hardware encoder on the controlled side."),
+        ("quality-ultra-need {}", ". Needs {} Mbps of bandwidth; through the relay it is held to the relay's limit."),
+        ("quality-high-need {}", ". Needs {} Mbps of bandwidth."),
+        ("quality-30-fps", ", 30 fps."),
         ("quality-needs-direct-tip", "Needs a direct connection; this one goes through the relay."),
         ("quality-needs-new-peer-tip", "Through the relay this needs a newer version on the controlled side."),
     ].iter().cloned().collect();

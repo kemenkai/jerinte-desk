@@ -88,4 +88,44 @@ void main() {
     expect(imageQualityOptionValue(''), isNull);
     expect(imageQualityOptionValue(null), isNull);
   });
+
+  group('imageQualityRateAt', () {
+    test('at 1080p, the numbers the 1080p texts give', () {
+      expect(imageQualityBaseKbps(1920, 1080), 2073);
+      final rates = {
+        for (final tier in kImageQualityTiers)
+          tier.id: imageQualityRateAt(1920, 1080, tier.ratio),
+      };
+      expect(rates['tier-game']!.mbps, '21');
+      expect(rates['tier-game']!.bandwidth, 30);
+      expect(rates['tier-ultra']!.mbps, '12');
+      expect(rates['tier-ultra']!.bandwidth, 20);
+      expect(rates['tier-high']!.mbps, '6.2');
+      expect(rates['tier-high']!.bandwidth, 10);
+      expect(imageQualityRateAt(1920, 1080, kImageQualityRatioBest).mbps, '3.1');
+      expect(imageQualityRateAt(1920, 1080, kImageQualityRatioBalanced).mbps,
+          '1.4');
+      expect(imageQualityRateAt(1920, 1080, kImageQualityRatioLow).mbps, '1');
+    });
+
+    test('at 2K and 4K, more', () {
+      expect(imageQualityBaseKbps(2560, 1440), 3000);
+      expect(imageQualityBaseKbps(3840, 2160), 5000);
+      final game = imageQualityRateAt(3840, 2160, game4kRatio);
+      expect(game.mbps, '50');
+      expect(game.bandwidth, 75);
+    });
+
+    test('between the sizes of the table, the nearest scaled', () {
+      // 1920x1200 is nearest 2048x1080 in pixels (src/lang.rs holds Rust to the same).
+      expect(imageQualityBaseKbps(1920, 1200), 2292);
+    });
+
+    test('a little bandwidth is five Mbps', () {
+      expect(imageQualityRateAt(640, 480, kImageQualityRatioLow).bandwidth, 5);
+    });
+  });
 }
+
+/// Game: 500%, which counts double.
+const game4kRatio = 10.0;
