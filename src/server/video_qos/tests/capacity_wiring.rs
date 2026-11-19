@@ -1439,26 +1439,29 @@ fn a_path_that_came_back_while_its_queue_was_sent_is_not_held_to_what_it_carried
     assert!(allowed(&mut qos) < down * 1.05);
     // The path fell short for a second and carries the stream again: the 11 Mbit that were
     // behind the probe the cut was made on are there 400 ms after it, when the next probe meets
-    // no queue. 27 Mbps, where the path was taken to carry 10: no less than the stream asks
-    // for, and the stream is not kept sending a queue that is gone.
+    // no queue. With the second the cut was made on (21 Mbit in 2.1 s) that is 32 Mbit in 2.5 s:
+    // the path carried 12.8 Mbps since it fell short, not the 10 it was taken for, and the
+    // stream is not kept sending a queue that is gone.
     arrived(&mut qos, 400, 12, 11_000.0);
-    assert_eq!(allowed(&mut qos), 3.5);
-    // Back at what was asked for with the next good replies, not after the half minute a
-    // ceiling is held for.
-    for _ in 0..6 {
+    let kbps = BASE_KBPS * allowed(&mut qos);
+    assert!((10_500.0..=11_300.0).contains(&kbps), "{kbps} kbps");
+    assert!(BASE_KBPS * qos.ratio() <= kbps + 1.0);
+    // The longer it fell short, the more was behind, and the more that says: 25 Mbit in the
+    // second after the cut come to 14.8 Mbps in all.
+    let mut qos = session(3.5);
+    settle(&mut qos);
+    brought_down(&mut qos);
+    arrived(&mut qos, 500, 400, 12_500.0);
+    arrived(&mut qos, 500, 12, 12_500.0);
+    let kbps = BASE_KBPS * allowed(&mut qos);
+    assert!((12_200.0..=13_000.0).contains(&kbps), "{kbps} kbps");
+    // From there it tries for more as under any ceiling, and with the path carrying all of it
+    // is back at what was asked for.
+    for _ in 0..90 {
         second(&mut qos, 10, 1.0, 1.0);
     }
     assert_eq!(qos.ratio(), 3.5);
     assert_eq!(qos.qos_state(), 0);
-    // It came back later, to less: 14 Mbit in the second after the cut. The stream settles
-    // under the 14 Mbps that says, and tries for more from there as under any ceiling.
-    let mut qos = session(3.5);
-    settle(&mut qos);
-    brought_down(&mut qos);
-    arrived(&mut qos, 500, 400, 9_000.0);
-    arrived(&mut qos, 500, 12, 5_000.0);
-    let kbps = BASE_KBPS * allowed(&mut qos);
-    assert!((11_500.0..=12_500.0).contains(&kbps), "{kbps} kbps");
 }
 
 #[test]
@@ -1485,22 +1488,29 @@ fn a_queue_that_leaves_as_fast_as_the_path_was_taken_to_carry_raises_nothing() {
     assert!(BASE_KBPS * allowed(&mut qos) < 9_000.0);
 }
 
+/// The encoder of `restart_only_session` is created again for a path that delivers 10 of the 21
+/// Mbps, on the deliveries.
+fn restarted_down(qos: &mut VideoQoS) {
+    between(qos, 500, 300, 10.0 / 21.0);
+    between(qos, 500, 850, 10.0 / 21.0);
+    second(qos, 900, 10.0 / 21.0, 1.0);
+    assert!(qos.take_restart_request(DISPLAY));
+    recreate(qos);
+    assert!(qos.ratio() < 3.5 * 0.6, "{}", qos.ratio());
+}
+
 #[test]
-fn an_encoder_that_cannot_change_goes_back_at_once_to_a_path_that_came_back() {
+fn an_encoder_that_cannot_change_goes_up_at_once_for_a_path_that_came_back() {
     let mut qos = restart_only_session();
     settle(&mut qos);
-    between(&mut qos, 500, 300, 10.0 / 21.0);
-    between(&mut qos, 500, 850, 10.0 / 21.0);
-    second(&mut qos, 900, 10.0 / 21.0, 1.0);
-    assert!(qos.take_restart_request(DISPLAY));
-    recreate(&mut qos);
+    restarted_down(&mut qos);
     let down = qos.ratio();
-    assert!(down < 3.5 * 0.6, "{down}");
-    // The queue leaves at once: the path carries the stream again.
-    arrived(&mut qos, 400, 12, 11_000.0);
-    // The encoder is created again for it as soon as one may be, five seconds after the last,
-    // and not after the half minute it waits before it tries a path that is not known to carry
-    // more.
+    // The queue leaves at once: with the 20 Mbit that were behind, the path carried 14.5 Mbps
+    // since it fell short, not 10.
+    arrived(&mut qos, 400, 12, 20_000.0);
+    // The encoder is created again for that as soon as one may be, five seconds after the
+    // last, and not after the half minute it waits before it tries a path that is not known to
+    // carry more.
     let mut seconds = 0;
     while !qos.take_restart_request(DISPLAY) {
         second_at(&mut qos, 10, 1.0);
@@ -1508,7 +1518,13 @@ fn an_encoder_that_cannot_change_goes_back_at_once_to_a_path_that_came_back() {
         assert!(seconds < 12, "still at {}", qos.ratio());
     }
     assert!((4..=7).contains(&seconds), "{seconds} s");
-    assert_eq!(qos.ratio(), 3.5);
+    let kbps = BASE_KBPS * qos.ratio();
+    assert!(
+        qos.ratio() > down * 1.2 && (11_900.0..=12_700.0).contains(&kbps),
+        "{kbps} kbps"
+    );
+    // Held to what was measured, which is not a try for more: the ceiling stands.
+    assert!(qos.capacity.has_ceiling());
 }
 
 #[test]
@@ -1524,47 +1540,38 @@ fn an_encoder_over_what_a_path_that_came_back_some_allows_is_brought_to_that_onc
     }
     assert!(qos.take_restart_request(DISPLAY));
     recreate(&mut qos);
-    // The second after the cut took 4.2 s to arrive, and the 25.6 Mbit behind it one more,
-    // when a probe meets no queue: 13 Mbps in all, where the path was taken to carry 10, and
-    // that is the ceiling.
+    // The three seconds up to then took 12.6 s to arrive, 126 Mbit; the 50 Mbit behind them
+    // one more, when a probe meets no queue: 12.9 Mbps in all, where the path was taken to
+    // carry 10, and that is the ceiling.
     qos.advance_ms(1000);
     let second = Duration::from_secs(1);
-    qos.user_delivery(1, 25_600_000 / 8, second, second, 12);
+    qos.user_delivery(1, 50_000_000 / 8, second, second, 12);
     qos.cut_on_delivery(1);
-    // At its new ratio the encoder puts out three times its bitrate, 12.7 Mbps: over the 11
+    // At its new ratio the encoder puts out 2.95 times its bitrate, 12.5 Mbps: over the 11
     // that ceiling allows. It is created again for that, and not once more for a ceiling that
     // was raised.
     let mut restarts = Vec::new();
     for second in 1..=14 {
-        second_out(&mut qos, 10, 1.0, 3.0);
+        second_out(&mut qos, 10, 1.0, 2.95);
         if qos.take_restart_request(DISPLAY) {
             recreate(&mut qos);
             restarts.push(second);
         }
     }
     assert_eq!(restarts.len(), 1, "{restarts:?}");
-    let out = BASE_KBPS * qos.ratio * 3.0;
-    assert!((out - 11_050.0).abs() < 300.0, "{out} kbps out");
-}
-
-/// The encoder of `restart_only_session` is created again for a path that delivers 10 of the 21
-/// Mbps, on the deliveries.
-fn restarted_down(qos: &mut VideoQoS) {
-    between(qos, 500, 300, 10.0 / 21.0);
-    between(qos, 500, 850, 10.0 / 21.0);
-    second(qos, 900, 10.0 / 21.0, 1.0);
-    assert!(qos.take_restart_request(DISPLAY));
-    recreate(qos);
-    assert!(qos.ratio() < 3.5 * 0.6, "{}", qos.ratio());
+    let out = BASE_KBPS * qos.ratio * 2.95;
+    assert!((out - 11_000.0).abs() < 300.0, "{out} kbps out");
 }
 
 #[test]
 fn an_encoder_that_cannot_change_is_sent_back_at_once_only_once_in_a_while() {
     let mut qos = restart_only_session();
     settle(&mut qos);
-    // The path fell short and came back: the encoder is created again for it five seconds on.
+    // The path fell short and came back: the encoder is created again for what it carried
+    // meanwhile five seconds on.
     restarted_down(&mut qos);
-    arrived(&mut qos, 400, 12, 11_000.0);
+    let first = qos.ratio();
+    arrived(&mut qos, 400, 12, 20_000.0);
     let mut seconds = 0;
     while !qos.take_restart_request(DISPLAY) {
         second_at(&mut qos, 10, 1.0);
@@ -1572,14 +1579,19 @@ fn an_encoder_that_cannot_change_is_sent_back_at_once_only_once_in_a_while() {
         assert!(seconds < 12);
     }
     recreate(&mut qos);
-    assert_eq!(qos.ratio(), 3.5);
+    assert!(qos.ratio() > first * 1.2, "{} after {first}", qos.ratio());
     // Ten seconds later it falls short again, and its queue leaves as fast: a path that comes
     // and goes. The encoder stays where it was brought to, and tries for more after the wait it
     // always had, not at once.
     for _ in 0..10 {
         second_at(&mut qos, 10, 1.0);
     }
-    restarted_down(&mut qos);
+    let share = 10.0 / (BASE_KBPS * qos.ratio() / 1000.0);
+    between(&mut qos, 500, 300, share);
+    between(&mut qos, 500, 850, share);
+    second(&mut qos, 900, share, 1.0);
+    assert!(qos.take_restart_request(DISPLAY));
+    recreate(&mut qos);
     let down = qos.ratio();
     arrived(&mut qos, 400, 12, 11_000.0);
     for _ in 0..20 {
@@ -1603,8 +1615,8 @@ fn a_cut_the_late_replies_confirm_is_asked_how_fast_its_queue_leaves_as_well() {
     assert!(qos.capacity.has_ceiling());
     assert!(BASE_KBPS * allowed(&mut qos) < 9_000.0);
     // Then the path carries the stream again: what was behind that reply arrives within half
-    // a second.
+    // a second. With the two seconds the cut was made on, 13.2 Mbps.
     arrived(&mut qos, 500, 12, 20_000.0);
     let kbps = BASE_KBPS * allowed(&mut qos);
-    assert!(kbps > 12_000.0, "{kbps} kbps");
+    assert!((10_800.0..=11_600.0).contains(&kbps), "{kbps} kbps");
 }
