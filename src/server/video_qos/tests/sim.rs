@@ -310,6 +310,9 @@ struct Packet {
     bits: f64,
     enqueued_ms: u32,
     probe_sent_ms: Option<u32>,
+    /// For a probe: the one the connection waits for before it sends the next of its kind, which
+    /// the parent's delays are taken from; the others are for the delivery alone.
+    probe_primary: bool,
     /// For a probe: the video handed to the path before it, in bits.
     video_bits_before: f64,
 }
@@ -322,6 +325,7 @@ struct Reply {
     video_bits_before: f64,
     /// When the probe left the path, which is when the viewer has it.
     reached_ms: u32,
+    primary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +453,11 @@ pub fn run(sc: &Scenario) -> Report {
     let mut encoded_this_second = 0_usize;
     let mut sent_this_second = 0_usize;
     let mut probe_sent: Option<u32> = None;
+    // A viewer that says when the probes reach it is sent one every `PROBE_EVERY` from its first
+    // reply on, whether the last is answered or not.
+    let probe_every_ms = PROBE_EVERY.as_millis() as u32;
+    let mut probes_between = false;
+    let mut last_arrive_ms = 0_u32;
     let mut replies: Vec<Reply> = Vec::new();
     // What the video loop reports every second, and what the probes mark.
     let mut video_bits = 0.0_f64;
@@ -585,6 +594,7 @@ pub fn run(sc: &Scenario) -> Report {
                 bits,
                 enqueued_ms: now,
                 probe_sent_ms: None,
+                probe_primary: false,
                 video_bits_before: 0.0,
             });
             queued_bits += bits;
@@ -599,13 +609,16 @@ pub fn run(sc: &Scenario) -> Report {
                 let Some(head) = queue.front_mut() else { break };
                 if let Some(sent) = head.probe_sent_ms {
                     let round_trip = sc.link.base_rtt_ms + probe_jitter_ms[(sent / 1000) as usize];
-                    let arrive = now + round_trip as u32;
+                    // The replies come back in the order the probes went out.
+                    let arrive = (now + round_trip as u32).max(last_arrive_ms);
+                    last_arrive_ms = arrive;
                     replies.push(Reply {
                         arrive_ms: arrive,
                         delay_ms: arrive - sent,
                         sent_ms: sent,
                         video_bits_before: head.video_bits_before,
                         reached_ms: now,
+                        primary: head.probe_primary,
                     });
                     queue.pop_front();
                     continue;
@@ -630,8 +643,8 @@ pub fn run(sc: &Scenario) -> Report {
             let reply = replies.remove(0);
             let delay = reply.delay_ms;
             max_delay = max_delay.max(delay);
-            probe_sent = None;
             if sc.reports {
+                probes_between = true;
                 // As the connection does: the video written between two probes, the time between
                 // their going out, and the time between their reaching the viewer.
                 if let Some((sent_ms, bits, reached_ms)) = answered {
@@ -641,25 +654,38 @@ pub fn run(sc: &Scenario) -> Report {
                             ((reply.video_bits_before - bits) / 8.0) as u64,
                             Duration::from_millis((reply.sent_ms - sent_ms) as u64),
                             Duration::from_millis((reply.reached_ms - reached_ms) as u64),
+                            delay,
                         );
                     }
                 }
                 answered = Some((reply.sent_ms, reply.video_bits_before, reply.reached_ms));
             }
-            qos.user_network_delay(1, delay);
+            if reply.primary {
+                probe_sent = None;
+                qos.user_network_delay(1, delay);
+            }
+            if sc.reports {
+                qos.cut_on_delivery(1);
+            }
         }
 
-        // The connection's one second timer.
-        if now % 1000 == 0 {
-            if probe_sent.is_none() {
+        // The connection's one second timer sends the probe the parent's delays are taken from,
+        // when the last one is answered; a probe for the delivery alone goes out wherever that
+        // one does not, every `PROBE_EVERY`.
+        let primary = now % 1000 == 0 && probe_sent.is_none();
+        if primary || (probes_between && now % probe_every_ms == 0) {
+            if primary {
                 probe_sent = Some(now);
-                queue.push_back(Packet {
-                    bits: 0.0,
-                    enqueued_ms: now,
-                    probe_sent_ms: Some(now),
-                    video_bits_before: video_bits,
-                });
             }
+            queue.push_back(Packet {
+                bits: 0.0,
+                enqueued_ms: now,
+                probe_sent_ms: Some(now),
+                probe_primary: primary,
+                video_bits_before: video_bits,
+            });
+        }
+        if now % 1000 == 0 {
             qos.user_delay_response_elapsed(1, (now - probe_sent.unwrap()) as u128);
             if sc.abr {
                 if let Some((least, most)) = sc.loop_wait {

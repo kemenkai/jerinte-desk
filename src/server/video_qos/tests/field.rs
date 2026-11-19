@@ -356,3 +356,38 @@ fn field_buffers() {
         }
     }
 }
+
+/// Prints, for each seed of the relay scenario, how long after the cut the stream came down, the
+/// longest queue on the way, and what was used once the cut was found (mean / least kbps):
+/// `cargo test --lib field_onset -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn field_onset() {
+    for frame_kbit in [320.0, 540.0] {
+        let mut rows = Vec::new();
+        for seed in 1..=10 {
+            let r = run(&relay_squeeze(seed, frame_kbit));
+            let found = r
+                .trace
+                .iter()
+                .find(|(at, _, _, ratio)| *at >= CUT_FROM_MS && *ratio < TARGET * 0.9)
+                .map_or(0, |(at, ..)| at - CUT_FROM_MS);
+            let worst = r
+                .trace
+                .iter()
+                .filter(|(at, ..)| *at >= CUT_FROM_MS && *at < CUT_FROM_MS + FOUND_AND_SENT_MS)
+                .map(|(_, _, queue_ms, _)| *queue_ms)
+                .max()
+                .unwrap_or(0);
+            let (least, mean, _) = kbps(&r, CUT_FROM_MS + FOUND_AND_SENT_MS, CUT_TO_MS);
+            rows.push(format!(
+                "{:.1}s/{}ms/{:.0}/{:.0}",
+                found as f64 / 1000.0,
+                worst,
+                mean,
+                least
+            ));
+        }
+        println!("frames of {frame_kbit}: {}", rows.join(" "));
+    }
+}

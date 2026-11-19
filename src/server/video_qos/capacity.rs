@@ -66,6 +66,32 @@ const SAMPLES: usize = 2;
 /// One interval more is kept, to know of a path that fell short and has had a queue since: the
 /// cut may come a second or two after the frame rate was braked.
 const SAMPLES_KEPT: usize = SAMPLES + 1;
+/// Those are intervals of this or more: what went between probes sent sooner after each other
+/// is taken together until it comes to this. When a probe went out a second after the last at
+/// the soonest, an interval was no shorter, and that is what `KEPT_UP` and the rest are margins
+/// of: half a second is timed twice as roughly by the same jitter.
+const MEASURED_OVER: Duration = Duration::from_millis(900);
+/// What comes between probes is kept as far back as makes `SAMPLES_KEPT` such intervals, however
+/// long ago it came, and no more of it than this, whatever a peer sends.
+const MOST_DELIVERIES_KEPT: usize = 16;
+/// A viewer that says when the probes reach it is sent one this often, whether the one before
+/// is answered or not: on a path that fills, a probe waits behind the queue, and one sent only
+/// when the last is back comes seconds apart just when the path is to be measured.
+pub const PROBE_EVERY: Duration = Duration::from_millis(500);
+/// The deliveries confirm congestion by themselves, without the late replies the parent counts
+/// (a second apart at the least, and each behind the queue), when the path fell short in each of
+/// the last `SAMPLES` intervals, each probe that closed one met a queue, and the last a queue of
+/// this much: a path that paused delivers more than is sent in the interval after, one that
+/// carries less than is sent does not.
+const CONFIRMING_QUEUE_MS: u32 = 400;
+/// And it delivered at about the same rate in each of them, the least this share of the most:
+/// that rate is then what the path carries. A pause in one of them, or a probe held back for
+/// what was lost before it, reads as one rate far from the other, and says nothing so soon.
+const SAME_RATE: f32 = 0.8;
+/// And no more than this share of what was sent into it, in each: half a second is timed to a
+/// few hundredths by the probes' own jitter, and a path short by less fills slowly, which the
+/// parent's late replies are in time for.
+const CLEARLY_SHORT: f32 = 0.9;
 /// A sample older than this says nothing of now.
 const SAMPLE_AGE: Duration = Duration::from_secs(3);
 /// The path kept up in an interval: it delivered this share of what was sent into it, or more.
@@ -100,6 +126,14 @@ const NEAR_CEILING: f32 = 0.9;
 const PAST_CEILING: f32 = 1.1;
 /// One probing step past the fast way back, as a share of the ceiling.
 const PROBE_STEP: f32 = 0.05;
+/// The queue of a cut left this much faster than the ceiling says, or more: the path carries
+/// more than it was taken for (`Capacity::passed`). By less it is what it was: the probe the cut
+/// was made on may have been held up on its way (for what was lost before it, or at the viewer),
+/// which reads as a queue that left that much sooner.
+const CARRIES_MORE: f32 = 1.25;
+/// A path that was found to carry more that way is not asked again for this long: one that falls
+/// short again so soon comes and goes, and is held to what it carries for as long as any.
+const ASKED_ONCE_IN: Duration = Duration::from_secs(60);
 /// The wait at the ceiling before probing past it: this at first, doubled each time the ceiling
 /// is met again, up to the longest. Probing a path that has not changed costs a short queue each
 /// time; not probing one that has, costs quality for as long as the wait. The longest wait, the
@@ -183,10 +217,17 @@ const WORTH_A_RESTART: f32 = 0.95;
 /// What was written between two probes, how long that took, and how long it took to arrive.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Delivery {
+    /// When the reply came that closed it; and that of the first probe in it, which is the same
+    /// one unless it is several taken together (`Deliveries::intervals`).
     at: Instant,
+    first_at: Instant,
     bytes: u64,
     sent: Duration,
     received: Duration,
+    /// How long the probe that closed it took to come back, and how much of that over the
+    /// viewer's baseline: the queue it met.
+    delay_ms: u32,
+    queue_ms: u32,
 }
 
 impl Delivery {
@@ -213,6 +254,17 @@ impl Delivery {
     fn caught_up(&self) -> bool {
         self.delivered_kbps() as f32 > self.sent_kbps() as f32 * (2.0 - KEPT_UP)
     }
+
+    /// The probe that closed it met a queue, as the parent takes a reply for late.
+    fn late(&self) -> bool {
+        self.queue_ms >= DELAY_THRESHOLD_150MS
+    }
+
+    /// The path delivered clearly less than was sent into it, by more than the probes' jitter
+    /// comes to in a short interval.
+    fn clearly_short(&self) -> bool {
+        self.delivered_kbps() as f32 <= self.sent_kbps() as f32 * CLEARLY_SHORT
+    }
 }
 
 /// What the last deliveries of a viewer say together.
@@ -236,60 +288,147 @@ struct Delivered {
     /// when that interval ended.
     sent_when_short_kbps: u32,
     fell_short_at: Option<Instant>,
+    /// Every probe of the interval it last fell short in met a queue, and each one since.
+    late_since_short: bool,
+    /// Congestion by the deliveries alone (`Deliveries::confirmed`): the rate the path
+    /// delivered at meanwhile.
+    confirmed: Option<u32>,
+    /// How long the latest probe took, and the queue it met.
+    delay_ms: u32,
+    queue_ms: u32,
 }
 
-/// A viewer's last deliveries.
+/// A viewer's last deliveries: what came between each probe and the one before it.
 #[derive(Debug, Default, Clone)]
 pub(super) struct Deliveries(VecDeque<Delivery>);
 
 impl Deliveries {
-    fn push(&mut self, delivery: Delivery) {
-        if self.0.len() >= SAMPLES_KEPT {
-            self.0.pop_front();
-        }
-        self.0.push_back(delivery);
+    /// The queue the latest probe met, if it is fresh.
+    fn queue_ms(&self, now: Instant) -> Option<u32> {
+        self.0
+            .back()
+            .filter(|last| now.saturating_duration_since(last.at) <= SAMPLE_AGE)
+            .map(|last| last.queue_ms)
     }
 
-    /// What the last `SAMPLES` say, if the latest is fresh. The rate is taken over the latest
-    /// and the one before it if at least `at_work_kbps` was sent in that: an interval of a
-    /// screen that hardly changed says nothing of what the path carries.
+    fn push(&mut self, delivery: Delivery) {
+        self.0.push_back(delivery);
+        // By what it makes, not by its age: on a path that falls short, what was sent in half
+        // a second arrives seconds after what was sent before it.
+        let kept = self.grouped().1.min(MOST_DELIVERIES_KEPT);
+        while self.0.len() > kept {
+            self.0.pop_front();
+        }
+    }
+
+    /// The last intervals of `MEASURED_OVER` or more, the latest first: what came between
+    /// probes sent sooner after each other is taken together. Such an interval's queue is the
+    /// least any of its probes met, so that it is late when each of them was.
+    fn intervals(&self) -> Vec<Delivery> {
+        self.grouped().0
+    }
+
+    /// Those intervals, and how many of the deliveries kept they are made of: all of them while
+    /// they do not make `SAMPLES_KEPT`.
+    fn grouped(&self) -> (Vec<Delivery>, usize) {
+        let mut intervals = Vec::with_capacity(SAMPLES_KEPT);
+        let mut open: Option<Delivery> = None;
+        for (n, earlier) in self.0.iter().rev().enumerate() {
+            let interval = match open.take() {
+                Some(later) => Delivery {
+                    first_at: earlier.first_at,
+                    bytes: later.bytes + earlier.bytes,
+                    sent: later.sent + earlier.sent,
+                    received: later.received + earlier.received,
+                    queue_ms: later.queue_ms.min(earlier.queue_ms),
+                    ..later
+                },
+                None => *earlier,
+            };
+            if interval.sent < MEASURED_OVER {
+                open = Some(interval);
+                continue;
+            }
+            intervals.push(interval);
+            if intervals.len() >= SAMPLES_KEPT {
+                return (intervals, n + 1);
+            }
+        }
+        (intervals, self.0.len())
+    }
+
+    /// The deliveries confirm congestion by themselves, before the late replies the parent
+    /// counts do: the rate the path delivered at, in kbps. Between each of the last `SAMPLES`
+    /// probes and the one before it, however soon after it went out, the encoder was at work
+    /// (`at_work_kbps` or more was sent) and the path delivered clearly less; each of those
+    /// probes met a queue, the last one of `CONFIRMING_QUEUE_MS`; and the path delivered at
+    /// about the same rate each time.
+    fn confirmed(&self, at_work_kbps: f32) -> Option<u32> {
+        let last = self.0.back()?;
+        let recent = || self.0.iter().rev().take(SAMPLES);
+        let short = |d: &Delivery| {
+            d.sent_kbps() as f32 >= at_work_kbps
+                && d.clearly_short()
+                && d.late()
+                && d.received >= TIMED
+        };
+        let rates = || recent().map(Delivery::delivered_kbps);
+        let same_rate = rates()
+            .min()
+            .zip(rates().max())
+            .is_some_and(|(least, most)| least as f32 >= most as f32 * SAME_RATE);
+        let confirmed = self.0.len() >= SAMPLES
+            && recent().all(short)
+            && last.queue_ms >= CONFIRMING_QUEUE_MS
+            && same_rate;
+        confirmed.then(|| {
+            Delivery::kbps(
+                recent().map(|d| d.bytes).sum(),
+                recent().map(|d| d.received).sum(),
+            )
+        })
+    }
+
+    /// What the last `SAMPLES` intervals say, if the latest delivery is fresh. The rate is taken
+    /// over the latest and the one before it if at least `at_work_kbps` was sent in that: an
+    /// interval of a screen that hardly changed says nothing of what the path carries.
     fn latest(&self, now: Instant, at_work_kbps: f32) -> Option<Delivered> {
         let last = self.0.back()?;
         if now.saturating_duration_since(last.at) > SAMPLE_AGE {
             return None;
         }
+        let intervals = self.intervals();
+        let latest = intervals.first()?;
         // Full: more went into the path than came out, and it was the stream that went in. An
         // interval of little sent that came up a little short says nothing of the path.
         let full = |d: &Delivery| d.sent_kbps() as f32 >= at_work_kbps && !d.kept_up();
-        let recent = || self.0.iter().rev().take(SAMPLES);
+        let recent = || intervals.iter().take(SAMPLES);
         let counted = || {
             recent()
                 .skip(1)
                 .filter(|d| d.sent_kbps() as f32 >= at_work_kbps)
-                .chain(std::iter::once(last))
+                .chain(std::iter::once(latest))
         };
         let bytes = counted().map(|d| d.bytes).sum();
         let received = counted().map(|d| d.received).sum();
+        let short = intervals.iter().position(full);
         Some(Delivered {
             kbps: Delivery::kbps(bytes, received),
-            latest_kbps: last.delivered_kbps(),
-            latest_received: last.received,
-            sent_kbps: last.sent_kbps(),
+            latest_kbps: latest.delivered_kbps(),
+            latest_received: latest.received,
+            sent_kbps: latest.sent_kbps(),
             fell_short: recent().all(full),
-            since_fell_short: self
-                .0
-                .iter()
-                .rev()
-                .position(full)
-                .filter(|since| *since > 0),
-            shrinking: last.caught_up(),
-            sent_when_short_kbps: self
-                .0
-                .iter()
-                .rev()
-                .find(|d| full(d))
-                .map_or(0, |d| d.sent_kbps()),
-            fell_short_at: self.0.iter().rev().find(|d| full(d)).map(|d| d.at),
+            since_fell_short: short.filter(|since| *since > 0),
+            shrinking: latest.caught_up(),
+            sent_when_short_kbps: short.map_or(0, |at| intervals[at].sent_kbps()),
+            // Of its first reply: taken together with what came before a cut, it did not fall
+            // short since.
+            fell_short_at: short.map(|at| intervals[at].first_at),
+            late_since_short: short
+                .is_some_and(|since| intervals.iter().take(since + 1).all(Delivery::late)),
+            confirmed: self.confirmed(at_work_kbps),
+            delay_ms: last.delay_ms,
+            queue_ms: last.queue_ms,
         })
     }
 }
@@ -363,13 +502,16 @@ pub(super) struct Evidence {
     pub held_up: f32,
     /// How much queue there is to send, in milliseconds of the path's rate.
     pub queue_ms: u32,
+    /// The deliveries confirm congestion by themselves (`Deliveries::confirmed`), and
+    /// `delivered_kbps` is the rate of the intervals they do it by.
+    pub confirmed: bool,
 }
 
 impl Evidence {
     /// The delivery says what the path carries: the path was full, with something to carry.
     fn counts(&self) -> bool {
         let at_work = self.sent_kbps as f32 >= self.nominal_kbps as f32 * AT_WORK;
-        let full = (self.fell_short && at_work) || self.queue_stood;
+        let full = (self.fell_short && at_work) || self.queue_stood || self.confirmed;
         self.delivered_kbps > 0 && self.nominal_kbps > 0 && (full || self.held_up >= HELD_UP_SHARE)
     }
 }
@@ -395,6 +537,15 @@ pub(super) struct Capacity {
     hold_until: Option<Instant>,
     /// When the stream was last brought under what the path carried.
     cut_at: Option<Instant>,
+    /// What arrived since the reply that cut was made on, and in how long by the viewer's
+    /// clock, while the queue of the cut is being sent: how fast the queue leaves says what the
+    /// path carries by then (`passed`). `None` once a probe met no queue, and without a cut.
+    passing: Option<(u64, Duration)>,
+    /// The ceiling was raised for that, and an encoder that takes a bitrate only by being
+    /// created again has yet to be created for it; and when it last was, which is not forgotten
+    /// with the ceiling.
+    raised: bool,
+    raised_at: Option<Instant>,
     /// What a hardware encoder was last seen to put out a frame, as a share of what its nominal
     /// bitrate comes to a frame at the frame rate its rate control is set for; 1 until it is
     /// seen, and for a software encoder.
@@ -422,6 +573,9 @@ impl Default for Capacity {
             hold: Duration::ZERO,
             hold_until: None,
             cut_at: None,
+            passing: None,
+            raised: false,
+            raised_at: None,
             output: 1.0,
             frame_rates: Default::default(),
             output_moved: None,
@@ -441,6 +595,8 @@ impl Capacity {
         self.hold = Duration::ZERO;
         self.hold_until = None;
         self.cut_at = None;
+        self.passing = None;
+        self.raised = false;
     }
 
     /// The ratio to go on with when the viewer's target is `target` and the stream is at
@@ -523,13 +679,23 @@ impl Capacity {
         // lowest, while it drains and after.
         let least = evidence.nominal_kbps as f32 * evidence.overshoot * DEEPEST_CUT;
         let ceiling = (evidence.delivered_kbps as f32).max(least / BELOW_CAPACITY);
-        self.hold = if self.ceiling_kbps.is_some() {
+        let again = self.ceiling_kbps.is_some();
+        self.hold = if again {
             (self.hold * 2).clamp(FIRST_HOLD, LONGEST_HOLD)
         } else {
             FIRST_HOLD
         };
         self.hold_until = Some(now + self.hold);
         self.cut_at = Some(now);
+        // How fast the queue leaves is asked of a path that was not known to be narrow. One
+        // that falls short again while it is held to what it carried, or soon after it was
+        // found to carry more that way, is held to what it carries now, as it was: it comes and
+        // goes, and a stream that goes back up each time meets every fall at full rate.
+        let asked = self
+            .raised_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ASKED_ONCE_IN);
+        self.passing = (!again && !asked).then_some((0, Duration::ZERO));
+        self.raised = false;
         self.ceiling_kbps = Some(ceiling);
         self.settled_kbps = ceiling * BELOW_CAPACITY;
         // Sending at the share `level` of what the path carries, a queue of q seconds is gone in
@@ -559,6 +725,47 @@ impl Capacity {
             self.settled_kbps,
         );
         true
+    }
+
+    /// A reply came with word of `bytes` more that arrived, in `received`, its probe having met a
+    /// queue of `queue_ms`. The first probe after a cut to meet none says the queue of the cut
+    /// is gone, and with it how fast it went: all that was written since the probe the cut was
+    /// made on arrived in the time between that probe and this one. On a path that carries what
+    /// the ceiling says, that comes to the ceiling. Where it comes to `CARRIES_MORE` of it, the
+    /// path carries that, and that is the ceiling: a path that fell short for seconds and came
+    /// back, which is not held to what it carried meanwhile; or one the two intervals the cut
+    /// was made on took for much narrower than it is. It is a rate the path delivered at, and
+    /// so no more than it carries, but for when the probe the cut was made on reached the
+    /// viewer later than what was sent before it; a probe that comes back with no queue cannot
+    /// be mistaken, as a late one can.
+    fn passed(&mut self, bytes: u64, received: Duration, queue_ms: u32, now: Instant) {
+        let Some((passed, over)) = self.passing.as_mut() else {
+            return;
+        };
+        *passed += bytes;
+        *over += received;
+        // The queue stands; or it left in less time than can be timed, and the next probe
+        // that meets none says over how long.
+        if queue_ms >= CLEAN_REPLY_MS || *over < TIMED {
+            return;
+        }
+        let (passed, over) = (*passed, *over);
+        self.passing = None;
+        let Some(ceiling) = self.ceiling_kbps else {
+            return;
+        };
+        let kbps = Delivery::kbps(passed, over) as f32;
+        if kbps < ceiling * CARRIES_MORE {
+            return;
+        }
+        log::info!(
+            "qos: the queue left at {kbps:.0} kbps: the path carries more than the {ceiling:.0} it was taken for"
+        );
+        self.ceiling_kbps = Some(kbps);
+        self.settled_kbps = self.settled_kbps.max(kbps * BELOW_CAPACITY);
+        self.drain_until = None;
+        self.raised = true;
+        self.raised_at = Some(now);
     }
 
     /// Still sending the queue of the last cut: nothing is cut further on replies that are bad
@@ -741,19 +948,85 @@ pub(super) struct Restart {
 }
 
 impl VideoQoS {
-    /// A probe came back. Between the probe before it and this one the connection wrote `bytes`
-    /// of video, in `sent` by this side's clock; the viewer says they reached it in `received`,
-    /// by its own.
-    pub fn user_delivery(&mut self, id: i32, bytes: u64, sent: Duration, received: Duration) {
+    /// A probe came back, after `delay_ms`. Between the probe before it and this one the
+    /// connection wrote `bytes` of video, in `sent` by this side's clock; the viewer says they
+    /// reached it in `received`, by its own.
+    pub fn user_delivery(
+        &mut self,
+        id: i32,
+        bytes: u64,
+        sent: Duration,
+        received: Duration,
+        delay_ms: u32,
+    ) {
         let at = self.now();
-        if let Some(user) = self.users.get_mut(&id) {
-            user.deliveries.push(Delivery {
-                at,
-                bytes,
-                sent,
-                received,
-            });
+        let Some(user) = self.users.get_mut(&id) else {
+            return;
+        };
+        let baseline = user.delay.rtt_calculator.get_rtt().unwrap_or_default();
+        let queue_ms = delay_ms.saturating_sub(baseline);
+        user.deliveries.push(Delivery {
+            at,
+            first_at: at,
+            bytes,
+            sent,
+            received,
+            delay_ms,
+            queue_ms,
+        });
+        // As `evidence`: of one viewer of one display the deliveries are the stream's.
+        if self.users.len() == 1 && self.displays.len() == 1 {
+            self.capacity.passed(bytes, received, queue_ms, at);
         }
+    }
+
+    /// The deliveries alone say the path is full (`Delivered::confirmed`).
+    fn confirmed_by_deliveries(&self) -> bool {
+        if self.users.len() != 1 || self.displays.len() != 1 {
+            return false;
+        }
+        let at_work = self.bitrate() as f32 * AT_WORK;
+        self.users
+            .values()
+            .next()
+            .and_then(|user| user.deliveries.latest(self.now(), at_work))
+            .is_some_and(|delivered| delivered.confirmed.is_some())
+    }
+
+    /// A reply of the viewer `id` that brought a delivery is dealt with, its delay taken where
+    /// it is the one the delay is taken from (`user_network_delay`): where the deliveries confirm
+    /// congestion by themselves, the stream is brought under what the path carries now, as
+    /// `adjust_ratio` does when the parent's late replies confirm it, which come later. An
+    /// encoder that takes a bitrate only by being created again is looked at in
+    /// `restart_only_step`, every second.
+    pub fn cut_on_delivery(&mut self, id: i32) {
+        if !self.users.contains_key(&id) || !self.in_vbr_state() || !self.confirmed_by_deliveries()
+        {
+            return;
+        }
+        let now = self.now();
+        if self.capacity.draining(now) {
+            return;
+        }
+        let (from, least, asked) = (self.ratio, self.min_ratio(), self.most_asked());
+        let most = (self.max_ratio() * MAX_BR_MULTIPLE).max(least);
+        let Some(to) = self.cut_by_delivery(from, least) else {
+            return;
+        };
+        self.capacity.end_start();
+        let to = to.clamp(least, most);
+        if let Some(user) = self.users.get_mut(&id) {
+            // As `adjust_ratio` leaves it: the parent's frame rate waits for two replies after
+            // a cut of the bitrate before it comes down for the same queue (the probe it has
+            // out may be from before the cut), and for none where the bitrate did not come down.
+            if user.delay.replies_after_bitrate_reduction.is_none() {
+                user.delay.replies_after_bitrate_reduction = Some(if to < from { 0 } else { 2 });
+            }
+        }
+        self.ratio = to;
+        self.note_ratio_change(from, asked, true);
+        self.reset_send_counters();
+        self.adjust_ratio_instant = now;
     }
 
     /// The viewer's connection goes through the relay.
@@ -1010,24 +1283,29 @@ impl VideoQoS {
         // short in and of each one after: the queue stood through the latest.
         // And what the path delivered in the latest is less than was sent into it when it fell
         // short: a path that paused and now catches up delivers more, and carries the stream.
-        let late = user.delay.consecutive_bad_samples as usize;
-        let queue_stood = delivered.since_fell_short.is_some_and(|since| late > since)
+        let queue_stood = delivered.since_fell_short.is_some()
+            && delivered.late_since_short
             && delivered.latest_received >= TIMED
             && (delivered.latest_kbps as f32) < delivered.sent_when_short_kbps as f32 * KEPT_UP;
         // What the path carries is its rate over the intervals together. Where that rests on the
         // queue having stood through the latest alone (the frame rate was braked on the first
         // late reply, and a hardware encoder then sent less), it is the rate of the latest: the
         // one before began before there was a queue.
-        let delivered_kbps = if queue_stood && !delivered.fell_short {
-            delivered.latest_kbps
-        } else {
-            delivered.kbps
+        // Confirmed by the deliveries alone, it is the rate of the short intervals that
+        // confirm it: the second before them was before the path fell short.
+        let delivered_kbps = match delivered.confirmed {
+            Some(kbps) => kbps,
+            None if queue_stood && !delivered.fell_short => delivered.latest_kbps,
+            None => delivered.kbps,
         };
         let sent_kbps = delivered.sent_kbps;
         // The probe that just came back saw the queue there was when it went out. It was under
         // way for its whole delay, and all that time more went into the path than came out.
-        let saw = user.delay.avg_delay() as f32;
-        let under_way = user.delay.delay_history.back().copied().unwrap_or_default() as f32;
+        // Of the latest probe, or of the replies the delay is taken from where they say more:
+        // they count a probe that is still out, which no delivery has come of.
+        let saw = delivered.queue_ms.max(user.delay.avg_delay()) as f32;
+        let under_way = user.delay.delay_history.back().copied().unwrap_or_default();
+        let under_way = delivered.delay_ms.max(under_way) as f32;
         let growth = (sent_kbps as f32 / delivered_kbps.max(1) as f32 - 1.0).clamp(0.0, 4.0);
         Some(Evidence {
             delivered_kbps,
@@ -1040,6 +1318,7 @@ impl VideoQoS {
             overshoot: self.overshoot(),
             held_up: display.rates.held_up(),
             queue_ms: (saw + under_way * growth) as u32,
+            confirmed: delivered.confirmed.is_some(),
         })
     }
 
@@ -1223,11 +1502,13 @@ impl VideoQoS {
     fn keep_under_limits(&mut self) {
         let (nominal, now) = (self.bitrate(), self.now());
         // Every viewer's replies come back clean: the probes meet no queue, so the queue of the
-        // last cut is sent, whether the screen changes or not.
-        let clean = self
-            .users
-            .values()
-            .all(|user| user.delay.avg_delay() < CLEAN_REPLY_MS);
+        // last cut is sent, whether the screen changes or not. The probes for the delivery say
+        // so too: a cut may come of them while the last reply the delay was taken from is one
+        // from before the queue.
+        let clean = self.users.values().all(|user| {
+            user.delay.avg_delay() < CLEAN_REPLY_MS
+                && user.deliveries.queue_ms(now).unwrap_or(0) < CLEAN_REPLY_MS
+        });
         if clean && self.capacity.draining(now) {
             self.capacity.queue_sent();
         }
@@ -1305,7 +1586,8 @@ impl VideoQoS {
         let confirmed = self
             .users
             .values()
-            .any(|user| user.delay.needs_bitrate_reduction());
+            .any(|user| user.delay.needs_bitrate_reduction())
+            || self.confirmed_by_deliveries();
         if confirmed && apart && self.restart_down(most, now) {
             return;
         }
@@ -1372,6 +1654,31 @@ impl VideoQoS {
             .users
             .values()
             .all(|user| user.delay.avg_delay() < DELAY_THRESHOLD_150MS);
+        if self.capacity.raised && apart && good {
+            // The queue of the cut left faster than the path was taken to carry
+            // (`Capacity::passed`): the encoder is created again for what it is known to carry
+            // now, without the wait, which is for a path that is not known to carry more.
+            self.capacity.raised = false;
+            let settled = self.capacity.settled_kbps;
+            let (from, nominal) = (self.bitrate_ratio, self.bitrate());
+            let to = ratio_for_kbps(from, nominal, self.overshoot_next(), settled).min(most);
+            let to = if to >= most * BACK { most } else { to };
+            if to >= most {
+                self.restart_to(most, most, now);
+                return;
+            }
+            if to * WORTH_A_RESTART > self.ratio {
+                // As `restart_to`, but for the ceiling, which is kept: it is what the path was
+                // measured to carry and not a try for more, and the encoder is held to it
+                // (`restart_over_allowance`).
+                let from = self.ratio;
+                log::info!("qos: encoder created again for what the path carries now, ratio {from:.2} -> {to:.2}");
+                self.ratio = to;
+                self.capacity.note_change(from, to, most, false);
+                self.request_restart(now);
+                return;
+            }
+        }
         if !waited || !good || encoded < CHANGING_FRAMES {
             return;
         }
@@ -1524,6 +1831,7 @@ mod tests {
             overshoot: 1.0,
             held_up,
             queue_ms: 1_000,
+            confirmed: false,
         }
     }
 
@@ -1630,6 +1938,204 @@ mod tests {
         let mut c = Capacity::default();
         assert!(c.cut(&evidence(10_000, 20_000, 0.0), now));
         assert_eq!(c.ceiling_kbps, Some(10_000.0));
+    }
+
+    /// What came in the half second up to `ms`: `bytes`, in `received_ms`, the probe having
+    /// met a queue of `queue_ms`.
+    fn half(now: Instant, ms: u64, bytes: u64, received_ms: u64, queue_ms: u32) -> Delivery {
+        Delivery {
+            at: now + Duration::from_millis(ms),
+            first_at: now + Duration::from_millis(ms),
+            bytes,
+            sent: Duration::from_millis(500),
+            received: Duration::from_millis(received_ms),
+            delay_ms: queue_ms + 20,
+            queue_ms,
+        }
+    }
+
+    #[test]
+    fn what_comes_between_probes_half_a_second_apart_is_taken_by_the_second() {
+        let now = Instant::now();
+        // 8 Mbps in half seconds, all of it there in the time it was sent in, but for the
+        // probes' jitter: one 30 ms late, the next on time. Half second by half second the
+        // path reads 6% short and then 6% over; by the second it kept up, as it did.
+        let mut d = Deliveries::default();
+        for (n, received) in [530, 470, 530, 470].into_iter().enumerate() {
+            d.push(half(now, 500 * n as u64, 500_000, received, 0));
+        }
+        let at = now + Duration::from_millis(1_500);
+        let said = d.latest(at, 4_000.0).unwrap();
+        assert_eq!(
+            (said.kbps, said.latest_kbps, said.sent_kbps),
+            (8_000, 8_000, 8_000)
+        );
+        assert!(!said.fell_short && !said.shrinking && said.since_fell_short.is_none());
+        assert_eq!(said.latest_received, Duration::from_secs(1));
+        // The seconds are counted back from the latest probe, and what does not fill one is
+        // left out: with a fifth half second, the last two and the two before them.
+        d.push(half(now, 2_000, 500_000, 1_000, 600));
+        let said = d.latest(at + Duration::from_millis(500), 4_000.0).unwrap();
+        assert_eq!(said.latest_kbps, 8_000_000 / 1_470);
+        assert_eq!(said.latest_received, Duration::from_millis(1_470));
+        // Late by the second when each probe in it was: this one's first was not.
+        assert!(!said.late_since_short && said.since_fell_short.is_none());
+        assert_eq!(
+            (said.queue_ms, said.delay_ms),
+            (600, 620),
+            "of the latest probe"
+        );
+        // A probe a second or more after the last is a second by itself, as it always was.
+        let mut d = Deliveries::default();
+        d.push(Delivery {
+            sent: Duration::from_secs(1),
+            ..half(now, 0, 1_000_000, 2_000, 0)
+        });
+        d.push(half(now, 0, 500_000, 500, 0));
+        assert_eq!(d.intervals().len(), 1, "half a second alone is none");
+        d.push(half(now, 0, 500_000, 500, 0));
+        assert_eq!(d.intervals().len(), 2);
+        // Kept: what makes the last three such intervals, and no more.
+        let mut d = Deliveries::default();
+        for n in 0..10 {
+            d.push(half(now, 500 * n, 500_000, 500, 0));
+        }
+        assert_eq!(d.0.len(), 2 * SAMPLES_KEPT);
+        // However long ago it came: on a path that carries a quarter of what is sent, each half
+        // second arrives two seconds after the one before it, and the three intervals are
+        // there all the same. Taken together, an interval is dated by its first reply as well.
+        let mut d = Deliveries::default();
+        for n in 0..10 {
+            d.push(half(now, 2_000 * n, 500_000, 2_000, 900));
+        }
+        assert_eq!(d.0.len(), 2 * SAMPLES_KEPT);
+        let intervals = d.intervals();
+        assert_eq!(intervals.len(), SAMPLES_KEPT);
+        assert_eq!(intervals[0].at, now + Duration::from_secs(18));
+        assert_eq!(intervals[0].first_at, now + Duration::from_secs(16));
+        let said = d.latest(now + Duration::from_secs(18), 4_000.0).unwrap();
+        assert!(said.fell_short && said.late_since_short);
+        assert_eq!(said.fell_short_at, Some(now + Duration::from_secs(16)));
+        // Sixteen at the most, of probes that never make an interval.
+        let mut d = Deliveries::default();
+        for n in 0..40 {
+            d.push(Delivery {
+                sent: Duration::from_millis(10),
+                ..half(now, 10 * n, 10_000, 10, 0)
+            });
+        }
+        assert_eq!(d.0.len(), MOST_DELIVERIES_KEPT);
+        assert!(d.intervals().is_empty());
+    }
+
+    #[test]
+    fn the_deliveries_confirm_a_path_clearly_short_twice_over_with_a_queue_that_stands() {
+        let now = Instant::now();
+        let said = |halves: &[(u64, u64, u32)]| {
+            let mut d = Deliveries::default();
+            // A second in which the path kept up comes first.
+            d.push(half(now, 0, 500_000, 500, 0));
+            d.push(half(now, 500, 500_000, 500, 0));
+            for (n, (bytes, received, queue)) in halves.iter().enumerate() {
+                d.push(half(now, 1_000 + 500 * n as u64, *bytes, *received, *queue));
+            }
+            d.confirmed(4_000.0)
+        };
+        // 8 Mbps into a path that carries 4: each half second takes a second to arrive, and
+        // the probes meet a queue of half a second, then of a second. Confirmed, at 4 Mbps.
+        assert_eq!(
+            said(&[(500_000, 1_000, 500), (500_000, 1_000, 1_000)]),
+            Some(4_000)
+        );
+        // Once is not twice.
+        assert_eq!(said(&[(500_000, 1_000, 500)]), None);
+        // A pause: far short, then caught up.
+        assert_eq!(said(&[(500_000, 1_400, 900), (500_000, 200, 600)]), None);
+        // Short at rates far apart: a pause in one of them, or a probe held back.
+        assert_eq!(said(&[(500_000, 2_000, 900), (500_000, 700, 1_100)]), None);
+        // A little short: left to the late replies, which are in time for a queue that grows
+        // by a twentieth of a second a second.
+        assert_eq!(said(&[(500_000, 530, 300), (500_000, 530, 450)]), None);
+        // No queue to speak of, or one probe that met none: the path is not full.
+        assert_eq!(said(&[(500_000, 1_000, 200), (500_000, 1_000, 390)]), None);
+        assert_eq!(said(&[(500_000, 1_000, 100), (500_000, 1_000, 600)]), None);
+        // Hardly anything was sent.
+        assert_eq!(said(&[(20_000, 1_000, 500), (20_000, 1_000, 1_000)]), None);
+    }
+
+    #[test]
+    fn how_fast_the_queue_of_a_cut_leaves_says_what_the_path_carries_by_then() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let cut_at = |c: &mut Capacity, at: Instant| {
+            c.cut(&evidence(8_000, 20_000, 0.0), at);
+            assert_eq!(c.ceiling_kbps, Some(8_000.0));
+        };
+        let cut = |c: &mut Capacity| cut_at(c, t0);
+        // The queue leaves at the 8 Mbps the path was taken to carry: 4 Mbit every half second
+        // while it stands, and so much in all when a probe meets none. Nothing changes.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        for _ in 0..5 {
+            c.passed(500_000, ms(500), 600, t0);
+            assert!(c.passing.is_some());
+        }
+        c.passed(500_000, ms(500), 10, t0);
+        assert_eq!(c.ceiling_kbps, Some(8_000.0));
+        assert!(c.passing.is_none() && !c.raised);
+        // Said once: what arrives later, with no queue, is what was sent and no more.
+        c.passed(5_000_000, ms(500), 10, t0);
+        assert_eq!(c.ceiling_kbps, Some(8_000.0));
+        // It leaves twice as fast: the path carries 16 Mbps by then, the stream settles under
+        // that, and is not kept sending a queue that is gone.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        c.passed(1_000_000, ms(500), 600, t0);
+        c.passed(1_000_000, ms(500), 10, t0 + ms(1_000));
+        assert_eq!(c.ceiling_kbps, Some(16_000.0));
+        assert_eq!(c.settled_kbps, 16_000.0 * BELOW_CAPACITY);
+        assert!(c.raised && !c.draining(t0 + ms(1_000)));
+        assert_eq!(c.raised_at, Some(t0 + ms(1_000)));
+        // A fifth faster is what it was: the probe the cut was made on may have been held up.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        c.passed(1_200_000, ms(1_000), 10, t0);
+        assert_eq!(c.ceiling_kbps, Some(8_000.0));
+        // It left in less time than can be timed: the next probe that meets no queue says
+        // over how long, with what was sent meanwhile.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        c.passed(1_000_000, ms(50), 10, t0);
+        assert!(c.passing.is_some());
+        assert_eq!(c.ceiling_kbps, Some(8_000.0));
+        c.passed(100_000, ms(500), 10, t0);
+        assert_eq!(c.ceiling_kbps, Some(16_000.0));
+        // Without a cut there is nothing to say.
+        let mut c = Capacity::default();
+        c.passed(1_000_000, ms(1_000), 10, t0);
+        assert_eq!(c.ceiling_kbps, None);
+        // A path that falls short again under its ceiling is not asked: it is held to what it
+        // carries now, however fast the queue leaves.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        c.passed(2_000_000, ms(1_000), 10, t0);
+        assert_eq!(c.ceiling_kbps, Some(16_000.0));
+        c.cut(&evidence(6_000, 12_000, 0.0), t0 + ms(20_000));
+        assert!(c.passing.is_none());
+        c.passed(2_000_000, ms(1_000), 10, t0 + ms(21_000));
+        assert_eq!(c.ceiling_kbps, Some(6_000.0));
+        assert!(!c.raised);
+        // Nor one whose ceiling is gone (an encoder created again on the way back forgets it)
+        // within a minute of having been found to carry more; after that it is asked again.
+        let mut c = Capacity::default();
+        cut(&mut c);
+        c.passed(2_000_000, ms(1_000), 10, t0);
+        c.forget_ceiling();
+        cut_at(&mut c, t0 + ms(20_000));
+        assert!(c.passing.is_none());
+        c.forget_ceiling();
+        cut_at(&mut c, t0 + ASKED_ONCE_IN);
+        assert!(c.passing.is_some());
     }
 
     #[test]
@@ -1837,9 +2343,12 @@ mod tests {
         let now = Instant::now();
         let delivery = |bytes, sent_ms, received_ms| Delivery {
             at: now,
+            first_at: now,
             bytes,
             sent: Duration::from_millis(sent_ms),
             received: Duration::from_millis(received_ms),
+            delay_ms: 0,
+            queue_ms: 0,
         };
         // A megabyte a second (8 Mbps) into a path that carries half of it. What was lost on the
         // way is sent again and holds the first probe back: the first megabyte reads 2.6 s, the

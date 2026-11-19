@@ -388,11 +388,10 @@ pub struct Connection {
     control_permissions: Option<ControlPermissions>,
     relayed: bool, // through the relay, where the stream keeps under the relay's limit
     last_test_delay: Option<Instant>,
-    // What the path delivers, from the probes: the video written to the stream so far, how much
-    // of it was written when the outstanding probe went out, and the last answered probe.
+    // What the path delivers, from the probes: the video written to the stream so far, and the
+    // probes that are out, each with how much of it was written when it went out.
     video_bytes_sent: u64,
-    probe_video_bytes: u64,
-    answered_probe: Option<AnsweredProbe>,
+    probes: Probes,
     network_delay: u32,
     lock_after_session_end: bool,
     show_remote_cursor: bool,
@@ -541,6 +540,141 @@ impl AnsweredProbe {
         ))
     }
 }
+/// A probe that is out: its number, when it went out, how much video the connection had written
+/// to the stream by then, and whether it is the one the connection waits for before it sends the
+/// next of its kind (`Connection::last_test_delay`), which the delay is taken from.
+#[derive(Debug, Clone, Copy)]
+struct SentProbe {
+    number: i64,
+    sent: Instant,
+    video_bytes: u64,
+    primary: bool,
+}
+
+/// What a probe that came back says: how long it took, what went between the one before it and
+/// this one (`AnsweredProbe::delivery_since`), and whether the delay is taken from it.
+#[derive(Debug, PartialEq)]
+struct ProbeReply {
+    delay_ms: u32,
+    delivery: Option<(u64, Duration, Duration)>,
+    primary: bool,
+}
+
+/// No more probes than this are out at a time for what the path delivers alone: with this many
+/// unanswered the path is not to be measured, and the connection is closed for it before long.
+const MOST_PROBES_OUT: usize = 16;
+
+/// The probes of a connection.
+///
+/// One goes out with the timer, every second, when the one before it is answered, as ever: the
+/// delay is taken from it, and the frame rate and the bitrate follow that. To a viewer that says
+/// when the probes reach it, of the video, one goes out every `PROBE_EVERY` besides, answered or
+/// not, for what the path delivers alone: on a path that fills, a probe waits behind the queue,
+/// and those sent only when the last is back come seconds apart just when the path is to be
+/// measured. Such a viewer is told the number of each in `TestDelay.time`, which it echoes; one
+/// that does not say gets 0 there as it always did, and has one probe out at a time.
+#[derive(Debug, Default)]
+struct Probes {
+    out: std::collections::VecDeque<SentProbe>,
+    numbered: i64,
+    answered: Option<AnsweredProbe>,
+    /// When the last one went out.
+    sent_at: Option<Instant>,
+    /// The viewer says when the probes reach it.
+    reports: bool,
+    /// When the timer last ticked, and when the next probe between its ticks is due.
+    timer_at: Option<Instant>,
+    between_at: Option<Instant>,
+}
+
+impl Probes {
+    const EVERY: Duration = video_qos::PROBE_EVERY;
+
+    /// A probe goes out at `now`, `video_bytes` of video written so far. Returns what to write in
+    /// its `TestDelay.time`; `None` when it is not to be sent: one for the delivery alone, to a
+    /// viewer that does not say when it arrives, with too many out, or right after another (the
+    /// loop was held up, and both were due when it came round).
+    fn sent(&mut self, now: Instant, video_bytes: u64, primary: bool) -> Option<i64> {
+        let just_sent = self.sent_at.is_some_and(|at| Self::too_close(at, now));
+        if !primary && (!self.reports || just_sent || self.out.len() >= MOST_PROBES_OUT) {
+            return None;
+        }
+        self.sent_at = Some(now);
+        self.numbered += 1;
+        self.out.push_back(SentProbe {
+            number: self.numbered,
+            sent: now,
+            video_bytes,
+            primary,
+        });
+        Some(if self.reports { self.numbered } else { 0 })
+    }
+
+    /// The reply to the probe `number` came at `now`; the viewer had the probe at `received_at`
+    /// by its own clock (0 when it does not say). `None` for a reply to none that is out.
+    fn answered(&mut self, number: i64, received_at: u64, now: Instant) -> Option<ProbeReply> {
+        // A viewer that was not told a number has one probe out, the oldest.
+        let at = match number {
+            0 => 0,
+            number => self.out.iter().position(|probe| probe.number == number)?,
+        };
+        // The replies come in the order the probes went out: none comes for those before it.
+        let primary = self.out.iter().take(at + 1).any(|probe| probe.primary);
+        let probe = self.out.drain(..(at + 1).min(self.out.len())).last()?;
+        let answered = AnsweredProbe {
+            sent: probe.sent,
+            video_bytes: probe.video_bytes,
+            received_at,
+        };
+        // Sent right after the one before it (the timer's own probe goes out when it is due,
+        // whatever went before), or there in the same millisecond (the two left a queue
+        // together): no interval that can be timed. It is left open, and what was written in it
+        // goes with the next.
+        let short = self.answered.as_ref().is_some_and(|before| {
+            Self::too_close(before.sent, answered.sent)
+                || (received_at != 0 && before.received_at == received_at)
+        });
+        let delivery = (!short)
+            .then(|| answered.delivery_since(self.answered.as_ref()))
+            .flatten();
+        if !short {
+            self.answered = Some(answered);
+        }
+        self.reports |= received_at != 0;
+        Some(ProbeReply {
+            delay_ms: now.saturating_duration_since(probe.sent).as_millis() as u32,
+            delivery,
+            primary,
+        })
+    }
+
+    /// The timer ticked at `now`. Returns when the first probe between this tick and the next is
+    /// due, if they are sent (`between`).
+    fn timer_ticked(&mut self, now: Instant, between: bool) -> Option<Instant> {
+        self.timer_at = Some(now);
+        self.between_at = Some(now + Self::EVERY).filter(|at| between && Self::in_time(*at, now));
+        self.between_at
+    }
+
+    /// The probe between the timer's ticks that was due is dealt with. Returns when the next is.
+    fn between_done(&mut self) -> Option<Instant> {
+        let (at, tick) = (self.between_at.take()?, self.timer_at?);
+        self.between_at = Some(at + Self::EVERY).filter(|at| Self::in_time(*at, tick));
+        self.between_at
+    }
+
+    /// `at` is before the next tick of the timer that ticked at `tick`, and not so close to it
+    /// that the two probes would be one.
+    fn in_time(at: Instant, tick: Instant) -> bool {
+        at + Self::EVERY / 2 < tick + TEST_DELAY_TIMEOUT
+    }
+
+    /// A probe at `later` comes too soon after one at `earlier` for what went between them to
+    /// be timed.
+    fn too_close(earlier: Instant, later: Instant) -> bool {
+        later.saturating_duration_since(earlier) < Self::EVERY / 2
+    }
+}
 const SEC30: Duration = Duration::from_secs(30);
 const H1: Duration = Duration::from_secs(3600);
 const MILLI1: Duration = Duration::from_millis(1);
@@ -648,8 +782,7 @@ impl Connection {
             relayed,
             last_test_delay: None,
             video_bytes_sent: 0,
-            probe_video_bytes: 0,
-            answered_probe: None,
+            probes: Probes::default(),
             network_delay: 0,
             lock_after_session_end: false,
             show_remote_cursor: false,
@@ -752,6 +885,9 @@ impl Connection {
         }
         let mut test_delay_timer =
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
+        // Fork: when the next probe between that timer's ticks goes out (`Probes`).
+        let probe_between = time::sleep_until(Instant::now());
+        tokio::pin!(probe_between);
         let mut last_recv_time = Instant::now();
         let started = Instant::now();
 
@@ -1248,28 +1384,29 @@ impl Connection {
                     }
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
                     if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
-                        conn.last_test_delay = Some(Instant::now());
-                        conn.probe_video_bytes = conn.video_bytes_sent;
-                        let mut msg_out = Message::new();
-                        // The stream's state is told to those who watch it, not to a file
-                        // transfer that shares the process.
-                        let watches = conn.is_authed_remote_conn() || conn.view_camera;
-                        let (target_bitrate, qos_state) = {
-                            let qos = video_service::VIDEO_QOS.lock().unwrap();
-                            (qos.bitrate(), if watches { qos.qos_state() } else { 0 })
-                        };
-                        msg_out.set_test_delay(TestDelay{
-                            last_delay: conn.network_delay,
-                            target_bitrate,
-                            qos_state,
-                            ..Default::default()
-                        });
-                        conn.send(msg_out.into()).await;
+                        conn.send_probe(true).await;
+                    } else if conn.probes_between() {
+                        // Fork: that one is still out, behind a queue, and the path is measured
+                        // all the same.
+                        conn.send_probe(false).await;
+                    }
+                    let between = conn.probes_between();
+                    if let Some(at) = conn.probes.timer_ticked(Instant::now(), between) {
+                        probe_between.as_mut().reset(at);
                     }
                     if conn.is_authed_remote_conn() || conn.view_camera {
                         if let Some(last_test_delay) = conn.last_test_delay {
                             video_service::VIDEO_QOS.lock().unwrap().user_delay_response_elapsed(id, last_test_delay.elapsed().as_millis());
                         }
+                    }
+                }
+                // Fork: a probe between the timer's, for what the path delivers (`Probes`).
+                _ = &mut probe_between, if conn.probes.between_at.is_some() => {
+                    if conn.probes_between() {
+                        conn.send_probe(false).await;
+                    }
+                    if let Some(at) = conn.probes.between_done() {
+                        probe_between.as_mut().reset(at);
                     }
                 }
                 clip_file = rx_clip.recv() => match clip_file {
@@ -3241,28 +3378,24 @@ impl Connection {
                 let mut msg_out = Message::new();
                 msg_out.set_test_delay(t);
                 self.inner.send(msg_out.into());
-            } else {
-                if let Some(tm) = self.last_test_delay {
+            } else if let Some(reply) = self.probes.answered(t.time, t.received_at, Instant::now())
+            {
+                let mut qos = video_service::VIDEO_QOS.lock().unwrap();
+                // What the path delivered comes first: the delay may call for a cut, and the
+                // cut is sized by it.
+                if let Some((bytes, sent, received)) = reply.delivery {
+                    qos.user_delivery(self.inner.id(), bytes, sent, received, reply.delay_ms);
+                }
+                // The delay is taken from the probe the connection waited for, as ever; the
+                // ones between say what the path delivers, and no more.
+                if reply.primary {
                     self.last_test_delay = None;
-                    let new_delay = tm.elapsed().as_millis() as u32;
-                    let probe = AnsweredProbe {
-                        sent: tm,
-                        video_bytes: self.probe_video_bytes,
-                        received_at: t.received_at,
-                    };
-                    {
-                        let mut qos = video_service::VIDEO_QOS.lock().unwrap();
-                        // What the path delivered comes first: the delay may call for a cut,
-                        // and the cut is sized by it.
-                        if let Some((bytes, sent, received)) =
-                            probe.delivery_since(self.answered_probe.as_ref())
-                        {
-                            qos.user_delivery(self.inner.id(), bytes, sent, received);
-                        }
-                        qos.user_network_delay(self.inner.id(), new_delay);
-                    }
-                    self.answered_probe = Some(probe);
-                    self.network_delay = new_delay;
+                    qos.user_network_delay(self.inner.id(), reply.delay_ms);
+                    self.network_delay = reply.delay_ms;
+                }
+                // Last, as the parent's own cut comes after it took the reply.
+                if reply.delivery.is_some() {
+                    qos.cut_on_delivery(self.inner.id());
                 }
             }
         } else if let Some(message::Union::SwitchSidesResponse(_s)) = msg.union {
@@ -5982,6 +6115,40 @@ impl Connection {
         }
     }
 
+    /// Fork: the probes for what the path delivers alone go to a viewer of the video that says
+    /// when they reach it (`Probes`).
+    fn probes_between(&self) -> bool {
+        self.probes.reports && (self.is_authed_remote_conn() || self.view_camera)
+    }
+
+    /// Sends a probe: the one the delay is taken from, which the connection then waits for
+    /// (`last_test_delay`), or one for what the path delivers alone.
+    async fn send_probe(&mut self, primary: bool) {
+        let now = Instant::now();
+        let Some(time) = self.probes.sent(now, self.video_bytes_sent, primary) else {
+            return;
+        };
+        if primary {
+            self.last_test_delay = Some(now);
+        }
+        // The stream's state is told to those who watch it, not to a file transfer that shares
+        // the process.
+        let watches = self.is_authed_remote_conn() || self.view_camera;
+        let (target_bitrate, qos_state) = {
+            let qos = video_service::VIDEO_QOS.lock().unwrap();
+            (qos.bitrate(), if watches { qos.qos_state() } else { 0 })
+        };
+        let mut msg_out = Message::new();
+        msg_out.set_test_delay(TestDelay {
+            time,
+            last_delay: self.network_delay,
+            target_bitrate,
+            qos_state,
+            ..Default::default()
+        });
+        self.send(msg_out.into()).await;
+    }
+
     fn is_authed_remote_conn(&self) -> bool {
         if let Some(id) = self.authed_conn_id.as_ref() {
             return id.conn_type() == AuthConnType::Remote;
@@ -8098,6 +8265,192 @@ mod probe_tests {
         );
         // The first probe of a connection has none before it.
         assert_eq!(first.delivery_since(None), None);
+    }
+
+    #[test]
+    fn a_viewer_that_does_not_say_has_one_probe_out_and_is_told_no_number() {
+        let t0 = Instant::now();
+        let mut probes = Probes::default();
+        // The timer's probe: no number is written, as ever.
+        assert_eq!(probes.sent(t0, 0, true), Some(0));
+        // None goes out between the timer's.
+        assert_eq!(
+            probes.sent(t0 + Duration::from_millis(500), 100, false),
+            None
+        );
+        assert_eq!(probes.out.len(), 1);
+        // Its reply says nothing of when, and no delivery comes of it.
+        let reply = probes.answered(0, 0, t0 + Duration::from_millis(40));
+        assert_eq!(
+            reply,
+            Some(ProbeReply {
+                delay_ms: 40,
+                delivery: None,
+                primary: true
+            })
+        );
+        assert!(!probes.reports && probes.out.is_empty());
+        // A reply to no probe is none.
+        assert_eq!(probes.answered(0, 0, t0 + Duration::from_secs(1)), None);
+        assert_eq!(probes.timer_ticked(t0, false), None);
+    }
+
+    #[test]
+    fn a_viewer_that_says_when_is_sent_numbered_probes_whether_answered_or_not() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut probes = Probes::default();
+        assert_eq!(probes.sent(t0, 0, true), Some(0));
+        // It says when: from here on its probes are numbered, and go out between the timer's.
+        assert!(probes
+            .answered(0, 7_000, t0 + ms(40))
+            .is_some_and(|r| r.primary));
+        assert!(probes.reports);
+        assert_eq!(probes.sent(t0 + ms(500), 1_000, false), Some(2));
+        assert_eq!(probes.sent(t0 + ms(1_000), 2_000, true), Some(3));
+        // The path filled: that one is out, and the next ones go out all the same.
+        assert_eq!(probes.sent(t0 + ms(1_500), 3_000, false), Some(4));
+        assert_eq!(probes.sent(t0 + ms(2_000), 4_000, false), Some(5));
+        assert_eq!(probes.out.len(), 4);
+        // Each reply is to the probe of its number: what went between the one before it and
+        // that one, how long it took, and whether the delay is taken from it.
+        assert_eq!(
+            probes.answered(2, 7_500, t0 + ms(540)),
+            Some(ProbeReply {
+                delay_ms: 40,
+                delivery: Some((1_000, ms(500), ms(500))),
+                primary: false
+            })
+        );
+        assert_eq!(
+            probes.answered(3, 9_300, t0 + ms(2_340)),
+            Some(ProbeReply {
+                delay_ms: 1_340,
+                delivery: Some((1_000, ms(500), ms(1_800))),
+                primary: true
+            })
+        );
+        // A reply that never came is not waited for: the next one answers for it, also for
+        // whether the delay is taken from it.
+        assert_eq!(probes.sent(t0 + ms(2_500), 5_000, true), Some(6));
+        assert_eq!(
+            probes.answered(6, 12_000, t0 + ms(5_000)),
+            Some(ProbeReply {
+                delay_ms: 2_500,
+                delivery: Some((3_000, ms(1_500), ms(2_700))),
+                primary: true
+            })
+        );
+        assert!(probes.out.is_empty());
+        // A number that is not out, or was answered, is no reply.
+        assert_eq!(probes.answered(6, 12_500, t0 + ms(5_100)), None);
+        assert_eq!(probes.answered(99, 12_500, t0 + ms(5_100)), None);
+    }
+
+    #[test]
+    fn no_more_probes_are_out_than_can_be_of_use() {
+        let t0 = Instant::now();
+        let mut probes = Probes::default();
+        probes.sent(t0, 0, true);
+        probes.answered(0, 1, t0);
+        for n in 1..=MOST_PROBES_OUT as u64 {
+            assert!(probes
+                .sent(t0 + Duration::from_millis(500 * n), n, false)
+                .is_some());
+        }
+        assert_eq!(probes.sent(t0 + Duration::from_secs(9), 0, false), None);
+        // The timer's own probe goes out as ever.
+        assert!(probes.sent(t0 + Duration::from_secs(9), 0, true).is_some());
+        assert_eq!(probes.out.len(), MOST_PROBES_OUT + 1);
+    }
+
+    #[test]
+    fn probes_one_right_after_the_other_make_no_interval_of_their_own() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut probes = Probes::default();
+        probes.sent(t0, 0, true);
+        probes.answered(0, 1_000, t0 + ms(20));
+        // The loop was held up for a second and a half, and both probes are due when it comes
+        // round: the one for the delivery goes out, and a second one right after it does not.
+        assert_eq!(probes.sent(t0 + ms(1_500), 9_000, false), Some(2));
+        assert_eq!(probes.sent(t0 + ms(1_503), 9_100, false), None);
+        // The timer's own goes out whatever went before it: the delay is taken from it. What
+        // was written between the two is too little to time, and goes with the next interval.
+        assert_eq!(probes.sent(t0 + ms(1_506), 9_200, true), Some(3));
+        assert_eq!(probes.sent(t0 + ms(2_006), 12_000, false), Some(4));
+        assert_eq!(
+            probes.answered(2, 2_900, t0 + ms(1_900)),
+            Some(ProbeReply {
+                delay_ms: 400,
+                delivery: Some((9_000, ms(1_500), ms(1_900))),
+                primary: false
+            })
+        );
+        assert_eq!(
+            probes.answered(3, 2_903, t0 + ms(1_910)),
+            Some(ProbeReply {
+                delay_ms: 404,
+                delivery: None,
+                primary: true
+            })
+        );
+        assert_eq!(
+            probes.answered(4, 3_500, t0 + ms(2_500)),
+            Some(ProbeReply {
+                delay_ms: 494,
+                delivery: Some((3_000, ms(506), ms(600))),
+                primary: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_probes_between_go_out_evenly_between_the_timers_ticks() {
+        let t0 = Instant::now();
+        let every = Probes::EVERY;
+        let mut probes = Probes::default();
+        // One every `EVERY` after the tick, and none where the timer's next tick comes.
+        let mut due = probes.timer_ticked(t0, true);
+        let mut at = Vec::new();
+        while let Some(when) = due {
+            at.push(when - t0);
+            due = probes.between_done();
+        }
+        let between = (TEST_DELAY_TIMEOUT.as_millis() / every.as_millis()) as u32 - 1;
+        assert_eq!(at, (1..=between).map(|n| every * n).collect::<Vec<_>>());
+        assert!(probes.between_at.is_none());
+        // Not sent between: none is due.
+        assert_eq!(probes.timer_ticked(t0, false), None);
+        assert_eq!(probes.between_done(), None);
+    }
+
+    #[test]
+    fn probes_there_in_the_same_millisecond_make_one_interval_with_the_next() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut probes = Probes::default();
+        probes.sent(t0, 0, true);
+        probes.answered(0, 1_000, t0 + ms(20));
+        // The path stopped for a second and a half. Three probes went out meanwhile, and are
+        // there together when it goes on: the first closes the interval it stopped in, and the
+        // two behind it, there in the same millisecond, cannot be timed. What was written
+        // before them is not lost: it arrived, and counts with the next interval, which is the
+        // one the path caught up in.
+        assert_eq!(probes.sent(t0 + ms(500), 5_000, false), Some(2));
+        assert_eq!(probes.sent(t0 + ms(1_000), 10_000, true), Some(3));
+        assert_eq!(probes.sent(t0 + ms(1_500), 15_000, false), Some(4));
+        assert_eq!(probes.sent(t0 + ms(2_000), 20_000, false), Some(5));
+        let first = probes.answered(2, 3_000, t0 + ms(2_020)).unwrap();
+        assert_eq!(first.delivery, Some((5_000, ms(500), ms(2_000))));
+        let second = probes.answered(3, 3_000, t0 + ms(2_021)).unwrap();
+        assert_eq!((second.delivery, second.primary), (None, true));
+        assert_eq!(
+            probes.answered(4, 3_000, t0 + ms(2_022)).unwrap().delivery,
+            None
+        );
+        let last = probes.answered(5, 3_100, t0 + ms(2_120)).unwrap();
+        assert_eq!(last.delivery, Some((15_000, ms(1_500), ms(100))));
     }
 
     #[test]

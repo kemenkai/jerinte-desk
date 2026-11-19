@@ -7,7 +7,7 @@ use std::{
 
 // Fork extension: how far the bitrate goes and how it comes back, from measured rates.
 mod capacity;
-pub use capacity::PACE_AHEAD; // fork: what a paced software encoder may send ahead
+pub use capacity::{PACE_AHEAD, PROBE_EVERY}; // fork: what a paced software encoder may send ahead
 
 /*
 FPS adjust:
