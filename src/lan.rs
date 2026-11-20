@@ -330,7 +330,14 @@ fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::Di
 
 async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>) -> ResultType<()> {
     // Only peers found on this client's server: `LanPeers::load` leaves out a list found elsewhere.
-    let mut peers = config::LanPeers::load().peers;
+    let config::LanPeers { server, mut peers } = config::LanPeers::load();
+    // `store` marks the list with the server of the moment: should the client move to another
+    // server while this run lasts, the peers of the old one are not stored as the new one's.
+    let store = |peers: &[config::DiscoveryPeer]| {
+        if config::LanPeers::server_mark() == server {
+            config::LanPeers::store(peers);
+        }
+    };
     peers.iter_mut().for_each(|peer| {
         peer.online = false;
     });
@@ -351,7 +358,7 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
                     }
                     peers.insert(0, peer);
                     if last_write_time.map(|t| t.elapsed().as_millis() > 300).unwrap_or(true)  {
-                        config::LanPeers::store(&peers);
+                        store(&peers);
                         #[cfg(feature = "flutter")]
                         crate::flutter_ffi::main_load_lan_peers();
                         last_write_time = Some(Instant::now());
@@ -364,7 +371,7 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
         }
     }
 
-    config::LanPeers::store(&peers);
+    store(&peers);
     #[cfg(feature = "flutter")]
     crate::flutter_ffi::main_load_lan_peers();
     Ok(())
