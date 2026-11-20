@@ -23,26 +23,10 @@ use std::{
 
 type Message = RendezvousMessage;
 
-/// The local option naming the server the stored LAN peers were found on (its `server_mark`).
-const OPTION_LAN_PEERS_SERVER: &str = "lan-peers-server";
-
-/// Which ID server this client is on, as discovery messages carry it (`misc`): the start of a
-/// hash of the server's key. A client answers a ping only from one on its server, and lists only
-/// those answering as such: one on another server cannot be connected to through ours, and has no
-/// business learning this machine's ID, host and user name. Empty without a key of our own, when
-/// discovery is everyone's, as upstream has it.
+/// Which ID server this client is on, as discovery messages carry it (`misc`); see
+/// `LanPeers::server_mark`. The stored list is kept per server there too.
 fn server_mark() -> String {
-    server_mark_of(&Config::get_option("key"))
-}
-
-fn server_mark_of(key: &str) -> String {
-    if key.is_empty() {
-        return String::new();
-    }
-    let hash = hbb_common::sodiumoxide::crypto::hash::sha256::hash(
-        format!("lan-discovery:{key}").as_bytes(),
-    );
-    hash.0[..8].iter().map(|b| format!("{b:02x}")).collect()
+    config::LanPeers::server_mark()
 }
 
 /// Whether a discovery message marked `theirs` is from a client on the server marked `ours`.
@@ -345,15 +329,8 @@ fn spawn_wait_responses(sockets: Vec<UdpSocket>) -> UnboundedReceiver<config::Di
 }
 
 async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>) -> ResultType<()> {
-    // Peers stored before discovery told servers apart, or while on another server, are not
-    // known to be on this one: start over once.
-    let server = server_mark();
-    let mut peers = if config::LocalConfig::get_option(OPTION_LAN_PEERS_SERVER) == server {
-        config::LanPeers::load().peers
-    } else {
-        config::LocalConfig::set_option(OPTION_LAN_PEERS_SERVER.to_owned(), server);
-        Vec::new()
-    };
+    // Only peers found on this client's server: `LanPeers::load` leaves out a list found elsewhere.
+    let mut peers = config::LanPeers::load().peers;
     peers.iter_mut().for_each(|peer| {
         peer.online = false;
     });
@@ -395,26 +372,17 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
 
 #[cfg(test)]
 mod tests {
-    use super::{same_server, server_mark_of};
-
-    #[test]
-    fn the_mark_tells_servers_apart_without_showing_the_key() {
-        let ours = server_mark_of("key of our server");
-        assert_eq!(ours.len(), 16);
-        assert!(ours.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(ours, server_mark_of("key of our server"));
-        assert_ne!(ours, server_mark_of("key of another server"));
-        assert_eq!(server_mark_of(""), "");
-    }
+    use super::same_server;
+    use hbb_common::config::LanPeers;
 
     #[test]
     fn only_clients_on_our_server_count_once_we_have_one() {
-        let ours = server_mark_of("key of our server");
+        let ours = LanPeers::server_mark_of("key of our server");
         assert!(same_server(&ours, &ours));
         // Another server's client, and one that says nothing: stock RustDesk, or an older build.
         assert!(!same_server(
             &ours,
-            &server_mark_of("key of another server")
+            &LanPeers::server_mark_of("key of another server")
         ));
         assert!(!same_server(&ours, ""));
         // Without a key of our own, discovery is everyone's.
