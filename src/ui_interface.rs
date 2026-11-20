@@ -823,8 +823,18 @@ pub fn get_new_version() -> String {
 }
 
 #[inline]
+/// The version the About page shows: the release a variant build is a test of
+/// (`res/release-version`, written by `res/custom/apply.sh`), the crate's version otherwise. Only
+/// shown: what peers and the server compare is `crate::VERSION`.
 pub fn get_version() -> String {
-    crate::VERSION.to_owned()
+    shown_version(include_str!("../res/release-version"))
+}
+
+fn shown_version(release: &str) -> String {
+    match release.trim() {
+        "" => crate::VERSION.to_owned(),
+        release => release.to_owned(),
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
@@ -1803,6 +1813,13 @@ mod tests {
         get_async_http_status, http_request, test_if_valid_server,
         validate_windows_service_video_save_directory,
     };
+
+    #[test]
+    fn the_about_page_shows_the_release_a_build_is_for() {
+        assert_eq!(super::shown_version("1.5.1-6"), "1.5.1-6");
+        assert_eq!(super::shown_version("1.5.1-6\n"), "1.5.1-6");
+        assert_eq!(super::shown_version(""), crate::VERSION);
+    }
 
     /// A request Flutter sends through Rust: its key's fragment is not sent, and its result is
     /// there to read once.

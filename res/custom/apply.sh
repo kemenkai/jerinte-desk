@@ -205,4 +205,11 @@ if env:
     with open(env, "a", encoding="utf-8") as f:
         f.write("CUSTOM_VARIANT=1\n")
 EOF
+# The release this build is a test of, for the About page: flutter-ci.yml uploads to a draft named
+# v<release>-test.<run>-<variant>. Only shown; the crate's version stays what compatibility checks
+# compare, and a build uploaded elsewhere shows it as before.
+if [[ "${TAG_NAME:-}" =~ ^v([0-9][0-9.]*-[0-9]+)-test\.[0-9]+- ]]; then
+  printf '%s' "${BASH_REMATCH[1]}" > res/release-version
+  echo "Release version ${BASH_REMATCH[1]}"
+fi
 echo "Applied custom client variant $variant${base:+ (extends $base)}"
