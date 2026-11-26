@@ -230,7 +230,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Wrong credentials", "登入資訊錯誤"),
         ("The verification code is incorrect or has expired", "驗證碼錯誤或已過期"),
         ("Edit Tag", "編輯標籤"),
-        ("Forget Password", "忘記密碼"),
+        ("Forget Password", "清除已儲存的密碼"),
         ("Favorites", "我的最愛"),
         ("Add to Favorites", "加入我的最愛"),
         ("Remove from Favorites", "從我的最愛中移除"),
@@ -843,5 +843,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("quality-30-fps", "，30 幀"),
         ("quality-needs-direct-tip", "需要直連，目前連線經過中繼"),
         ("quality-needs-new-peer-tip", "被控端版本較舊，經中繼時無法使用"),
+        ("Request approval", "請求批准"),
+        ("Forever", "永久"),
     ].iter().cloned().collect();
 }
