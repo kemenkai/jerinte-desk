@@ -502,8 +502,7 @@ lazy_static::lazy_static! {
     };
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     // Fork: the mouse buttons this process pressed, and the releases not done with
-    // (src/mouse_buttons.rs). When both are held, `ENIGO` is taken first. At exit the guard is
-    // read and released before `ENIGO` is taken.
+    // (src/mouse_buttons.rs). When both are held, `ENIGO` is taken first.
     static ref MOUSE_GUARD: (Mutex<crate::mouse_buttons::Guard>, std::sync::Condvar) = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
@@ -1296,9 +1295,10 @@ fn press_mouse_button(en: &mut Enigo, button: i32) {
     let Some(b) = enigo_mouse_button(button) else {
         return;
     };
-    allow_err!(en.mouse_down(b));
-    // Whether it went in or not: a press not known to have failed is a button to release.
+    // Before it is injected, for an exit that comes between the two to see it. Whether it goes
+    // in or not: a press not known to have failed is a button to release.
     MOUSE_GUARD.0.lock().unwrap().pressed(button);
+    allow_err!(en.mouse_down(b));
 }
 
 /// Fork: a release is followed up until the button is up (src/mouse_buttons.rs).
@@ -1429,18 +1429,21 @@ fn follow_up_mouse_releases() {
 
 /// The process exits: no button it pressed stays down.
 fn release_mouse_buttons_at_exit() {
-    let down = MOUSE_GUARD.0.lock().unwrap().unsettled();
-    if down == 0 {
+    // Without `ENIGO`, which a process that never injected has not made yet.
+    if MOUSE_GUARD.0.lock().unwrap().unsettled() == 0 {
         return;
     }
-    log::info!(
-        "releasing the mouse buttons still down at exit: {}",
-        crate::mouse_buttons::names(down)
-    );
     let func = move || {
         #[cfg(windows)]
         crate::platform::windows::try_change_desktop();
+        // Read again under `ENIGO`: an input thread that was injecting has finished, and no
+        // other starts (`EXITING` is looked at under it).
         let mut en = ENIGO.lock().unwrap();
+        let down = MOUSE_GUARD.0.lock().unwrap().unsettled();
+        log::info!(
+            "releasing the mouse buttons still down at exit: {}",
+            crate::mouse_buttons::names(down)
+        );
         for button in crate::mouse_buttons::BUTTONS {
             if let Some(b) = enigo_mouse_button(button).filter(|_| down & button != 0) {
                 en.mouse_up(b);
@@ -1448,7 +1451,18 @@ fn release_mouse_buttons_at_exit() {
         }
     };
     #[cfg(target_os = "macos")]
-    QUEUE.exec_async(func);
+    {
+        // Injected on the main queue, and the caller exits the process next: wait for it, but
+        // not for ever (the main queue may not be running, or this may be its thread).
+        let (done, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        QUEUE.exec_async(move || {
+            func();
+            done.send(()).ok();
+        });
+        if wait.recv_timeout(Duration::from_millis(200)).is_err() {
+            log::warn!("the mouse buttons were not released before the exit");
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     func();
 }
@@ -1475,6 +1489,10 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     let buttons = evt.mask >> 3;
     let evt_type = evt.mask & MOUSE_TYPE_MASK;
     let mut en = ENIGO.lock().unwrap();
+    // Again, under `ENIGO`: the exit releases the buttons under it, and nothing is pressed after.
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     en.set_ignore_flags(enigo_ignore_flags());
     #[cfg(not(target_os = "macos"))]
