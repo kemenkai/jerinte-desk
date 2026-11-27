@@ -502,8 +502,9 @@ lazy_static::lazy_static! {
     };
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
     // Fork: the mouse buttons this process pressed, and the releases not done with
-    // (src/mouse_buttons.rs). Locked after `ENIGO` wherever both are held.
-    static ref MOUSE_GUARD: Arc<(Mutex<crate::mouse_buttons::Guard>, std::sync::Condvar)> = Default::default();
+    // (src/mouse_buttons.rs). When both are held, `ENIGO` is taken first. At exit the guard is
+    // read and released before `ENIGO` is taken.
+    static ref MOUSE_GUARD: (Mutex<crate::mouse_buttons::Guard>, std::sync::Condvar) = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
     // Track connections that are currently using relative mouse movement.
@@ -1356,6 +1357,14 @@ fn log_mouse_release(button: i32, outcome: &crate::mouse_buttons::Outcome, err: 
             warn,
             "mouse button still down after up: button={button}, left alone"
         ),
+        // Once for a release: not throttled.
+        Outcome::FailedGivenUp { tries } => log::warn!(
+            "mouse button up failed: button={button} err={} tries={tries}, given up",
+            err.unwrap_or_default()
+        ),
+        Outcome::CouldNotRead => {
+            log::warn!("mouse button state could not be read after up: button={button}")
+        }
     }
 }
 
@@ -1364,7 +1373,7 @@ fn log_mouse_release(button: i32, outcome: &crate::mouse_buttons::Outcome, err: 
 #[cfg(windows)]
 fn follow_up_mouse_releases() {
     use crate::mouse_buttons::{Outcome, Todo};
-    let (guard, wake) = &**MOUSE_GUARD;
+    let (guard, wake) = &*MOUSE_GUARD;
     loop {
         {
             let mut g = guard.lock().unwrap();
@@ -1384,6 +1393,8 @@ fn follow_up_mouse_releases() {
         // pending and injecting it.
         let mut en = ENIGO.lock().unwrap();
         crate::platform::windows::try_change_desktop();
+        // Not on the input desktop, the system answers "up" for every button.
+        let on_input_desktop = !crate::platform::windows::desktop_changed();
         let mut g = guard.lock().unwrap();
         let now = std::time::Instant::now();
         for (button, todo) in g.due(now) {
@@ -1397,6 +1408,11 @@ fn follow_up_mouse_releases() {
                     log_mouse_release(button, &outcome, res.err());
                 }
                 Todo::Look => {
+                    if !on_input_desktop {
+                        let outcome = g.look_unknown(button, now);
+                        log_mouse_release(button, &outcome, None);
+                        continue;
+                    }
                     let down = Enigo::mouse_button_down(b).unwrap_or(false);
                     let outcome = g.looked(button, down, now);
                     if matches!(outcome, Outcome::StillDown { .. }) {
@@ -1413,7 +1429,7 @@ fn follow_up_mouse_releases() {
 
 /// The process exits: no button it pressed stays down.
 fn release_mouse_buttons_at_exit() {
-    let down = MOUSE_GUARD.0.lock().unwrap().down();
+    let down = MOUSE_GUARD.0.lock().unwrap().unsettled();
     if down == 0 {
         return;
     }
@@ -1422,6 +1438,8 @@ fn release_mouse_buttons_at_exit() {
         crate::mouse_buttons::names(down)
     );
     let func = move || {
+        #[cfg(windows)]
+        crate::platform::windows::try_change_desktop();
         let mut en = ENIGO.lock().unwrap();
         for button in crate::mouse_buttons::BUTTONS {
             if let Some(b) = enigo_mouse_button(button).filter(|_| down & button != 0) {

@@ -8,11 +8,14 @@
 //!   connection ended before it. [`Held`], one for a connection, knows the buttons its peer
 //!   holds: their release goes in whatever the permission says, and they are let go when the
 //!   permission or the connection goes.
-//! - It does not go into the input stream. [`Guard`], in the process that injects, tries it
-//!   again until it does.
-//! - It goes in and takes no effect (another program's hook swallowing it, the input desktop
-//!   changed between the press and the release). [`Guard`] looks at the state the system has
-//!   the button in and injects the release again, twice at most.
+//! - On Windows, it does not go into the input stream, or goes in and takes no effect (another
+//!   program's hook swallowing it, the input desktop changed between the press and the release).
+//!   [`Guard`] retries the release and looks at the button state. Checking and retrying a release
+//!   is done on Windows only; elsewhere, it only remembers what is down, for the release at exit.
+//!
+//! A look that finds the button down releases it again even if the local user pressed it within
+//! those milliseconds. A press injected by one process and released by another (the portable
+//! service starting or stopping in between) is settled only when the first process exits.
 //!
 //! What is not here: the controlling side saying which buttons it holds, with a timeout on this
 //! side. Nothing it sent is lost on the way, a controlling side that is gone ends the
@@ -114,6 +117,8 @@ const LOOKS: [Duration; 3] = [
 /// A release that did not go in is tried again after this, doubling up to `SLOWEST`.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
 const SLOWEST: Duration = Duration::from_millis(1000);
+/// How long a release that did not go in is retried.
+const RELEASE_RETRY_LIMIT: Duration = Duration::from_secs(30);
 
 /// What the injecting process still has to do about the release of one button.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,6 +135,7 @@ struct Pending {
     /// Releases that did not go in (`Inject`), or injected again after a look (`Look`).
     tries: u32,
     due: Instant,
+    failed_since: Option<Instant>,
 }
 
 /// The injecting process: the buttons it pressed, and the releases not done with.
@@ -153,6 +159,10 @@ pub enum Outcome {
     /// Still down after every release injected again: left alone, someone at the machine may be
     /// holding the button.
     GivenUp,
+    /// The release kept failing for the retry limit.
+    FailedGivenUp { tries: u32 },
+    /// The input desktop could not be read before all looks were used.
+    CouldNotRead,
 }
 
 fn index(button: i32) -> Option<usize> {
@@ -180,6 +190,7 @@ impl Guard {
                 todo: Todo::Look,
                 tries: 0,
                 due: now + LOOKS[0],
+                failed_since: None,
             });
             Outcome::Quiet
         } else {
@@ -187,6 +198,7 @@ impl Guard {
                 todo: Todo::Inject,
                 tries: 1,
                 due: now + FIRST_RETRY,
+                failed_since: Some(now),
             });
             Outcome::Failing { tries: 1 }
         }
@@ -218,15 +230,23 @@ impl Guard {
             self.released(button, true, look, now);
             Outcome::Recovered { tries: p.tries }
         } else {
+            let tries = p.tries + 1;
+            let failing_for = p.failed_since.map(|since| now.duration_since(since));
+            if failing_for.is_some_and(|d| d >= RELEASE_RETRY_LIMIT) {
+                // The button stays in `down`: the exit releases it once more.
+                self.pending[i] = None;
+                return Outcome::FailedGivenUp { tries };
+            }
             let wait = FIRST_RETRY
                 .checked_mul(1 << p.tries.min(8))
                 .map_or(SLOWEST, |w| w.min(SLOWEST));
             self.pending[i] = Some(Pending {
                 todo: Todo::Inject,
-                tries: p.tries + 1,
+                tries,
                 due: now + wait,
+                failed_since: p.failed_since,
             });
-            Outcome::Failing { tries: p.tries + 1 }
+            Outcome::Failing { tries }
         }
     }
 
@@ -250,6 +270,7 @@ impl Guard {
                     todo: Todo::Look,
                     tries,
                     due: now + *wait,
+                    failed_since: None,
                 });
                 Outcome::StillDown { tries }
             }
@@ -260,9 +281,45 @@ impl Guard {
         }
     }
 
-    /// The buttons pressed and not released, to release when the process exits.
+    /// A look could not read the button because the calling thread was not on the input desktop.
+    pub fn look_unknown(&mut self, button: i32, now: Instant) -> Outcome {
+        let Some(i) = index(button) else {
+            return Outcome::Quiet;
+        };
+        let Some(p) = self.pending[i].filter(|p| p.todo == Todo::Look) else {
+            return Outcome::Quiet;
+        };
+        let tries = p.tries + 1;
+        match LOOKS.get(tries as usize) {
+            Some(wait) => {
+                self.pending[i] = Some(Pending {
+                    todo: Todo::Look,
+                    tries,
+                    due: now + *wait,
+                    failed_since: None,
+                });
+                Outcome::Quiet
+            }
+            None => {
+                self.pending[i] = None;
+                Outcome::CouldNotRead
+            }
+        }
+    }
+
+    /// The buttons pressed and not released.
+    #[cfg(test)]
     pub fn down(&self) -> i32 {
         self.down
+    }
+
+    /// Buttons still down or with pending work, to release when the process exits.
+    pub fn unsettled(&self) -> i32 {
+        self.pending
+            .iter()
+            .zip(BUTTONS)
+            .filter_map(|(pending, button)| pending.is_some().then_some(button))
+            .fold(self.down, |buttons, button| buttons | button)
     }
 }
 
@@ -323,8 +380,11 @@ mod tests {
 
     #[test]
     fn a_release_is_the_event_of_one_button_going_up() {
-        let up = release_of(R);
-        assert_eq!((kind(&up), buttons(&up), up.x, up.y), (MOUSE_TYPE_UP, R, 0, 0));
+        for button in BUTTONS {
+            let up = release_of(button);
+            assert_eq!(up.mask, MOUSE_TYPE_UP | button << 3);
+            assert_eq!((kind(&up), buttons(&up), up.x, up.y), (MOUSE_TYPE_UP, button, 0, 0));
+        }
     }
 
     #[test]
@@ -349,6 +409,43 @@ mod tests {
         assert_eq!(g.injected(L, true, true, now), Outcome::Recovered { tries: 7 });
         assert_eq!(g.down(), 0);
         assert_eq!(g.due(now + LOOKS[0]), vec![(L, Todo::Look)]);
+    }
+
+    #[test]
+    fn a_press_cancels_a_release_that_is_failing() {
+        let t = Instant::now();
+        let mut g = Guard::default();
+        g.pressed(L);
+        assert_eq!(g.released(L, false, true, t), Outcome::Failing { tries: 1 });
+        g.pressed(L);
+        assert_eq!(g.down(), L);
+        assert_eq!(g.unsettled(), L);
+        assert_eq!(g.next_due(), None);
+    }
+
+    #[test]
+    fn a_failing_release_is_given_up_after_thirty_seconds() {
+        let t = Instant::now();
+        let mut g = Guard::default();
+        g.pressed(L);
+        assert_eq!(g.released(L, false, true, t), Outcome::Failing { tries: 1 });
+        let mut now = t;
+        let mut outcome = Outcome::Quiet;
+        // At most one try a second once the retries have slowed down: well under 100 of them.
+        for _ in 0..100 {
+            now = g.next_due().unwrap();
+            assert_eq!(g.due(now), vec![(L, Todo::Inject)]);
+            outcome = g.injected(L, false, true, now);
+            if !matches!(outcome, Outcome::Failing { .. }) {
+                break;
+            }
+        }
+        assert!(matches!(outcome, Outcome::FailedGivenUp { .. }));
+        let failed_for = now.duration_since(t);
+        assert!(failed_for >= RELEASE_RETRY_LIMIT && failed_for < RELEASE_RETRY_LIMIT + SLOWEST);
+        assert_eq!(g.down(), L);
+        assert_eq!(g.unsettled(), L);
+        assert_eq!(g.next_due(), None);
     }
 
     #[test]
@@ -383,6 +480,36 @@ mod tests {
         g.pressed(R);
         g.released(R, true, false, t);
         assert_eq!(g.next_due(), None);
+    }
+
+    #[test]
+    fn unknown_looks_advance_without_reinjecting_and_drop_after_the_last_look() {
+        let t = Instant::now();
+        let mut g = Guard::default();
+        g.pressed(L);
+        g.released(L, true, true, t);
+        assert_eq!(g.unsettled(), L);
+        let mut now = t + LOOKS[0];
+        assert_eq!(g.due(now), vec![(L, Todo::Look)]);
+        assert_eq!(g.look_unknown(L, now), Outcome::Quiet);
+        assert_eq!(g.due(now), vec![]);
+        now += LOOKS[1];
+        assert_eq!(g.due(now), vec![(L, Todo::Look)]);
+        assert_eq!(g.look_unknown(L, now), Outcome::Quiet);
+        now += LOOKS[2];
+        assert_eq!(g.due(now), vec![(L, Todo::Look)]);
+        assert_eq!(g.look_unknown(L, now), Outcome::CouldNotRead);
+        assert_eq!(g.next_due(), None);
+    }
+
+    #[test]
+    fn unsettled_includes_a_button_whose_look_is_pending() {
+        let t = Instant::now();
+        let mut g = Guard::default();
+        g.pressed(L);
+        g.released(L, true, true, t);
+        assert_eq!(g.down(), 0);
+        assert_eq!(g.unsettled(), L);
     }
 
     // The second press of a double click comes before the look at the first release.
