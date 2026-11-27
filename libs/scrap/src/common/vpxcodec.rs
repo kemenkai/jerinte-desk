@@ -43,6 +43,36 @@ impl Default for VpxVideoCodecId {
     }
 }
 
+/// Fork: the coarsest quantizer the encoder may use, whatever the quality. With the bound
+/// `calc_q_values` gives (37 at the higher qualities, about 44 to 50 once the bitrate is brought
+/// down), a picture that changes everywhere at every frame (a page scrolled fast) cannot be made
+/// as small as a narrow path needs: the encoder drops frames instead, the next frame is then further
+/// from the last and bigger still, and over a relay capped at 3 Mbit/s it settled at 1 to 3 frames a
+/// second. Allowed down to 63 it lowers the quality and keeps the frames (720p: 2.3 -> 27 frames a
+/// second, the text still readable). With enough bitrate the encoder does not go there: the bound
+/// is not the quantizer it picks.
+const MAX_QUANTIZER: u32 = 63;
+
+/// Fork: the longest time from one frame to the next the encoder is told. libvpx sizes a frame by
+/// the time since the one before it (the frame rate it derives from the timestamps). When frames
+/// come late because the sender held them back, or the encoder dropped some, it makes the next one
+/// bigger, which makes it later still: at 1080p, even with `MAX_QUANTIZER`, the frame rate fell
+/// from 21 to 2 and stayed there. Told no more than this, a late frame gets the share of one frame
+/// at thirty a second (the slowest pace a software encoder is held to, `SLOWEST_PACE` of the video
+/// service), and the frame rate stays up (1080p over a 3 Mbit/s relay: 1.0 -> 24.5 frames a
+/// second). Shorter gaps are told as they are.
+const LONGEST_STEP_MS: i64 = 1000 / 30;
+
+/// The time told to the encoder for a frame at `ms`, given the frame before it (`last`: its real
+/// time and the time it was told): the time since, at least a millisecond (libvpx ignores a step of
+/// none) and at most `LONGEST_STEP_MS`.
+fn told_time(last: Option<(i64, i64)>, ms: i64) -> i64 {
+    match last {
+        Some((last_ms, last_told)) => last_told + (ms - last_ms).clamp(1, LONGEST_STEP_MS),
+        None => ms,
+    }
+}
+
 pub struct VpxEncoder {
     ctx: vpx_codec_ctx_t,
     width: usize,
@@ -50,6 +80,8 @@ pub struct VpxEncoder {
     id: VpxVideoCodecId,
     i444: bool,
     yuvfmt: EncodeYuvFormat,
+    /// The real time of the last frame and the time the encoder was told for it (`told_time`).
+    last_time: Option<(i64, i64)>,
 }
 
 pub struct VpxDecoder {
@@ -102,9 +134,9 @@ impl EncoderApi for VpxEncoder {
                     c.kf_mode = vpx_kf_mode::VPX_KF_DISABLED; // reduce bandwidth a lot
                 }
 
-                let (q_min, q_max) = Self::calc_q_values(config.quality);
+                let (q_min, _) = Self::calc_q_values(config.quality);
                 c.rc_min_quantizer = q_min;
-                c.rc_max_quantizer = q_max;
+                c.rc_max_quantizer = MAX_QUANTIZER;
                 c.rc_target_bitrate =
                     Self::bitrate(config.width as _, config.height as _, config.quality);
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp9/common/vp9_enums.h#29
@@ -184,6 +216,7 @@ impl EncoderApi for VpxEncoder {
                     id: config.codec,
                     i444,
                     yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
+                    last_time: None,
                 })
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -191,15 +224,18 @@ impl EncoderApi for VpxEncoder {
     }
 
     fn encode_to_message(&mut self, input: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
+        let told = told_time(self.last_time, ms);
         let mut frames = Vec::new();
         for ref frame in self
-            .encode(ms, input.yuv()?, STRIDE_ALIGN)
+            .encode(told, input.yuv()?, STRIDE_ALIGN)
             .with_context(|| "Failed to encode")?
         {
-            frames.push(VpxEncoder::create_frame(frame));
+            frames.push(VpxEncoder::create_frame(frame, ms));
         }
+        // Whether it went in or not: the next frame is told the time since this one.
+        self.last_time = Some((ms, told));
         for ref frame in self.flush().with_context(|| "Failed to flush")? {
-            frames.push(VpxEncoder::create_frame(frame));
+            frames.push(VpxEncoder::create_frame(frame, ms));
         }
 
         // to-do: flush periodically, e.g. 1 second
@@ -221,9 +257,9 @@ impl EncoderApi for VpxEncoder {
 
     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
         let mut c = unsafe { *self.ctx.config.enc.to_owned() };
-        let (q_min, q_max) = Self::calc_q_values(ratio);
+        let (q_min, _) = Self::calc_q_values(ratio);
         c.rc_min_quantizer = q_min;
-        c.rc_max_quantizer = q_max;
+        c.rc_max_quantizer = MAX_QUANTIZER;
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
         call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
@@ -321,11 +357,12 @@ impl VpxEncoder {
     }
 
     #[inline]
-    fn create_frame(frame: &EncodeFrame) -> EncodedVideoFrame {
+    /// The frame goes out with its real time `ms`, not the one the encoder was told.
+    fn create_frame(frame: &EncodeFrame, ms: i64) -> EncodedVideoFrame {
         EncodedVideoFrame {
             data: Bytes::from(frame.data.to_vec()),
             key: frame.key,
-            pts: frame.pts,
+            pts: ms,
             ..Default::default()
         }
     }
@@ -614,3 +651,52 @@ impl Drop for Image {
 }
 
 unsafe impl Send for vpx_codec_ctx_t {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_frame_is_told_its_own_time() {
+        assert_eq!(told_time(None, 0), 0);
+        assert_eq!(told_time(None, 1234), 1234);
+    }
+
+    #[test]
+    fn a_short_step_is_told_as_it_is() {
+        assert_eq!(told_time(Some((100, 100)), 116), 116);
+        assert_eq!(told_time(Some((100, 40)), 133), 73);
+    }
+
+    #[test]
+    fn a_long_step_is_told_as_one_frame_at_thirty_a_second() {
+        assert_eq!(told_time(Some((100, 100)), 600), 100 + LONGEST_STEP_MS);
+        assert_eq!(told_time(Some((100, 100)), 100 + LONGEST_STEP_MS + 1), 100 + LONGEST_STEP_MS);
+    }
+
+    #[test]
+    fn the_told_time_always_moves_on() {
+        // The same millisecond twice (a frame encoded again), or a clock that went back.
+        assert_eq!(told_time(Some((100, 50)), 100), 51);
+        assert_eq!(told_time(Some((100, 50)), 90), 51);
+        let mut last = None;
+        let mut told = Vec::new();
+        for ms in [0, 0, 16, 500, 501, 501, 2000] {
+            let t = told_time(last, ms);
+            last = Some((ms, t));
+            told.push(t);
+        }
+        let l = LONGEST_STEP_MS;
+        assert_eq!(told, vec![0, 1, 17, 17 + l, 18 + l, 19 + l, 19 + 2 * l]);
+    }
+
+    #[test]
+    fn the_quantizer_bound_is_the_coarsest_libvpx_has() {
+        assert_eq!(MAX_QUANTIZER, 63);
+        // The finest the quality asks for stays under it at every quality.
+        for ratio in [0.1, 0.5, 1.0, 2.0, 3.0] {
+            let (q_min, _) = VpxEncoder::calc_q_values(ratio);
+            assert!(q_min < MAX_QUANTIZER);
+        }
+    }
+}
