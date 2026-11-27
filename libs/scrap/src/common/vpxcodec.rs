@@ -20,7 +20,8 @@ use std::{ptr, slice};
 generate_call_macro!(call_vpx, false);
 
 // EXPERIMENT, not to be merged: knobs of the VP9 encoder, from the environment variable RD_VP9X
-// ("drop=0,screen=1,ptsmax=66,qmax=63,inter=300,aq=3,resize=1"), to tell on a real machine what
+// ("drop=0,screen=1,ptsmax=66,dur=1,qmax=63,inter=300,intra=300,aq=3,resize=1,lag=0,errres=0,
+// overshoot=0,undershoot=50,postdrop=1"), to tell on a real machine what
 // keeps the frame rate up when frames cannot get smaller.
 fn xknob(name: &str) -> Option<i64> {
     static KNOBS: std::sync::OnceLock<Vec<(String, i64)>> = std::sync::OnceLock::new();
@@ -119,6 +120,18 @@ impl EncoderApi for VpxEncoder {
                 if xknob("resize") == Some(1) {
                     c.rc_resize_allowed = 1;
                 }
+                if let Some(lag) = xknob("lag") {
+                    c.g_lag_in_frames = lag as _;
+                }
+                if xknob("errres") == Some(0) {
+                    c.g_error_resilient = 0;
+                }
+                if let Some(pct) = xknob("overshoot") {
+                    c.rc_overshoot_pct = pct as _;
+                }
+                if let Some(pct) = xknob("undershoot") {
+                    c.rc_undershoot_pct = pct as _;
+                }
                 c.g_threads = codec_thread_num(64) as _;
                 c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
                 // https://developers.google.com/media/vp9/bitrate-modes/
@@ -213,6 +226,20 @@ impl EncoderApi for VpxEncoder {
                             &mut ctx,
                             VP9E_SET_MAX_INTER_BITRATE_PCT as _,
                             pct as c_uint
+                        ));
+                    }
+                    if let Some(pct) = xknob("intra") {
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP8E_SET_MAX_INTRA_BITRATE_PCT as _,
+                            pct as c_uint
+                        ));
+                    }
+                    if xknob("postdrop") == Some(1) {
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP9E_SET_POSTENCODE_DROP as _,
+                            1 as c_uint
                         ));
                     }
                     if let Some(aq) = xknob("aq") {
@@ -332,19 +359,27 @@ impl VpxEncoder {
 
         // EXPERIMENT: the encoder sizes a frame by the time since the last one. Told no more than
         // `ptsmax` milliseconds have passed, a frame held back by pacing is not made bigger.
-        let pts = match xknob("ptsmax") {
+        // `dur=1`: the frame is said to last as long as the time told since the last one, where
+        // it was always said to last one millisecond.
+        let (pts, duration) = match xknob("ptsmax") {
             Some(max) => {
-                self.told_pts += (pts - self.last_real_pts).clamp(1, max.max(1));
+                let step = (pts - self.last_real_pts).clamp(1, max.max(1));
+                let start = self.told_pts;
+                self.told_pts += step;
                 self.last_real_pts = pts;
-                self.told_pts
+                if xknob("dur") == Some(1) {
+                    (start, step)
+                } else {
+                    (self.told_pts, 1)
+                }
             }
-            None => pts,
+            None => (pts, 1),
         };
         call_vpx!(vpx_codec_encode(
             &mut self.ctx,
             &image,
             pts as _,
-            1, // Duration
+            duration as _,
             0, // Flags
             VPX_DL_REALTIME as _,
         ));
