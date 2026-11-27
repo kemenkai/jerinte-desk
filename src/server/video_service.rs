@@ -1740,6 +1740,8 @@ fn check_qos(
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     *spf = video_qos.spf();
+    let interval = frame_interval(*spf, encoder.is_hardware());
+    encoder.set_frame_interval(interval);
     // Fork: a hardware encoder keeps to its bitrate, and is not paced.
     set_pace(video_qos.pace_kbps().filter(|_| !encoder.is_hardware()));
     if *ratio != video_qos.ratio() {

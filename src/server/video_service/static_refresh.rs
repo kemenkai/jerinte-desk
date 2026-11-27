@@ -236,6 +236,12 @@ impl<'a> StaticRefresh<'a> {
                 Ok(())
             })?;
 
+            // Fork: these frames are meant to come this far apart (an encoder that follows the
+            // time between frames is told up to it, src/server/video_service.rs sets the stream's
+            // own again before the next frame).
+            if matches!(self.codec_format, CodecFormat::VP8 | CodecFormat::VP9) {
+                encoder.set_frame_interval(INITIAL_REPEAT_INTERVAL.max(spf));
+            }
             let result = encoder.encode_to_message(frame, ms);
             self.last_encode = if matches!(self.codec_format, CodecFormat::VP8 | CodecFormat::VP9) {
                 Instant::now()

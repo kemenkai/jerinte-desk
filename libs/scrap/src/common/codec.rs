@@ -89,6 +89,12 @@ pub trait EncoderApi {
     fn set_fps(&mut self, fps: u32) -> ResultType<u32> {
         Ok(fps)
     }
+
+    /// Fork: the time from one frame to the next the stream is now meant to run at. An encoder
+    /// whose rate control follows the time between frames (VP8/VP9) is told no longer a time than
+    /// this: frames that come later are late (held back, dropped), and are not to be made bigger
+    /// for it.
+    fn set_frame_interval(&mut self, _interval: std::time::Duration) {}
 }
 
 /// Fork: an encoder whose rate control was created for `created_fps` frames a second is set to no
