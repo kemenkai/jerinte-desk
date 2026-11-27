@@ -18,6 +18,29 @@ use std::os::raw::{c_int, c_uint};
 use std::{ptr, slice};
 
 generate_call_macro!(call_vpx, false);
+
+// EXPERIMENT, not to be merged: knobs of the VP9 encoder, from the environment variable RD_VP9X
+// ("drop=0,screen=1,ptsmax=66,qmax=63,inter=300,aq=3,resize=1"), to tell on a real machine what
+// keeps the frame rate up when frames cannot get smaller.
+fn xknob(name: &str) -> Option<i64> {
+    static KNOBS: std::sync::OnceLock<Vec<(String, i64)>> = std::sync::OnceLock::new();
+    KNOBS
+        .get_or_init(|| {
+            let knobs: Vec<(String, i64)> = std::env::var("RD_VP9X")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.trim().to_owned(), v.trim().parse().ok()?))
+                })
+                .collect();
+            log::info!("VP9 experiment knobs: {:?}", knobs);
+            knobs
+        })
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| *v)
+}
 generate_call_ptr_macro!(call_vpx_ptr);
 
 #[derive(Debug)]
@@ -50,6 +73,9 @@ pub struct VpxEncoder {
     id: VpxVideoCodecId,
     i444: bool,
     yuvfmt: EncodeYuvFormat,
+    // EXPERIMENT: the time the encoder is told, when it is not the real one (`ptsmax`).
+    last_real_pts: i64,
+    told_pts: i64,
 }
 
 pub struct VpxDecoder {
@@ -89,7 +115,10 @@ impl EncoderApi for VpxEncoder {
                 c.rc_buf_sz = 1000;
                 // When the data buffer falls below this percentage of fullness, a dropped frame is indicated. Set the threshold to zero (0) to disable this feature.
                 // In dynamic scenes, low bitrate gets low fps while high bitrate gets high fps.
-                c.rc_dropframe_thresh = 25;
+                c.rc_dropframe_thresh = xknob("drop").unwrap_or(25) as _;
+                if xknob("resize") == Some(1) {
+                    c.rc_resize_allowed = 1;
+                }
                 c.g_threads = codec_thread_num(64) as _;
                 c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
                 // https://developers.google.com/media/vp9/bitrate-modes/
@@ -104,7 +133,7 @@ impl EncoderApi for VpxEncoder {
 
                 let (q_min, q_max) = Self::calc_q_values(config.quality);
                 c.rc_min_quantizer = q_min;
-                c.rc_max_quantizer = q_max;
+                c.rc_max_quantizer = xknob("qmax").map_or(q_max, |q| q as u32);
                 c.rc_target_bitrate =
                     Self::bitrate(config.width as _, config.height as _, config.quality);
                 // https://chromium.googlesource.com/webm/libvpx/+/refs/heads/main/vp9/common/vp9_enums.h#29
@@ -171,6 +200,28 @@ impl EncoderApi for VpxEncoder {
                         VP9E_SET_TILE_COLUMNS as _,
                         4 as c_int
                     ));
+                    if xknob("screen") == Some(1) {
+                        // VP9E_CONTENT_SCREEN
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP9E_SET_TUNE_CONTENT as _,
+                            1 as c_int
+                        ));
+                    }
+                    if let Some(pct) = xknob("inter") {
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP9E_SET_MAX_INTER_BITRATE_PCT as _,
+                            pct as c_uint
+                        ));
+                    }
+                    if let Some(aq) = xknob("aq") {
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP9E_SET_AQ_MODE as _,
+                            aq as c_uint
+                        ));
+                    }
                 } else if config.codec == VpxVideoCodecId::VP8 {
                     // https://github.com/webmproject/libvpx/blob/972149cafeb71d6f08df89e91a0130d6a38c4b15/vpx/vp8cx.h#L172
                     // https://groups.google.com/a/webmproject.org/g/webm-discuss/c/DJhSrmfQ61M
@@ -184,6 +235,8 @@ impl EncoderApi for VpxEncoder {
                     id: config.codec,
                     i444,
                     yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
+                    last_real_pts: 0,
+                    told_pts: 0,
                 })
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -196,10 +249,16 @@ impl EncoderApi for VpxEncoder {
             .encode(ms, input.yuv()?, STRIDE_ALIGN)
             .with_context(|| "Failed to encode")?
         {
-            frames.push(VpxEncoder::create_frame(frame));
+            let mut frame = VpxEncoder::create_frame(frame);
+            // EXPERIMENT: the real time goes out, whatever the encoder was told.
+            frame.pts = ms;
+            frames.push(frame);
         }
         for ref frame in self.flush().with_context(|| "Failed to flush")? {
-            frames.push(VpxEncoder::create_frame(frame));
+            let mut frame = VpxEncoder::create_frame(frame);
+            // EXPERIMENT: the real time goes out, whatever the encoder was told.
+            frame.pts = ms;
+            frames.push(frame);
         }
 
         // to-do: flush periodically, e.g. 1 second
@@ -223,7 +282,7 @@ impl EncoderApi for VpxEncoder {
         let mut c = unsafe { *self.ctx.config.enc.to_owned() };
         let (q_min, q_max) = Self::calc_q_values(ratio);
         c.rc_min_quantizer = q_min;
-        c.rc_max_quantizer = q_max;
+        c.rc_max_quantizer = xknob("qmax").map_or(q_max, |q| q as u32);
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
         call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
@@ -271,6 +330,16 @@ impl VpxEncoder {
             data.as_ptr() as _,
         ));
 
+        // EXPERIMENT: the encoder sizes a frame by the time since the last one. Told no more than
+        // `ptsmax` milliseconds have passed, a frame held back by pacing is not made bigger.
+        let pts = match xknob("ptsmax") {
+            Some(max) => {
+                self.told_pts += (pts - self.last_real_pts).clamp(1, max.max(1));
+                self.last_real_pts = pts;
+                self.told_pts
+            }
+            None => pts,
+        };
         call_vpx!(vpx_codec_encode(
             &mut self.ctx,
             &image,
