@@ -89,3 +89,6 @@ pub mod virtual_display_manager;
 pub mod vdisplay;
 
 mod kcp_stream;
+
+// Fork: a mouse button pressed on the controlled side comes up again.
+mod mouse_buttons;

@@ -501,6 +501,9 @@ lazy_static::lazy_static! {
         Arc::new(Mutex::new(Enigo::new()))
     };
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
+    // Fork: the mouse buttons this process pressed, and the releases not done with
+    // (src/mouse_buttons.rs). Locked after `ENIGO` wherever both are held.
+    static ref MOUSE_GUARD: Arc<(Mutex<crate::mouse_buttons::Guard>, std::sync::Condvar)> = Default::default();
     static ref LATEST_PEER_INPUT_CURSOR: Arc<Mutex<Input>> = Default::default();
     static ref LATEST_SYS_CURSOR_POS: Arc<Mutex<(Option<Instant>, (i32, i32))>> = Arc::new(Mutex::new((None, (INVALID_CURSOR_POS, INVALID_CURSOR_POS))));
     // Track connections that are currently using relative mouse movement.
@@ -948,6 +951,7 @@ pub fn fix_key_down_timeout_at_exit() {
     }
     EXITING.store(true, Ordering::SeqCst);
     fix_key_down_timeout(true);
+    release_mouse_buttons_at_exit();
     log::info!("fix_key_down_timeout_at_exit");
 }
 
@@ -1276,6 +1280,161 @@ pub fn handle_mouse_(
     }
 }
 
+fn enigo_mouse_button(button: i32) -> Option<MouseButton> {
+    Some(match button {
+        MOUSE_BUTTON_LEFT => MouseButton::Left,
+        MOUSE_BUTTON_RIGHT => MouseButton::Right,
+        MOUSE_BUTTON_WHEEL => MouseButton::Middle,
+        MOUSE_BUTTON_BACK => MouseButton::Back,
+        MOUSE_BUTTON_FORWARD => MouseButton::Forward,
+        _ => return None,
+    })
+}
+
+fn press_mouse_button(en: &mut Enigo, button: i32) {
+    let Some(b) = enigo_mouse_button(button) else {
+        return;
+    };
+    allow_err!(en.mouse_down(b));
+    // Whether it went in or not: a press not known to have failed is a button to release.
+    MOUSE_GUARD.0.lock().unwrap().pressed(button);
+}
+
+/// Fork: a release is followed up until the button is up (src/mouse_buttons.rs).
+fn release_mouse_button(en: &mut Enigo, button: i32) {
+    let Some(b) = enigo_mouse_button(button) else {
+        return;
+    };
+    #[cfg(windows)]
+    let (res, look) = (en.mouse_up_checked(b), true);
+    #[cfg(not(windows))]
+    let (res, look) = {
+        en.mouse_up(b);
+        (Ok::<(), u32>(()), false)
+    };
+    let outcome =
+        MOUSE_GUARD
+            .0
+            .lock()
+            .unwrap()
+            .released(button, res.is_ok(), look, std::time::Instant::now());
+    log_mouse_release(button, &outcome, res.err());
+    #[cfg(windows)]
+    {
+        static FOLLOWED_UP: std::sync::Once = std::sync::Once::new();
+        FOLLOWED_UP.call_once(|| {
+            std::thread::spawn(follow_up_mouse_releases);
+        });
+        MOUSE_GUARD.1.notify_one();
+    }
+}
+
+/// What became of a release, for whoever reads the log of a machine whose button stuck: the
+/// release did not go into the input stream (`failed`, with the system's error), or went in and
+/// left the button down (`still down`).
+fn log_mouse_release(button: i32, outcome: &crate::mouse_buttons::Outcome, err: Option<u32>) {
+    use crate::mouse_buttons::{names, Outcome};
+    let button = names(button);
+    match outcome {
+        Outcome::Quiet => {}
+        Outcome::Failing { tries } => hbb_common::throttled_log!(
+            Duration::from_secs(2),
+            warn,
+            "mouse button up failed: button={button} err={} tries={tries}",
+            err.unwrap_or_default()
+        ),
+        Outcome::Recovered { tries } => {
+            log::warn!("mouse button released after retry: button={button} tries={tries}")
+        }
+        Outcome::StillDown { tries } => hbb_common::throttled_log!(
+            Duration::from_secs(2),
+            warn,
+            "mouse button still down after up: button={button} tries={tries}, releasing again"
+        ),
+        Outcome::GivenUp => hbb_common::throttled_log!(
+            Duration::from_secs(2),
+            warn,
+            "mouse button still down after up: button={button}, left alone"
+        ),
+    }
+}
+
+/// The thread that does the work `MOUSE_GUARD` has pending: a release that did not go in again,
+/// and a look at a button whose release went in.
+#[cfg(windows)]
+fn follow_up_mouse_releases() {
+    use crate::mouse_buttons::{Outcome, Todo};
+    let (guard, wake) = &**MOUSE_GUARD;
+    loop {
+        {
+            let mut g = guard.lock().unwrap();
+            loop {
+                let now = std::time::Instant::now();
+                match g.next_due() {
+                    Some(due) if due <= now => break,
+                    Some(due) => g = wake.wait_timeout(g, due - now).unwrap().0,
+                    None => g = wake.wait(g).unwrap(),
+                }
+            }
+        }
+        if EXITING.load(Ordering::SeqCst) {
+            return;
+        }
+        // `ENIGO` first, as the input threads do: a press cannot come between finding a release
+        // pending and injecting it.
+        let mut en = ENIGO.lock().unwrap();
+        crate::platform::windows::try_change_desktop();
+        let mut g = guard.lock().unwrap();
+        let now = std::time::Instant::now();
+        for (button, todo) in g.due(now) {
+            let Some(b) = enigo_mouse_button(button) else {
+                continue;
+            };
+            match todo {
+                Todo::Inject => {
+                    let res = en.mouse_up_checked(b);
+                    let outcome = g.injected(button, res.is_ok(), true, now);
+                    log_mouse_release(button, &outcome, res.err());
+                }
+                Todo::Look => {
+                    let down = Enigo::mouse_button_down(b).unwrap_or(false);
+                    let outcome = g.looked(button, down, now);
+                    if matches!(outcome, Outcome::StillDown { .. }) {
+                        if let Err(err) = en.mouse_up_checked(b) {
+                            log_mouse_release(button, &Outcome::Failing { tries: 0 }, Some(err));
+                        }
+                    }
+                    log_mouse_release(button, &outcome, None);
+                }
+            }
+        }
+    }
+}
+
+/// The process exits: no button it pressed stays down.
+fn release_mouse_buttons_at_exit() {
+    let down = MOUSE_GUARD.0.lock().unwrap().down();
+    if down == 0 {
+        return;
+    }
+    log::info!(
+        "releasing the mouse buttons still down at exit: {}",
+        crate::mouse_buttons::names(down)
+    );
+    let func = move || {
+        let mut en = ENIGO.lock().unwrap();
+        for button in crate::mouse_buttons::BUTTONS {
+            if let Some(b) = enigo_mouse_button(button).filter(|_| down & button != 0) {
+                en.mouse_up(b);
+            }
+        }
+    };
+    #[cfg(target_os = "macos")]
+    QUEUE.exec_async(func);
+    #[cfg(not(target_os = "macos"))]
+    func();
+}
+
 pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     if !active_mouse_(conn) {
         return;
@@ -1382,42 +1541,8 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
                 };
             }
         }
-        MOUSE_TYPE_DOWN => match buttons {
-            MOUSE_BUTTON_LEFT => {
-                allow_err!(en.mouse_down(MouseButton::Left));
-            }
-            MOUSE_BUTTON_RIGHT => {
-                allow_err!(en.mouse_down(MouseButton::Right));
-            }
-            MOUSE_BUTTON_WHEEL => {
-                allow_err!(en.mouse_down(MouseButton::Middle));
-            }
-            MOUSE_BUTTON_BACK => {
-                allow_err!(en.mouse_down(MouseButton::Back));
-            }
-            MOUSE_BUTTON_FORWARD => {
-                allow_err!(en.mouse_down(MouseButton::Forward));
-            }
-            _ => {}
-        },
-        MOUSE_TYPE_UP => match buttons {
-            MOUSE_BUTTON_LEFT => {
-                en.mouse_up(MouseButton::Left);
-            }
-            MOUSE_BUTTON_RIGHT => {
-                en.mouse_up(MouseButton::Right);
-            }
-            MOUSE_BUTTON_WHEEL => {
-                en.mouse_up(MouseButton::Middle);
-            }
-            MOUSE_BUTTON_BACK => {
-                en.mouse_up(MouseButton::Back);
-            }
-            MOUSE_BUTTON_FORWARD => {
-                en.mouse_up(MouseButton::Forward);
-            }
-            _ => {}
-        },
+        MOUSE_TYPE_DOWN => press_mouse_button(&mut en, buttons),
+        MOUSE_TYPE_UP => release_mouse_button(&mut en, buttons),
         MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD => {
             #[allow(unused_mut)]
             let mut x = -evt.x;

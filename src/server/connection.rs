@@ -434,6 +434,9 @@ pub struct Connection {
     options_in_login: Option<OptionMessage>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
+    // Fork: the mouse buttons the peer holds down here, let go of when it may no longer
+    // control or is gone (src/mouse_buttons.rs).
+    mouse_held: crate::mouse_buttons::Held,
     closed: bool,
     /// A message that may be the last was sent (a close reason, a login error): the peer is waited
     /// for to read it before the stream goes, unless it closed first (`closed_by_peer`).
@@ -817,6 +820,7 @@ impl Connection {
             options_in_login: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
+            mouse_held: Default::default(),
             closed: false,
             parting_sent: false,
             closed_by_peer: false,
@@ -990,6 +994,10 @@ impl Connection {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
                                 conn.keyboard = enabled;
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                if !enabled {
+                                    conn.let_go_of_held_mouse_buttons("control was taken away");
+                                }
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 // Until authorized, only record the value; try_sub_monitor_services subscribes from it.
                                 if let Some(s) = conn.server.upgrade().filter(|_| conn.authorized) {
@@ -3452,13 +3460,16 @@ impl Connection {
                     if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
                     }
+                    // Fork: the release of a button this peer holds goes in even if it may no
+                    // longer control: its press went in.
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if self.peer_keyboard_enabled() {
+                    if self.peer_keyboard_enabled() || self.mouse_held.releases(&me) {
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
                             MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
                         }
+                        self.mouse_held.injecting(&me);
                         #[cfg(target_os = "macos")]
                         self.retina.on_mouse_event(&mut me, self.display_idx);
                         self.input_mouse(
@@ -5352,6 +5363,10 @@ impl Connection {
         if let Ok(q) = o.disable_keyboard.enum_value() {
             if q != BoolOption::NotSet {
                 self.disable_keyboard = q == BoolOption::Yes;
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if self.disable_keyboard {
+                    self.let_go_of_held_mouse_buttons("the peer gave up control");
+                }
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
                         super::clipboard_service::NAME,
@@ -5618,6 +5633,8 @@ impl Connection {
         // But it's not necessary now and we have to consider two audio services(client, server).
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.let_go_of_held_mouse_buttons("the connection closed");
         if lock
             && self.lock_after_session_end
             && self.keyboard
@@ -6020,6 +6037,39 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Fork: releases mouse buttons the peer pressed, as its own release would: through the
+    /// input thread, after whatever of the peer is still queued there.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn let_go_of_mouse_buttons(&self, buttons: i32, why: &str) {
+        if buttons == 0 {
+            return;
+        }
+        log::warn!(
+            "#{} mouse buttons let go without a release from the peer: {} ({why})",
+            self.inner.id(),
+            crate::mouse_buttons::names(buttons),
+        );
+        for button in crate::mouse_buttons::BUTTONS {
+            if buttons & button != 0 {
+                self.input_mouse(
+                    crate::mouse_buttons::release_of(button),
+                    self.inner.id(),
+                    self.lr.my_name.clone(),
+                    self.peer_argb,
+                    true,
+                    false,
+                );
+            }
+        }
+    }
+
+    /// Fork: the peer may no longer control, or is gone: nothing of its stays pressed.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn let_go_of_held_mouse_buttons(&mut self, why: &str) {
+        let held = self.mouse_held.take();
+        self.let_go_of_mouse_buttons(held, why);
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -7101,7 +7151,11 @@ impl Default for PortableState {
 impl Drop for Connection {
     fn drop(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.release_pressed_modifiers();
+        {
+            self.release_pressed_modifiers();
+            // A connection dropped without `on_close`; the input thread still takes this up.
+            self.let_go_of_held_mouse_buttons("the connection was dropped");
+        }
 
         if let Some(s) = self.terminal_generic_service.as_ref() {
             s.join();

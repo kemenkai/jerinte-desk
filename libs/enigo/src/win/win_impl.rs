@@ -10,6 +10,7 @@ use std::mem::*;
 
 extern "system" {
     pub fn GetLastError() -> DWORD;
+    pub fn SetLastError(code: DWORD);
 }
 
 /// The main struct for handling the event emitting
@@ -98,12 +99,25 @@ fn keybd_event(mut flags: u32, vk: u16, scan: u16) -> DWORD {
     }
 }
 
+/// The error of a `SendInput` that inserted nothing, read right after it. With no error set the
+/// input was refused all the same: `ERROR_GEN_FAILURE` stands for it.
+fn not_inserted() -> DWORD {
+    const ERROR_GEN_FAILURE: DWORD = 31;
+    match unsafe { GetLastError() } {
+        0 => ERROR_GEN_FAILURE,
+        code => code,
+    }
+}
+
 fn get_error() -> String {
+    get_error_of(unsafe { GetLastError() })
+}
+
+fn get_error_of(errno: DWORD) -> String {
     unsafe {
         let buff_size = 256;
         let mut buff: Vec<u16> = Vec::with_capacity(buff_size);
         buff.resize(buff_size, 0);
-        let errno = GetLastError();
         let chars_copied = FormatMessageW(
             FORMAT_MESSAGE_IGNORE_INSERTS
                 | FORMAT_MESSAGE_FROM_SYSTEM
@@ -130,6 +144,50 @@ fn get_error() -> String {
         let sl = std::slice::from_raw_parts(buff.as_ptr(), curr_char);
         let err_msg = String::from_utf16(sl);
         return err_msg.unwrap_or("".to_owned());
+    }
+}
+
+impl Enigo {
+    /// Releases a mouse button and says whether the release went into the input stream: the
+    /// error code of a `SendInput` that inserted nothing. What went in can still be kept from
+    /// taking effect (a low-level hook swallowing it); `mouse_button_down` tells.
+    pub fn mouse_up_checked(&mut self, button: MouseButton) -> Result<(), u32> {
+        let flags = match button {
+            MouseButton::Left => MOUSEEVENTF_LEFTUP,
+            MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
+            MouseButton::Right => MOUSEEVENTF_RIGHTUP,
+            MouseButton::Back | MouseButton::Forward => MOUSEEVENTF_XUP,
+            _ => {
+                log::info!("Unsupported button {:?}", button);
+                return Ok(());
+            }
+        };
+        let data = match button {
+            MouseButton::Back => XBUTTON1 as u32,
+            MouseButton::Forward => XBUTTON2 as u32,
+            _ => 0,
+        };
+        // Cleared first: the last error of an earlier call must not be read as this one's.
+        unsafe { SetLastError(0) };
+        if mouse_event(flags, data, 0, 0) == 0 {
+            return Err(not_inserted());
+        }
+        Ok(())
+    }
+
+    /// Whether the system has a mouse button as held down, on the desktop of the calling
+    /// thread. Injected and physical presses are one state, and both this and `SendInput` name
+    /// the physical button, whichever way the buttons are swapped for the user.
+    pub fn mouse_button_down(button: MouseButton) -> Option<bool> {
+        let vk = match button {
+            MouseButton::Left => VK_LBUTTON,
+            MouseButton::Right => VK_RBUTTON,
+            MouseButton::Middle => VK_MBUTTON,
+            MouseButton::Back => VK_XBUTTON1,
+            MouseButton::Forward => VK_XBUTTON2,
+            _ => return None,
+        };
+        Some(unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000 != 0)
     }
 }
 
@@ -173,6 +231,8 @@ impl MouseControllable for Enigo {
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> crate::ResultType {
+        // Cleared first: the last error of an earlier call must not be read as this one's.
+        unsafe { SetLastError(0) };
         let res = mouse_event(
             match button {
                 MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
@@ -194,35 +254,22 @@ impl MouseControllable for Enigo {
             0,
         );
         if res == 0 {
-            let err = get_error();
-            if !err.is_empty() {
-                return Err(err.into());
-            }
+            // Fork: nothing inserted and no error named is what a blocked injection looks like
+            // (UIPI, security software), not a success.
+            let code = not_inserted();
+            let err = get_error_of(code);
+            return Err(if err.is_empty() {
+                format!("SendInput inserted nothing, error {code}").into()
+            } else {
+                err.into()
+            });
         }
         Ok(())
     }
 
     fn mouse_up(&mut self, button: MouseButton) {
-        mouse_event(
-            match button {
-                MouseButton::Left => MOUSEEVENTF_LEFTUP,
-                MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
-                MouseButton::Right => MOUSEEVENTF_RIGHTUP,
-                MouseButton::Back => MOUSEEVENTF_XUP,
-                MouseButton::Forward => MOUSEEVENTF_XUP,
-                _ => {
-                    log::info!("Unsupported button {:?}", button);
-                    return;
-                }
-            },
-            match button {
-                MouseButton::Back => XBUTTON1 as _,
-                MouseButton::Forward => XBUTTON2 as _,
-                _ => 0,
-            },
-            0,
-            0,
-        );
+        // Callers that act on a release that did not go in use `mouse_up_checked`.
+        self.mouse_up_checked(button).ok();
     }
 
     fn mouse_click(&mut self, button: MouseButton) {

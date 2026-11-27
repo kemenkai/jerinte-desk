@@ -818,6 +818,9 @@ pub mod server {
             }
         }
 
+        // Fork: nothing more comes to inject, a release included: what this process pressed
+        // and did not release stays down for no one, so it goes up now.
+        crate::input_service::fix_key_down_timeout_at_exit();
         *EXIT.lock().unwrap() = true;
     }
 }
