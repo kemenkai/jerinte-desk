@@ -10,7 +10,7 @@ on:
         type: string
         default: "nightly"
       targets:
-        # Private builds: comma separated subset of linux, macos, windows; "all" keeps every job.
+        # Private builds: comma separated subset including android; "all" keeps every job.
         type: string
         default: "all"
       variant:
@@ -1559,35 +1559,14 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
-    if: ${{ inputs.targets == 'all' }}
+    if: ${{ inputs.targets == 'all' || contains(inputs.targets, 'android') }}
     needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
-        job:
-          - {
-              arch: aarch64,
-              target: aarch64-linux-android,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: armv7,
-              target: armv7-linux-androideabi,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
-          - {
-              arch: x86_64,
-              target: x86_64-linux-android,
-              os: ubuntu-24.04,
-              reltype: release,
-              suffix: "",
-            }
+        job: ${{ fromJSON(inputs.variant == '' && '[{"arch":"aarch64","target":"aarch64-linux-android","os":"ubuntu-24.04","reltype":"release","suffix":""},{"arch":"armv7","target":"armv7-linux-androideabi","os":"ubuntu-24.04","reltype":"release","suffix":""},{"arch":"x86_64","target":"x86_64-linux-android","os":"ubuntu-24.04","reltype":"release","suffix":""}]' || '[{"arch":"aarch64","target":"aarch64-linux-android","os":"ubuntu-24.04","reltype":"release","suffix":""}]') }}
     steps:
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
@@ -1645,6 +1624,13 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
+
+      - name: Apply custom client variant
+        if: ${{ inputs.variant != '' }}
+        env:
+          CUSTOM_CLIENT_SECRETS: ${{ secrets.CUSTOM_CLIENT_SECRETS }}
+          VARIANT: ${{ inputs.variant }}
+        run: bash res/custom/apply.sh "$VARIANT"
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -1771,7 +1757,7 @@ jobs:
           export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
           # Increase Gradle JVM memory for CI builds
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
-          # temporary use debug sign config
+          # Keep variant APKs installable with the debug key when no release key is configured.
           sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
           case ${{ matrix.job.target }} in
             aarch64-linux-android)
@@ -1862,10 +1848,31 @@ jobs:
           files: |
             signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
 
+      - name: Upload to the draft release (custom client)
+        if: ${{ env.UPLOAD_ARTIFACT == 'true' && inputs.variant != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VARIANT: ${{ inputs.variant }}
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          VERSION: ${{ env.VERSION }}
+          ARCH: ${{ matrix.job.arch }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ANDROID_SIGNING_KEY" ]; then
+            apk="${{ steps.sign-rustdesk.outputs.signedReleaseFile }}"
+          else
+            apk="signed-apk/rustdesk-${VERSION}-${ARCH}.apk"
+          fi
+          if [ ! -f "$apk" ]; then echo "::error::nothing to upload"; exit 1; fi
+          filename="rustdesk-${VARIANT}-${VERSION}-${ARCH}.apk"
+          cp "$apk" "$filename"
+          gh release upload "$TAG_NAME" "$filename" --repo "$GITHUB_REPOSITORY" --clobber
+
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact && inputs.targets == 'all' }}
+    if: ${{ inputs.upload-artifact && inputs.targets == 'all' && inputs.variant == '' }}
     runs-on: ubuntu-24.04
     env:
       reltype: release

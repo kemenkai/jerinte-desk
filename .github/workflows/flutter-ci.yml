@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "Comma separated: linux, macos, windows, sciter (32-bit Windows, for Windows 7)"
+        description: "Comma separated: linux, macos, windows, android, sciter (32-bit Windows, for Windows 7)"
         required: true
         default: "linux"
       variant:
