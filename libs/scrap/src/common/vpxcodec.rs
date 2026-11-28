@@ -43,7 +43,8 @@ impl Default for VpxVideoCodecId {
     }
 }
 
-/// Fork: the coarsest quantizer the encoder may use, whatever the quality. With the bound
+/// Fork, VP9 only (VP8 is left as it was, not measured): the coarsest quantizer the encoder may
+/// use, whatever the quality. With the bound
 /// `calc_q_values` gives (37 at the higher qualities, about 44 to 50 once the bitrate is brought
 /// down), a picture that changes everywhere at every frame (a page scrolled fast) cannot be made
 /// as small as a narrow path needs: the encoder drops frames instead, the next frame is then further
@@ -57,7 +58,7 @@ impl Default for VpxVideoCodecId {
 const MAX_QUANTIZER: u32 = 63;
 const FRAMES_BEFORE_COARSE: u32 = 30;
 
-/// Fork: libvpx sizes a frame by the time since the one before it (the frame rate it derives from
+/// Fork, VP9 only (VP8 is left as it was, not measured): libvpx sizes a frame by the time since the one before it (the frame rate it derives from
 /// the timestamps). When frames come late because the sender held them back, or the encoder
 /// dropped some, it makes the next one bigger, which makes it later still: at 1080p, even with
 /// `MAX_QUANTIZER`, the frame rate fell from 21 to 2 and stayed there. The encoder is told no longer
@@ -237,7 +238,11 @@ impl EncoderApi for VpxEncoder {
     }
 
     fn encode_to_message(&mut self, input: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
-        let told = told_time(self.last_time, ms, self.longest_step);
+        let told = if self.folds_time() {
+            told_time(self.last_time, ms, self.longest_step)
+        } else {
+            ms
+        };
         let mut frames = Vec::new();
         for ref frame in self
             .encode(told, input.yuv()?, STRIDE_ALIGN)
@@ -247,7 +252,7 @@ impl EncoderApi for VpxEncoder {
         }
         // Whether a frame comes out of it or not: the encoder has taken this time.
         self.last_time = Some((ms, told));
-        if self.frames < FRAMES_BEFORE_COARSE {
+        if self.folds_time() && self.frames < FRAMES_BEFORE_COARSE {
             self.frames += 1;
             if self.frames == FRAMES_BEFORE_COARSE {
                 let mut c = unsafe { *self.ctx.config.enc.to_owned() };
@@ -280,7 +285,7 @@ impl EncoderApi for VpxEncoder {
         let mut c = unsafe { *self.ctx.config.enc.to_owned() };
         let (q_min, q_max) = Self::calc_q_values(ratio);
         c.rc_min_quantizer = q_min;
-        c.rc_max_quantizer = Self::max_quantizer(self.frames, q_max);
+        c.rc_max_quantizer = Self::max_quantizer(self.id, self.frames, q_max);
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
         call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
@@ -397,9 +402,15 @@ impl VpxEncoder {
         (bitrate * ratio) as u32
     }
 
+    /// Whether the fix applies: VP9 only, VP8 was not measured with it.
+    fn folds_time(&self) -> bool {
+        self.id == VpxVideoCodecId::VP9
+    }
+
     /// The coarsest quantizer allowed once `frames` were encoded, the quality's being `q_max`.
-    fn max_quantizer(frames: u32, q_max: u32) -> u32 {
-        if frames >= FRAMES_BEFORE_COARSE {
+    /// Only VP9 is given `MAX_QUANTIZER`.
+    fn max_quantizer(id: VpxVideoCodecId, frames: u32, q_max: u32) -> u32 {
+        if id == VpxVideoCodecId::VP9 && frames >= FRAMES_BEFORE_COARSE {
             MAX_QUANTIZER
         } else {
             q_max
@@ -733,9 +744,20 @@ mod tests {
     fn the_coarsest_quantizer_is_allowed_only_after_the_first_frames() {
         for ratio in [0.5, 1.0, 3.0] {
             let (_, q_max) = VpxEncoder::calc_q_values(ratio);
-            assert_eq!(VpxEncoder::max_quantizer(0, q_max), q_max);
-            assert_eq!(VpxEncoder::max_quantizer(FRAMES_BEFORE_COARSE - 1, q_max), q_max);
-            assert_eq!(VpxEncoder::max_quantizer(FRAMES_BEFORE_COARSE, q_max), MAX_QUANTIZER);
+            let vp9 = VpxVideoCodecId::VP9;
+            assert_eq!(VpxEncoder::max_quantizer(vp9, 0, q_max), q_max);
+            assert_eq!(VpxEncoder::max_quantizer(vp9, FRAMES_BEFORE_COARSE - 1, q_max), q_max);
+            assert_eq!(VpxEncoder::max_quantizer(vp9, FRAMES_BEFORE_COARSE, q_max), MAX_QUANTIZER);
+        }
+    }
+
+    #[test]
+    fn vp8_keeps_the_quantizer_bound_of_the_quality() {
+        for ratio in [0.5, 1.0, 3.0] {
+            let (_, q_max) = VpxEncoder::calc_q_values(ratio);
+            for frames in [0, FRAMES_BEFORE_COARSE, 1000] {
+                assert_eq!(VpxEncoder::max_quantizer(VpxVideoCodecId::VP8, frames, q_max), q_max);
+            }
         }
     }
 
