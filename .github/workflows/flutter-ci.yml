@@ -66,10 +66,19 @@ jobs:
           # run and the variant: v1.5.1-3 out, the draft is v1.5.1-4-test.70-jerinte. The title is
           # the tag, as a release's is.
           latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName || true)
-          if [[ "$latest" =~ ^(v.+)-([0-9]+)$ ]]; then
-            next="${BASH_REMATCH[1]}-$((BASH_REMATCH[2] + 1))"
+          # The release is numbered on the upstream version it is built on (Cargo.toml): the
+          # next revision of the latest release while that version is the same, -1 once it moved
+          # on (v1.5.1-6 then v1.5.3-1).
+          version=$(gh api "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$GITHUB_SHA" --jq .content \
+            | base64 -d | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::no version in Cargo.toml"
+            exit 1
+          fi
+          if [[ "$latest" =~ ^v${version//./\\.}-([0-9]+)$ ]]; then
+            next="v$version-$((BASH_REMATCH[1] + 1))"
           else
-            next="v0-1"
+            next="v$version-1"
           fi
           TAG="$next-test.$RUN-$VARIANT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
